@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slurmify"
+version = "0.1.0"
+description = "Interactive TUI wizard for generating and submitting Slurm sbatch scripts"
+requires-python = ">=3.8"
+dependencies = [
+    "questionary>=2.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+slurmify = "slurmify.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
