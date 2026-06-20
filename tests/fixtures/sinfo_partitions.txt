@@ -1,0 +1,5 @@
+cpu-shared*|02:00:00|100|up|32|131072|(null)
+cpu-highmem|12:00:00|20|up|48|524288|(null)
+gpu-shared|04:00:00|10|up|16|196608|gpu:a100:4,gpu:v100:2
+gpu-highend|24:00:00|4|up|32|262144|gpu:h100:8
+debug|01:00:00|2|up|8|32768|(null)

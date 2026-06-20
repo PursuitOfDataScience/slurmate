@@ -1,0 +1,2 @@
+a100,nvlink|gpu:a100:4
+v100,pcie|gpu:v100:2

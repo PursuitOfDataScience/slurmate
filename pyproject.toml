@@ -6,11 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "slurmify"
 version = "0.1.0"
 description = "Interactive TUI wizard for generating and submitting Slurm sbatch scripts"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Slurmify contributors"},
+    {name = "Youzhi Yu", email = "yuyouzhi666@icloud.com"},
 ]
 keywords = ["slurm", "sbatch", "hpc", "tui", "wizard"]
 classifiers = [
@@ -21,7 +21,6 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -35,14 +34,15 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/anomalyco/slurmify"
-Repository = "https://github.com/anomalyco/slurmify.git"
-Issues = "https://github.com/anomalyco/slurmify/issues"
+Homepage = "https://github.com/PursuitOfDataScience/slurmify"
+Repository = "https://github.com/PursuitOfDataScience/slurmify.git"
+Issues = "https://github.com/PursuitOfDataScience/slurmify/issues"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "pytest-mock>=3.10",
+    "pytest-cov>=4.0",
     "ruff>=0.3.0",
     "mypy>=1.8",
     "build>=1.0",
@@ -59,17 +59,19 @@ where = ["src"]
 slurmify = ["py.typed"]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 line-length = 100
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.9"
-strict = false
+python_version = "3.10"
+strict = true
 ignore_missing_imports = true
 warn_unused_configs = true
-disallow_untyped_defs = false
+disallow_untyped_defs = true
 check_untyped_defs = true
 
 [tool.pytest.ini_options]

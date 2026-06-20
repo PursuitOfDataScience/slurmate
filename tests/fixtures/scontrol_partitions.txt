@@ -1,0 +1,5 @@
+PartitionName=cpu-shared AllowAccounts=ALL Hidden=NO AllowQos=normal,high,express
+PartitionName=cpu-highmem AllowAccounts=ALL Hidden=NO AllowQos=normal
+PartitionName=gpu-shared AllowAccounts=ALL Hidden=NO AllowQos=gpu,interactive
+PartitionName=gpu-highend AllowAccounts=ALL Hidden=NO AllowQos=gpu
+PartitionName=debug AllowAccounts=restricted Hidden=YES AllowQos=interactive

@@ -1,10 +1,5 @@
 """Tests for the sbatch script builder."""
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
 from slurmify.builder import build_sbatch_script, estimate_su
 
 
@@ -52,8 +47,8 @@ class TestBuildSbatchScript:
         assert "#SBATCH --mem=32G" in script
         assert "#SBATCH --time=02:00:00" in script
         assert "#SBATCH --nodes=2" in script
-        assert "#SBATCH --gres=gpu:4" in script
-        assert "#SBATCH --constraint=a100" in script
+        assert "#SBATCH --gres=gpu:a100:4" in script
+        assert "#SBATCH --constraint=a100" not in script
         assert "#SBATCH --array=1-5" in script
         assert "module load python/3.10" in script
         assert "module load cuda/12.0" in script
@@ -98,18 +93,146 @@ class TestBuildSbatchScript:
         )
         assert script.startswith("#!/bin/bash\n")
 
+    def test_gpu_format_gres_type(self):
+        script = build_sbatch_script(
+            job_name="test", partition="gpu", cpus=4, memory="16G",
+            time_limit="01:00:00", gpus=2, gpu_type="a100",
+            gpu_format="gres_type", command="echo hi",
+        )
+        assert "#SBATCH --gres=gpu:a100:2" in script
+        assert "#SBATCH --constraint" not in script
+
+    def test_gpu_format_gpus(self):
+        script = build_sbatch_script(
+            job_name="test", partition="gpu", cpus=4, memory="16G",
+            time_limit="01:00:00", gpus=2, gpu_type="a100",
+            gpu_format="gpus", command="echo hi",
+        )
+        assert "#SBATCH --gpus=a100:2" in script
+        assert "#SBATCH --constraint" not in script
+
+    def test_gpu_format_duplicate_filtering(self):
+        script = build_sbatch_script(
+            job_name="test", partition="gpu", cpus=4, memory="16G",
+            time_limit="01:00:00", gpus=2, gpu_type="a100",
+            gpu_format="constraint", command="echo hi",
+            custom_sbatch=["--gres=gpu:2", "--constraint=a100", "--constraint=ssd"]
+        )
+        assert script.count("--gres=gpu:2") == 1
+        assert script.count("--constraint=a100") == 1
+        assert "#SBATCH --constraint=ssd" in script
+
+    def test_env_activation_strategies(self):
+        script_conda = build_sbatch_script(
+            job_name="test", partition="cpu", cpus=1, memory="1G",
+            time_limit="00:01:00", env_name="myenv", env_type="Conda", command="echo hi"
+        )
+        assert "conda activate myenv" in script_conda
+
+        script_mamba = build_sbatch_script(
+            job_name="test", partition="cpu", cpus=1, memory="1G",
+            time_limit="00:01:00", env_name="myenv", env_type="Mamba", command="echo hi"
+        )
+        assert "mamba activate myenv" in script_mamba
+
+        script_venv = build_sbatch_script(
+            job_name="test", partition="cpu", cpus=1, memory="1G",
+            time_limit="00:01:00", env_name="/path/to/venv", env_type="Virtualenv (venv)", command="echo hi"
+        )
+        assert "source /path/to/venv/bin/activate" in script_venv
+
+    def test_multi_node_task_layout(self):
+        script = build_sbatch_script(
+            job_name="test", partition="cpu", cpus=4, memory="16G",
+            time_limit="01:00:00", nodes=2, command="echo hi"
+        )
+        assert "#SBATCH --nodes=2" in script
+        assert "#SBATCH --ntasks-per-node=1" in script
+
 
 class TestEstimateSu:
     def test_basic_estimate(self):
         result = estimate_su(4, "01:00:00", 1)
-        assert isinstance(result, str)
-        # 4 CPUs * 1 hour = 4 SU
-        assert result is not None
+        assert result == "4.0"
 
     def test_zero_cpus(self):
         result = estimate_su(0, "01:00:00", 1)
-        assert result is not None
+        assert result == "0.00"
 
     def test_multi_node(self):
         result = estimate_su(8, "02:00:00", 4)
-        assert result is not None
+        assert result == "64.0"
+
+
+class TestPartialPreview:
+    def test_partial_omits_unentered_fields(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p"}, partial=True)
+        assert "--job-name=j" in s
+        assert "--partition=p" in s
+        # not entered yet -> must not appear as placeholder lines
+        assert "--time=" not in s
+        assert "--nodes=" not in s
+        assert "--cpus-per-task=" not in s
+        assert "--mem=" not in s
+
+    def test_partial_hides_partition_until_entered(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"job_name": "j"}, partial=True)
+        assert "--partition" not in s
+        assert "--job-name=j" in s
+
+    def test_partial_hides_output_until_name(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"cpus": 4}, partial=True)
+        assert "--output" not in s
+        assert "--cpus-per-task=4" in s
+
+    def test_full_build_still_fills_defaults(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "command": "echo hi"})
+        assert "--time=02:00:00" in s
+        assert "--nodes=1" in s
+        assert "--cpus-per-task=1" in s
+        assert "--mem=16G" in s
+        assert "echo hi" in s
+
+
+class TestQosAndOutputFile:
+    def test_qos_default_none_omitted(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "qos": "Default (none)"})
+        assert "--qos" not in s
+
+    def test_qos_explicit_kept(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "qos": "high"})
+        assert "#SBATCH --qos=high" in s
+
+    def test_output_file_in_dir_and_derived_error(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "logs", "output_file": "run-%j.out"})
+        assert "#SBATCH --output=logs/run-%j.out" in s
+        assert "#SBATCH --error=logs/run-%j.err" in s
+
+    def test_output_file_explicit_path_ignores_dir(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "logs", "output_file": "/tmp/x.out"})
+        assert "#SBATCH --output=/tmp/x.out" in s
+        assert "#SBATCH --error=/tmp/x.err" in s
+
+
+class TestPartialOutputTiming:
+    def test_output_hidden_until_dir_or_file(self):
+        from slurmify.builder import build_from_answers
+        # just job name + partition -> no output lines yet
+        s = build_from_answers({"job_name": "train", "partition": "p"}, partial=True)
+        assert "--output" not in s
+        assert "--error" not in s
+
+    def test_output_shown_once_dir_entered(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({"job_name": "train", "partition": "p", "output_dir": "logs"}, partial=True)
+        assert "#SBATCH --output=logs/train-%j.out" in s

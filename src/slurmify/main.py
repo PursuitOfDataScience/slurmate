@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -9,23 +10,26 @@ from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 
-from .builder import build_from_answers, build_sbatch_script, estimate_su
+from .builder import build_from_answers, estimate_su
 from .system_utils import (
+    _parse_slurm_time_to_minutes,
     fetch_partitions,
     fetch_queue_eta,
+    load_config,
     normalize_memory,
     submit_sbatch,
+    validate_memory,
+    validate_time,
 )
 from .theme import c, print_banner
 from .tui import Wizard, _parse_custom_flags
 
-
 # ── Batch mode helpers ───────────────────────────────────────────────────
 
-def _get_partition(partitions: list[dict], name: str) -> dict[str, Any]:
+def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any]:
     for p in partitions:
         if p["name"] == name:
             return p
@@ -33,34 +37,201 @@ def _get_partition(partitions: list[dict], name: str) -> dict[str, Any]:
             "gpu_types": [], "timelimit": None, "is_public": True}
 
 
-def run_batch(args: argparse.Namespace, console: Console) -> dict[str, Any]:
+def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]) -> dict[str, Any]:
     print(f"  {c.CYAN}\u25b8{c.RESET} {c.GRAY}Running in batch mode{c.RESET}\n")
 
+    # Get values fallback from config
+    args_partition = getattr(args, "partition", None)
+    partition = args_partition if args_partition is not None else config.get("partition", "")
+
+    args_cpus = getattr(args, "cpus", None)
+    cpus = args_cpus if args_cpus is not None else config.get("cpus", 4)
+
+    args_memory = getattr(args, "memory", None)
+    memory_val = args_memory if args_memory is not None else config.get("memory", "16G")
+
+    args_time = getattr(args, "time", None)
+    time_val = args_time if args_time is not None else config.get("time_limit", "02:00:00")
+
+    args_nodes = getattr(args, "nodes", None)
+    nodes = args_nodes if args_nodes is not None else config.get("nodes", 1)
+
+    args_gpus = getattr(args, "gpus", None)
+    gpus = args_gpus if args_gpus is not None else config.get("gpus", 0)
+
+    args_ntasks_per_node = getattr(args, "ntasks_per_node", None)
+    ntasks_per_node = args_ntasks_per_node if args_ntasks_per_node is not None else config.get("ntasks_per_node")
+
+    args_gpu_type = getattr(args, "gpu_type", None)
+    gpu_type = args_gpu_type if args_gpu_type is not None else config.get("gpu_type")
+
+    args_gpu_format = getattr(args, "gpu_format", None)
+    gpu_format = args_gpu_format if args_gpu_format is not None else config.get("gpu_format")
+
+    args_output_dir = getattr(args, "output_dir", None)
+    output_dir = args_output_dir if args_output_dir is not None else config.get("output_dir", "logs")
+
+    args_output_file = getattr(args, "output_file", None)
+    output_file = args_output_file if args_output_file is not None else config.get("output_file")
+
+    if gpus > 0 and not gpu_format:
+        gpu_format = "gres_type"
+
+    # Hard-validate memory
+    if not validate_memory(str(memory_val)):
+        Console(stderr=True).print(f"  {c.RED}\u2717 Error: Invalid memory value: {memory_val}{c.RESET}")
+        sys.exit(1)
+
+    # Hard-validate time limit
+    if not validate_time(str(time_val)):
+        Console(stderr=True).print(f"  {c.RED}\u2717 Error: Invalid time limit value: {time_val}{c.RESET}")
+        sys.exit(1)
+
     all_parts = fetch_partitions()
-    part_obj = _get_partition(all_parts, args.partition)
-    mods = [m.strip() for m in args.modules.split(",") if m.strip()] if args.modules else None
+    part_obj = _get_partition(all_parts, partition)
+
+    raw_modules = getattr(args, "modules", None)
+    if raw_modules is None:
+        cfg_mods = config.get("modules")
+        if isinstance(cfg_mods, list):
+            mods = cfg_mods
+        elif isinstance(cfg_mods, str):
+            mods = [m.strip() for m in cfg_mods.split(",") if m.strip()]
+        else:
+            mods = None
+    else:
+        mods = [m.strip() for m in raw_modules.split(",") if m.strip()]
+
+    args_env_type = getattr(args, "env_type", None)
+    env_type = args_env_type if args_env_type is not None else config.get("env_type")
+
+    args_env = getattr(args, "env", None)
+    env_name = args_env if args_env is not None else config.get("env_name")
+    if env_name and not env_type:
+        env_type = "conda"
+
+    custom_sbatch_val = getattr(args, "custom_sbatch", None)
+    if custom_sbatch_val is None:
+        cfg_custom = config.get("custom_sbatch")
+        if isinstance(cfg_custom, list):
+            custom_sbatch_list = cfg_custom
+        elif isinstance(cfg_custom, str):
+            custom_sbatch_list = _parse_custom_flags(cfg_custom)
+        else:
+            custom_sbatch_list = None
+    else:
+        custom_sbatch_list = _parse_custom_flags(custom_sbatch_val)
+
+    args_job_name = getattr(args, "job_name", None)
+    args_account = getattr(args, "account", None)
+    args_qos = getattr(args, "qos", None)
+    args_array = getattr(args, "array", None)
+    args_command = getattr(args, "command", None)
 
     return {
-        "job_name": args.job_name,
-        "account": args.account or None,
-        "partition": args.partition,
+        "job_name": args_job_name if args_job_name is not None else config.get("job_name", ""),
+        "account": args_account if args_account is not None else config.get("account"),
+        "partition": partition,
         "_partition_obj": part_obj,
-        "qos": args.qos or None,
-        "cpus": args.cpus,
-        "memory": normalize_memory(args.memory),
-        "time_limit": args.time,
-        "nodes": args.nodes,
-        "gpus": args.gpus,
-        "gpu_type": args.gpu_type or None,
-        "array_spec": args.array or None,
+        "qos": args_qos if args_qos is not None else config.get("qos"),
+        "cpus": cpus,
+        "memory": normalize_memory(str(memory_val)),
+        "time_limit": time_val,
+        "nodes": nodes,
+        "ntasks_per_node": ntasks_per_node,
+        "gpus": gpus,
+        "gpu_type": gpu_type or None,
+        "gpu_format": gpu_format or None,
+        "array_spec": args_array if args_array is not None else config.get("array_spec"),
         "modules": mods,
-        "env_name": args.env or None,
-        "command": args.command,
-        "custom_sbatch": _parse_custom_flags(args.custom_sbatch) if args.custom_sbatch else None,
+        "env_type": env_type,
+        "env_name": env_name,
+        "output_dir": output_dir,
+        "output_file": output_file or None,
+        "command": args_command if args_command is not None else config.get("command", ""),
+        "custom_sbatch": custom_sbatch_list,
     }
 
 
-def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict]:
+def _validate_partition_limits(answers: dict[str, Any], console: Console) -> None:
+    part = answers.get("_partition_obj")
+    if not part:
+        return
+
+    # Check CPUs
+    cpus = answers.get("cpus")
+    if cpus is not None:
+        try:
+            cores = int(cpus)
+            limit = part.get("cpus_per_node", 0)
+            if limit and cores > limit:
+                console.print(f"  [yellow]\u26a0 Warning: CPUs ({cores}) exceeds partition limit ({limit} per node)[/]")
+        except ValueError:
+            pass
+
+    # Check Memory
+    memory = answers.get("memory")
+    if memory:
+        if validate_memory(str(memory)):
+            norm = normalize_memory(str(memory))
+            m = re.match(r"^(\d+)([MGT]?)$", norm)
+            if m:
+                amt = int(m.group(1))
+                unit = m.group(2)
+                mb = amt
+                if unit == "G":
+                    mb = amt * 1024
+                elif unit == "T":
+                    mb = amt * 1024 * 1024
+                limit = part.get("mem_per_node_mb", 0)
+                if limit and mb > limit:
+                    console.print(f"  [yellow]\u26a0 Warning: Memory ({memory}) exceeds partition limit ({limit} MB per node)[/]")
+
+    # Check Time Limit
+    time_limit = answers.get("time_limit")
+    if time_limit:
+        try:
+            req_mins = _parse_slurm_time_to_minutes(str(time_limit))
+            limit_str = part.get("timelimit")
+            if limit_str:
+                limit_mins = _parse_slurm_time_to_minutes(limit_str)
+                if limit_mins > 0 and req_mins > limit_mins:
+                    console.print(f"  [yellow]\u26a0 Warning: Time limit ({time_limit}) exceeds partition limit ({limit_str})[/]")
+        except Exception:
+            pass
+
+    # Check GPUs
+    gpus = answers.get("gpus", 0)
+    try:
+        gpus_val = int(gpus) if gpus is not None else 0
+    except ValueError:
+        gpus_val = 0
+
+    gpu_types = part.get("gpu_types", [])
+    if gpus_val > 0 and not gpu_types:
+        console.print(f"  [yellow]\u26a0 Warning: Partition '{part.get('name')}' does not support GPUs[/]")
+
+    # Check GPU type
+    gpu_type = answers.get("gpu_type")
+    if gpu_type and gpu_types and gpu_type not in gpu_types:
+        console.print(f"  [yellow]\u26a0 Warning: GPU type '{gpu_type}' not in partition list ({', '.join(gpu_types)})[/]")
+
+
+_REQUIRED_FIELDS = [("job_name", "Job name"), ("partition", "Partition"), ("command", "Command to run")]
+
+
+def _warn_missing_required(answers: dict[str, Any], console: Console) -> list[str]:
+    """Print a reminder for any required field left blank; return the labels."""
+    missing = [label for key, label in _REQUIRED_FIELDS if not answers.get(key)]
+    if missing:
+        console.print(
+            f"  [yellow]⚠ Missing recommended fields:[/] {', '.join(missing)}"
+            f" [dim](go back in the wizard, or pass them as flags)[/]"
+        )
+    return missing
+
+
+def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict[str, Any]]:
     script = build_from_answers(answers)
 
     su_estimate = estimate_su(
@@ -74,20 +245,45 @@ def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict
         req_nodes=answers.get("nodes", 1),
     )
 
+    _validate_partition_limits(answers, console)
     _show_script_and_summary(console, script, answers, su_estimate, queue_info)
+    _warn_missing_required(answers, console)
     return script, queue_info
 
 
 def _show_script_and_summary(console: Console, script: str, answers: dict[str, Any],
-                              su_estimate: str, queue_info: dict | None = None) -> None:
+                              su_estimate: str, queue_info: dict[str, Any] | None = None) -> None:
     print()
-    script_w = min(console.width - 2, 60)
+    # Render the script as a Rich Text with our own line numbers + light
+    # highlighting. Text measures exactly (unlike Syntax, whose auto-measurement
+    # could render a broken/too-narrow box), so the panel always closes cleanly.
+    script_lines = script.split("\n")
+    num_w = len(str(len(script_lines)))
+    body = Text()
+    for i, ln in enumerate(script_lines, 1):
+        body.append(f"{i:>{num_w}} ", style="bright_black")
+        if ln.startswith("#!") or (ln.startswith("#") and not ln.startswith("#SBATCH")):
+            body.append(ln, style="bright_black")
+        elif ln.startswith("#SBATCH") and "=" in ln:
+            key, val = ln.split("=", 1)
+            body.append(key + "=", style="green")
+            body.append(val, style="white")
+        elif ln.startswith("#SBATCH"):
+            body.append(ln, style="green")
+        else:
+            body.append(ln, style="cyan")
+        if i < len(script_lines):
+            body.append("\n")
+
+    title_text = "Generated sbatch script"
+    content_w = num_w + 1 + max((len(ln) for ln in script_lines), default=10)
+    panel_w = min(console.width, max(len(title_text) + 6, content_w + 4))
     console.print(Panel(
-        Syntax(script, "bash", theme="monokai", line_numbers=True),
-        title=f"[bold]{c.PINK}Generated sbatch script[/]",
+        body,
+        title=f"[bold]{c.PINK}{title_text}[/]",
         border_style="bright_magenta",
         padding=(0, 1),
-        width=script_w,
+        width=panel_w,
     ))
 
     table = Table.grid(padding=(0, 2))
@@ -97,7 +293,7 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
     table.add_row("Partition:", answers.get("partition", ""))
     if answers.get("account"):
         table.add_row("Account:", answers["account"])
-    if answers.get("qos"):
+    if answers.get("qos") and answers["qos"] != "Default (none)":
         table.add_row("QoS:", f"[magenta]{answers['qos']}[/]")
     table.add_row("CPUs:", str(answers.get("cpus", "")))
     table.add_row("Memory:", answers.get("memory", ""))
@@ -121,7 +317,8 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         table.add_row("Est. ETA (rough):", f"[{eta_color}]{queue_info['eta_label']}[/]")
 
     print()
-    console.print(Panel(table, title=f"[bold]{c.CYAN}Summary[/]", border_style="cyan", padding=(0, 1)))
+    console.print(Panel(table, title=f"[bold]{c.CYAN}Summary[/]", border_style="cyan",
+                        padding=(0, 1), expand=False))
     print()
 
 
@@ -138,50 +335,99 @@ def _edit_script_in_editor(script: str) -> str:
         os.unlink(tmp_path)
 
 
+def _offer_save_script(script: str, default_name: str) -> None:
+    """When a job isn't submitted, offer to save the generated script to disk."""
+    import questionary
+
+    from .theme import questionary_style
+    QS = questionary_style()
+    save = questionary.confirm("Save the script to a file?", default=True, qmark="", style=QS).ask()
+    if not save:
+        return
+    path = questionary.text("Save as:", default=default_name, qmark="", style=QS).ask()
+    if not path or not path.strip():
+        return
+    path = os.path.expanduser(path.strip())
+    try:
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(script)
+        print(f"  {c.GREEN}✓ Saved to {path}{c.RESET}")
+    except OSError as e:
+        print(f"  {c.RED}✗ Could not save: {e}{c.RESET}")
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    from . import __version__
     parser = argparse.ArgumentParser(description="Slurmify \u2014 sbatch wizard")
-    parser.add_argument("--job-name", default="", help="Job name")
+    parser.add_argument("--job-name", default=None, help="Job name")
     parser.add_argument("--account", default=None, help="Slurm account")
-    parser.add_argument("--partition", default="", help="Target partition")
+    parser.add_argument("--partition", default=None, help="Target partition")
     parser.add_argument("--qos", default=None, help="QoS")
-    parser.add_argument("--cpus", type=int, default=4, help="CPU cores")
-    parser.add_argument("--memory", default="16G", help="Memory (e.g. 16G, 32G, 64000M)")
-    parser.add_argument("--time", default="02:00:00", help="Time limit")
-    parser.add_argument("--nodes", type=int, default=1, help="Node count")
-    parser.add_argument("--gpus", type=int, default=0, help="Number of GPUs")
+    parser.add_argument("--cpus", type=int, default=None, help="CPU cores")
+    parser.add_argument("--memory", default=None, help="Memory (e.g. 16G, 32G, 64000M)")
+    parser.add_argument("--time", default=None, help="Time limit")
+    parser.add_argument("--nodes", type=int, default=None, help="Node count")
+    parser.add_argument("--ntasks-per-node", type=int, default=None, help="Tasks per node")
+    parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs")
     parser.add_argument("--gpu-type", default=None, help="GPU type (e.g. a100, h100)")
+    parser.add_argument("--gpu-format", default=None, choices=["gres_type", "constraint", "gpus"],
+                        help="GPU request format")
     parser.add_argument("--array", default=None, help="Array spec (e.g. 1-10)")
     parser.add_argument("--modules", default=None, help="Comma-separated modules")
     parser.add_argument("--env", default=None, help="Conda environment")
-    parser.add_argument("--command", default="", help="Command to run")
+    parser.add_argument("--env-type", default=None, choices=["conda", "mamba", "venv", "none"],
+                        help="Environment activation strategy (conda, mamba, venv, none)")
+    parser.add_argument("--output-dir", default=None, help="Output directory for logs")
+    parser.add_argument("--output-file", default=None,
+                        help="Output log file name/pattern (%%j = job ID); error derives .err")
+    parser.add_argument("--command", default=None, help="Command to run")
     parser.add_argument("--custom-sbatch", default=None,
                         help="Comma-separated extra #SBATCH flags (e.g. --exclusive,--reservation=abc)")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation and submit")
+    parser.add_argument("--dry-run", action="store_true", help="Print the script and exit without submitting")
+    parser.add_argument("--print", action="store_true", help="Print the script to stdout and exit")
+    parser.add_argument("--version", action="version", version=f"slurmify {__version__}")
     return parser.parse_args(argv)
 
 
 def main() -> None:
     console = Console()
-    print_banner(animate=sys.stdout.isatty())
-
     args = parse_args()
 
-    if args.partition:
-        answers = run_batch(args, console)
+    if not (args.print or args.dry_run):
+        print_banner(animate=sys.stdout.isatty())
+
+    config = load_config()
+
+    answers: dict[str, Any] | None = None
+    if args.partition is not None:
+        answers = run_batch(args, console, config)
     else:
         wizard = Wizard()
         answers = wizard.run()
 
     if not answers:
-        print(f"  {c.YELLOW}Cancelled.{c.RESET}")
+        if not (args.print or args.dry_run):
+            print(f"  {c.YELLOW}Cancelled.{c.RESET}")
+        else:
+            sys.exit(1)
+        return
+
+    if args.print or args.dry_run:
+        script = build_from_answers(answers)
+        print(script)
         return
 
     script, queue_info = build_and_show(answers, console)
 
     if not args.yes:
         import questionary
+
         from .theme import questionary_style
         QS = questionary_style()
         editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vim"))
@@ -199,11 +445,13 @@ def main() -> None:
         submit = True
     else:
         import questionary
+
         from .theme import questionary_style
         QS = questionary_style()
         submit = questionary.confirm("Submit this job to Slurm?", default=True, qmark="", style=QS).ask()
         if submit is None or not submit:
-            print(f"  {c.YELLOW}Job not submitted. Exiting.{c.RESET}")
+            print(f"  {c.YELLOW}Job not submitted.{c.RESET}")
+            _offer_save_script(script, f"{answers.get('job_name', '') or 'slurm'}.sh")
             return
 
     retcode, stdout, stderr = submit_sbatch(script, job_name=answers.get("job_name", "slurm"))
@@ -215,7 +463,22 @@ def main() -> None:
             print(f"  {c.RED}{stderr}{c.RESET}")
         sys.exit(1)
 
-    print(f"  {c.GREEN}\u2713 Submitted!{c.RESET} Job ID: {c.CYAN}{stdout}{c.RESET}")
+    job_id = stdout.strip()
+    print(f"  {c.GREEN}\u2713 Submitted!{c.RESET} Job ID: {c.CYAN}{job_id}{c.RESET}")
+
+    # Read the actual --output path from the generated script (source of truth).
+    log_path = f"{answers.get('job_name', '') or 'slurm'}-%j.out"
+    for line in script.splitlines():
+        if line.startswith("#SBATCH --output="):
+            log_path = line.split("=", 1)[1].strip()
+            break
+
+    resolved_log = log_path.replace("%j", job_id)
+    print(f"  {c.GRAY}Log path: {resolved_log}{c.RESET}")
+    print(f"  {c.GRAY}Hints:{c.RESET}")
+    print(f"    squeue -j {job_id}")
+    print(f"    tail -f {resolved_log}")
+    print(f"    scancel {job_id}")
 
 
 if __name__ == "__main__":

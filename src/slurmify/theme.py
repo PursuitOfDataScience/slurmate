@@ -4,7 +4,7 @@ import os
 import re
 import sys
 import time
-from typing import Optional
+from typing import Any
 
 
 def _should_use_color() -> bool:
@@ -40,6 +40,13 @@ class C:
     G5 = "\033[38;2;0;128;255m"
     G6 = "\033[38;2;0;255;255m"
 
+    def __getattribute__(self, name: str) -> Any:
+        if name.startswith("__"):
+            return object.__getattribute__(self, name)
+        if not _should_use_color():
+            return ""
+        return object.__getattribute__(self, name)
+
 
 c = C()
 
@@ -52,10 +59,14 @@ BANNER_LINES = [
     r"    ╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝        ╚═╝   ",
 ]
 
-BANNER_GRADIENT = [c.G1, c.G2, c.G3, c.G4, c.G5, c.G6]
+# Use class-level access (not the `c` instance) so the gradient codes are not
+# blanked by C.__getattribute__'s color gate when this module is imported under
+# a non-TTY/NO_COLOR process. print_banner() decides at call time whether to emit
+# them.
+BANNER_GRADIENT = [C.G1, C.G2, C.G3, C.G4, C.G5, C.G6]
 
 
-def _brighten(rgb, t):
+def _brighten(rgb: tuple[int, int, int], t: float) -> tuple[int, int, int]:
     return (
         min(255, int(rgb[0] + (255 - rgb[0]) * t)),
         min(255, int(rgb[1] + (255 - rgb[1]) * t)),
@@ -63,7 +74,7 @@ def _brighten(rgb, t):
     )
 
 
-def _to_rgb(ansi_code):
+def _to_rgb(ansi_code: str) -> tuple[int, int, int]:
     m = re.match(r"\033\[38;2;(\d+);(\d+);(\d+)m", ansi_code)
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (255, 0, 128)
 
@@ -71,9 +82,9 @@ def _to_rgb(ansi_code):
 BASE_RGB = [_to_rgb(g) for g in BANNER_GRADIENT]
 
 
-def print_banner(animate=False):
+def print_banner(animate: bool | str | None = False) -> None:
     """Print banner, respecting NO_COLOR and SLURMIFY_NO_BANNER env vars.
-    
+
     Args:
         animate: If True, show animation. Default is False (instant display).
                  Can be overridden with SLURMIFY_BANNER_ANIMATE=1.
@@ -128,7 +139,7 @@ def print_banner(animate=False):
     print()
 
 
-def questionary_style():
+def questionary_style() -> Any:
     import questionary
     return questionary.Style([
         ("qmark", "fg:#00ffff bold"),

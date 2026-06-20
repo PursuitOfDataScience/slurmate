@@ -1,14 +1,5 @@
 """Tests for the Slurm system utilities (mock mode)."""
 
-import os
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-# Force mock mode
-os.environ["SLURMIFY_MOCK"] = "1"
-
 from slurmify.system_utils import (
     MOCK_ACCOUNTS,
     MOCK_CONDA_ENVS,
@@ -127,8 +118,33 @@ class TestSubmitSbatch:
         assert ret == 0
         assert "not available" in err
 
+    def test_submit_creates_log_directories(self, tmp_path):
+        out_dir = tmp_path / "test_out_dir"
+        err_dir = tmp_path / "test_err_dir"
+        assert not out_dir.exists()
+        assert not err_dir.exists()
+        
+        script = f"""#!/bin/bash
+#SBATCH --output={out_dir}/job-%j.out
+#SBATCH --error={err_dir}/job-%j.err
+echo hello
+"""
+        submit_sbatch(script)
+        
+        assert out_dir.exists()
+        assert err_dir.exists()
+
 
 class TestHelpers:
+    def test_validate_memory(self):
+        from slurmify.system_utils import validate_memory
+        assert validate_memory("16G") is True
+        assert validate_memory("64000M") is True
+        assert validate_memory("1T") is True
+        assert validate_memory("") is False
+        assert validate_memory("0") is False
+        assert validate_memory("abc") is False
+
     def test_parse_mem_to_mb(self):
         from slurmify.system_utils import _parse_mem_to_mb
         assert _parse_mem_to_mb("16G") == 16384
@@ -146,3 +162,32 @@ class TestHelpers:
         assert _detect_gpu_type("", "gpu:a100:4") == "a100"
         assert _detect_gpu_type("", "gpu:4") == "gpu"
         assert _detect_gpu_type("a100", "") == "a100"
+
+
+class TestLoadConfig:
+    def test_mock_mode_is_hermetic(self, tmp_path, monkeypatch):
+        # Even with a real config present, mock mode must ignore it.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".slurmify.toml").write_text('account = "x"\n')
+        monkeypatch.setenv("SLURMIFY_MOCK", "1")
+        from slurmify.system_utils import load_config
+        assert load_config() == {}
+
+    def test_reads_toml_with_section_and_types(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("SLURMIFY_MOCK", raising=False)
+        (tmp_path / ".slurmify.toml").write_text(
+            'partition = "gpu"\ncpus = 8\n[defaults]\nmodules = ["a", "b"]\n'
+        )
+        from slurmify.system_utils import load_config
+        cfg = load_config()
+        assert cfg["partition"] == "gpu"
+        assert cfg["cpus"] == 8
+        assert cfg["modules"] == ["a", "b"]
+
+    def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("SLURMIFY_MOCK", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        from slurmify.system_utils import load_config
+        assert load_config() == {}

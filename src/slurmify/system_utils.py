@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 from typing import Any
 
+logger = logging.getLogger(__name__)
 
 MOCK_PARTITIONS = [
     {"name": "cpu-shared", "nodes": 100, "state": "up", "cpus_per_node": 32, "mem_per_node_mb": 131072, "gpu_types": [], "timelimit": "02:00:00", "is_public": True},
@@ -77,12 +79,12 @@ def _parse_mem_to_mb(raw: str) -> int:
 
 def validate_memory(value: str) -> bool:
     """Validate memory value.
-    
+
     Accepts formats:
     - Plain digits: "16"
     - With units: "16G", "16g", "512M", "1T"
     - With Slurm N/C suffix: "16GN", "16GC"
-    
+
     Rejects:
     - Zero or empty
     - Invalid formats
@@ -99,9 +101,20 @@ def validate_memory(value: str) -> bool:
     return False
 
 
+def validate_time(val: str) -> bool:
+    """Validate time limit string in Slurm format (hh:mm:ss or d-hh:mm:ss)."""
+    if not val.strip():
+        return True
+    if re.match(r"^\d+-\d{2}:\d{2}:\d{2}$", val.strip()):
+        return True
+    if re.match(r"^\d{2}:\d{2}:\d{2}$", val.strip()):
+        return True
+    return False
+
+
 def normalize_memory(value: str) -> str:
     """Normalize memory value to a standard format.
-    
+
     Returns:
     - Plain digits prefixed with "M": "16" -> "16M"
     - Units already present: "16G" -> "16G"
@@ -356,27 +369,8 @@ MOCK_QUEUE_INFO = {
 }
 
 
-def _parse_squeue_time(t_str: str) -> int:
-    """Convert Slurm time format to seconds."""
-    t = t_str.strip()
-    if not t or t in ("UNLIMITED", "NOT_SET", "INVALID"):
-        return 0
-    total = 0
-    if "-" in t:
-        days, rest = t.split("-", 1)
-        total += int(days) * 86400
-        t = rest
-    parts = t.split(":")
-    if len(parts) == 3:
-        total += int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-    elif len(parts) == 2:
-        total += int(parts[0]) * 60 + int(parts[1])
-    elif len(parts) == 1:
-        total += int(parts[0])
-    return total
 
-
-def fetch_queue_eta(partition: str, req_nodes: int = 1) -> dict:
+def fetch_queue_eta(partition: str, req_nodes: int = 1) -> dict[str, Any]:
     """Estimate queue wait time for a partition based on squeue / sinfo data."""
     if not is_tool_available("squeue") or not is_tool_available("sinfo"):
         return dict(MOCK_QUEUE_INFO)
@@ -455,34 +449,57 @@ def _format_eta(seconds: int) -> str:
 
 def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, str, str]:
     """Submit sbatch script and return (returncode, job_id_or_output, error_message).
-    
+
     Args:
         script_content: The sbatch script content
         job_name: Job name for logging purposes
-        
+
     Returns:
         Tuple of (returncode, job_id_or_stdout, stderr)
         - returncode: 0 on success, non-zero on failure
         - job_id_or_stdout: Job ID (integer as string) on success, stdout on failure
         - stderr: Error message on failure, empty string on success
     """
+    # Parse output/error paths to create directories if they don't exist
+    for line in script_content.splitlines():
+        if line.startswith("#SBATCH --output=") or line.startswith("#SBATCH -o "):
+            val = line.split("=", 1)[1].strip() if "=" in line else line.split(None, 2)[2].strip()
+            dir_name = os.path.dirname(val)
+            if dir_name:
+                try:
+                    os.makedirs(dir_name, exist_ok=True)
+                except OSError as e:
+                    logger.debug(f"Failed to create output directory {dir_name}: {e}")
+        elif line.startswith("#SBATCH --error=") or line.startswith("#SBATCH -e "):
+            val = line.split("=", 1)[1].strip() if "=" in line else line.split(None, 2)[2].strip()
+            dir_name = os.path.dirname(val)
+            if dir_name:
+                try:
+                    os.makedirs(dir_name, exist_ok=True)
+                except OSError as e:
+                    logger.debug(f"Failed to create error directory {dir_name}: {e}")
+
     if not is_tool_available("sbatch"):
         return 0, "", "sbatch not available (mock mode) — no job submitted"
 
-    # Use --parsable for clean job ID output
-    result = subprocess.run(
-        ["sbatch", "--parsable"],
-        input=script_content,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    
+    try:
+        # Use --parsable for clean job ID output
+        result = subprocess.run(
+            ["sbatch", "--parsable"],
+            input=script_content,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return -1, "", "Submission timed out after 30s"
+
     if result.returncode != 0:
         return result.returncode, result.stdout.strip(), result.stderr.strip()
 
     job_id = result.stdout.strip()
-    
+
     # Optionally save script to disk for reproducibility
     log_dir = os.environ.get("SLURMIFY_LOG_DIR")
     if log_dir:
@@ -492,7 +509,91 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
             with open(script_path, "w") as f:
                 f.write(script_content)
         except OSError as e:
-            # Log but don't fail
-            pass
+            logger.debug(f"Failed to save script copy to SLURMIFY_LOG_DIR: {e}")
 
     return result.returncode, job_id, ""
+
+
+def _coerce_config_value(v: str) -> Any:
+    """Parse one scalar value for the naive key=value fallback parser."""
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        return v[1:-1]
+    if v.startswith("[") and v.endswith("]"):
+        return re.findall(r"['\"]([^'\"]*)['\"]", v)
+    if v.isdigit():
+        return int(v)
+    if v.lower() == "true":
+        return True
+    if v.lower() == "false":
+        return False
+    return v
+
+
+def _parse_config_naive(text: str) -> dict[str, Any]:
+    """Minimal flat key=value parser used only when no TOML library is available."""
+    config: dict[str, Any] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("["):
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            config[k.strip()] = _coerce_config_value(v.strip())
+    return config
+
+
+def _flatten_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Take top-level scalar keys, then merge an optional [defaults]/[slurmify] table."""
+    config: dict[str, Any] = {k: v for k, v in data.items() if not isinstance(v, dict)}
+    for section in ("defaults", "slurmify"):
+        sect = data.get(section)
+        if isinstance(sect, dict):
+            config.update(sect)
+    return config
+
+
+def load_config() -> dict[str, Any]:
+    """Load configuration defaults from a TOML file.
+
+    Looks for ``.slurmify.toml`` in the current directory, then
+    ``~/.config/slurmify/config.toml``; the first file found wins. Keys may sit
+    at the top level or under a ``[defaults]`` (or ``[slurmify]``) table. Real
+    TOML is used when a parser is available (``tomllib`` on 3.11+, ``tomli`` on
+    older Pythons), otherwise a minimal flat key=value reader is used.
+
+    Returns ``{}`` in mock mode (``SLURMIFY_MOCK``) so tests stay hermetic, and
+    on any missing or unreadable file.
+    """
+    if _force_mock():
+        return {}
+
+    from pathlib import Path
+
+    toml: Any = None
+    try:
+        import tomllib
+        toml = tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli
+            toml = tomli
+        except ModuleNotFoundError:
+            toml = None
+
+    paths = [
+        Path.cwd() / ".slurmify.toml",
+        Path.home() / ".config" / "slurmify" / "config.toml",
+    ]
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            if toml is not None:
+                with open(p, "rb") as fb:
+                    return _flatten_config(toml.load(fb))
+            with open(p) as f:
+                return _parse_config_naive(f.read())
+        except Exception as e:
+            logger.debug(f"Failed to load config from {p}: {e}")
+            return {}
+    return {}
