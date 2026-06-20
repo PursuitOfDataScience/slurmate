@@ -1,150 +1,19 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
-import threading
 import time
-from typing import Callable, Optional
-
-from prompt_toolkit import PromptSession
-from prompt_toolkit.application import Application
-from prompt_toolkit.completion import Completer, Completion, FuzzyWordCompleter
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
-from prompt_toolkit.styles import Style as PTStyle
-from prompt_toolkit.validation import ValidationError, Validator as PTValidator
-from prompt_toolkit.widgets import Label, RadioList
-
-_SEL_STYLE = PTStyle([
-    ("prompt", "bold fg:#00ffff"),
-    ("pointer", "bold fg:#bf00ff"),
-])
+from typing import Optional
 
 
-def select_input(prompt: str, choices: list[str], default: str | None = None,
-                 qmark: str = "") -> Optional[str]:
-    """Arrow-key selectable list with ESC to go back."""
-    if not choices:
-        return None
-    radio = RadioList([(c, c) for c in choices])
-    if default and default in choices:
-        radio.current_value = default
-
-    sel_kb = KeyBindings()
-
-    @sel_kb.add("enter", eager=True)
-    def _enter(event):
-        event.app.exit(result=radio.current_value)
-
-    @sel_kb.add("escape", eager=True)
-    def _esc(event):
-        event.app.exit(result=None)
-
-    app = Application(
-        layout=Layout(
-            HSplit([
-                Window(Label(f"  {prompt}"), height=1, dont_extend_height=True),
-                radio,
-            ]),
-            focused_element=radio,
-        ),
-        key_bindings=sel_kb,
-        style=_SEL_STYLE,
-    )
-    try:
-        return app.run()
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-
-class _PathCompleter(Completer):
-    """Completes file/directory paths as the user types."""
-
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        prefix = text.rsplit(" ", 1)[-1] if " " in text else text
-        if not prefix:
-            return
-
-        expanded = os.path.expanduser(prefix)
-        dir_part = os.path.dirname(expanded) or "."
-        partial = os.path.basename(expanded)
-
-        try:
-            entries = os.listdir(dir_part)
-        except OSError:
-            return
-
-        for entry in sorted(entries):
-            if not entry.startswith(partial) or entry.startswith("."):
-                continue
-            full = os.path.join(dir_part, entry)
-            suffix = entry + "/" if os.path.isdir(full) else entry
-            if partial:
-                dir_prefix = prefix[: -len(partial)]
-                completion_text = dir_prefix + suffix
-            else:
-                completion_text = prefix + suffix
-            yield Completion(completion_text, start_position=-len(prefix))
-
-
-_KB = KeyBindings()
-
-
-@_KB.add("escape", eager=True)
-def _exit_on_esc(event):
-    event.app.exit(result=None)
-
-
-def _make_session(choices: list[str] | None = None, validate: Callable[[str], bool] | None = None,
-                  path_complete: bool = False) -> PromptSession:
-    kwargs = dict(key_bindings=_KB)
-    if path_complete:
-        kwargs["completer"] = _PathCompleter()
-        kwargs["complete_while_typing"] = True
-    elif choices:
-        kwargs["completer"] = FuzzyWordCompleter(choices)
-        kwargs["complete_while_typing"] = True
-    if validate:
-
-        class V(PTValidator):
-            def validate(self, doc):
-                if not validate(doc.text):
-                    raise ValidationError(message="Invalid input", cursor_position=len(doc.text))
-        kwargs["validator"] = V()
-    return PromptSession(**kwargs)
-
-
-def autocomplete(prompt: str, choices: list[str], default: str = "", qmark: str = "",
-                 validate: Callable[[str], bool] | None = None) -> Optional[str]:
-    """Like questionary.autocomplete but ESC returns None."""
-    try:
-        result = _make_session(choices, validate).prompt(f"{qmark}{prompt} ", default=default)
-        return result
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-
-def text_input(prompt: str, default: str = "", qmark: str = "",
-               validate: Callable[[str], bool] | None = None) -> Optional[str]:
-    """Like questionary.text but ESC returns None."""
-    try:
-        result = _make_session(validate=validate).prompt(f"{qmark}{prompt} ", default=default)
-        return result
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-
-def path_input(prompt: str, default: str = "", qmark: str = "",
-               validate: Callable[[str], bool] | None = None) -> Optional[str]:
-    """Text input with file/directory path autocomplete."""
-    try:
-        result = _make_session(validate=validate, path_complete=True).prompt(
-            f"{qmark}{prompt} ", default=default
-        )
-        return result
-    except (KeyboardInterrupt, EOFError):
-        return None
+def _should_use_color() -> bool:
+    """Check if we should use color output based on environment."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return sys.stdout.isatty()
 
 
 class C:
@@ -195,23 +64,42 @@ def _brighten(rgb, t):
 
 
 def _to_rgb(ansi_code):
-    m = __import__("re").match(r"\033\[38;2;(\d+);(\d+);(\d+)m", ansi_code)
+    m = re.match(r"\033\[38;2;(\d+);(\d+);(\d+)m", ansi_code)
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (255, 0, 128)
 
 
 BASE_RGB = [_to_rgb(g) for g in BANNER_GRADIENT]
 
 
-def print_banner(animate=True):
+def print_banner(animate=False):
+    """Print banner, respecting NO_COLOR and SLURMIFY_NO_BANNER env vars.
+    
+    Args:
+        animate: If True, show animation. Default is False (instant display).
+                 Can be overridden with SLURMIFY_BANNER_ANIMATE=1.
+    """
+    if os.environ.get("SLURMIFY_NO_BANNER"):
+        return
+
+    use_color = _should_use_color()
+    use_animation = animate or os.environ.get("SLURMIFY_BANNER_ANIMATE") == "1"
+
     print()
-    for i, line in enumerate(BANNER_LINES):
-        print(f"{BANNER_GRADIENT[i]}{c.BOLD}\033[3m{line}\033[23m{c.RESET}")
+    if use_color:
+        for i, line in enumerate(BANNER_LINES):
+            print(f"{BANNER_GRADIENT[i]}{c.BOLD}\033[3m{line}\033[23m{c.RESET}")
+    else:
+        for line in BANNER_LINES:
+            print(line)
     print()
 
-    if not animate or not sys.stdout.isatty():
-        subtitle = f"{c.CYAN}Slurmify{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
+    if not use_animation or not use_color:
+        if use_color:
+            subtitle = f"{c.CYAN}Slurmify{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
+        else:
+            subtitle = "Slurmify  \u2014  interactive sbatch wizard"
         print(f"  {subtitle}")
-        print(f"  {c.GRAY}ESC to go back{c.RESET}")
+        print(f"  {c.GRAY if use_color else ''}ESC to go back{c.RESET if use_color else ''}")
         print()
         return
 
@@ -238,63 +126,6 @@ def print_banner(animate=True):
     print(f"  {subtitle}")
     print(f"  {c.GRAY}ESC to go back{c.RESET}")
     print()
-
-
-class Spinner:
-    def __init__(self, msg="Loading"):
-        self.msg = msg
-        self.running = False
-        self.thread = None
-
-    def _spin(self):
-        frames = ["\u25d0", "\u25d3", "\u25d1", "\u25d2"]
-        i = 0
-        while self.running:
-            sys.stdout.write(
-                f"\r  {c.CYAN}{frames[i % len(frames)]}{c.RESET} "
-                f"{c.GRAY}{self.msg}...\033[K{c.RESET}"
-            )
-            sys.stdout.flush()
-            time.sleep(0.1)
-            i += 1
-
-    def start(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._spin, daemon=True)
-        self.thread.start()
-
-    def stop(self, status="ok"):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=0.5)
-        icon = {"ok": f"{c.GREEN}\u2713{c.RESET}", "err": f"{c.RED}\u2717{c.RESET}"}.get(status, "")
-        sys.stdout.write(f"\r  {icon} {c.GRAY}{self.msg}\033[K{c.RESET}\n")
-        sys.stdout.flush()
-
-
-def tool_status(name, status="running"):
-    if status == "running":
-        print(f"\r  {c.CYAN}\u26a1{c.RESET} {c.GRAY}{name}...\033[K{c.RESET}", end="", flush=True)
-    elif status == "success":
-        print(f"\r  {c.GREEN}\u2713{c.RESET} {c.GRAY}{name}\033[K{c.RESET}")
-    elif status == "error":
-        print(f"\r  {c.RED}\u2717 {name}\033[K{c.RESET}")
-
-
-def ok(msg):
-    print(f"  {c.GREEN}\u2713{c.RESET} {c.GRAY}{msg}{c.RESET}")
-
-
-def fail(msg):
-    print(f"  {c.RED}\u2717 {msg}{c.RESET}")
-
-
-def info(msg):
-    print(f"  {c.CYAN}\u25b8{c.RESET} {c.GRAY}{msg}{c.RESET}")
-
-
-def header(title):
-    print(f"\n  {c.BOLD}{c.PINK}\u276f {title}{c.RESET}")
 
 
 def questionary_style():

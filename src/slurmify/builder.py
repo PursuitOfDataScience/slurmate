@@ -1,9 +1,34 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from .system_utils import _parse_slurm_time_to_minutes
+
+
+def build_from_answers(answers: dict[str, Any]) -> str:
+    """Build sbatch script from answers dict.
+    
+    Extracts all required parameters from the answers dict and calls
+    build_sbatch_script to generate the script.
+    """
+    return build_sbatch_script(
+        job_name=answers.get("job_name", ""),
+        partition=answers.get("partition", ""),
+        account=answers.get("account"),
+        qos=answers.get("qos"),
+        cpus=answers.get("cpus", 1),
+        memory=answers.get("memory", "16G"),
+        time_limit=answers.get("time_limit", "02:00:00"),
+        nodes=answers.get("nodes", 1),
+        gpus=answers.get("gpus", 0),
+        gpu_type=answers.get("gpu_type"),
+        array_spec=answers.get("array_spec"),
+        modules=answers.get("modules"),
+        custom_sbatch=answers.get("custom_sbatch"),
+        env_name=answers.get("env_name"),
+        command=answers.get("command", ""),
+    )
 
 
 def build_sbatch_script(

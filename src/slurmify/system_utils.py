@@ -25,9 +25,15 @@ MOCK_MODULES = ["python/anaconda", "cuda/11.8", "cuda/12.1", "gcc/9.3.0", "openm
 MOCK_ACCOUNTS = ["my_lab", "training", "default"]
 
 
-def _run_command(cmd: list[str]) -> tuple[str, str, int]:
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    return result.stdout, result.stderr, result.returncode
+_RUN_TIMEOUT = 30
+
+
+def _run_command(cmd: list[str], timeout: int = _RUN_TIMEOUT) -> tuple[str, str, int]:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", f"Command timed out after {timeout}s", -1
 
 
 def _force_mock() -> bool:
@@ -67,6 +73,51 @@ def _parse_mem_to_mb(raw: str) -> int:
         return int(num * scale[match.group(2)])
     plain = _safe_int(value)
     return plain if plain > 0 else 0
+
+
+def validate_memory(value: str) -> bool:
+    """Validate memory value.
+    
+    Accepts formats:
+    - Plain digits: "16"
+    - With units: "16G", "16g", "512M", "1T"
+    - With Slurm N/C suffix: "16GN", "16GC"
+    
+    Rejects:
+    - Zero or empty
+    - Invalid formats
+    """
+    v = value.strip()
+    if not v or v == "0":
+        return False
+    # Accepts plain digits
+    if v.isdigit():
+        return int(v) > 0
+    # Accepts with unit suffix (KMGTP) and optional Slurm N/C
+    if re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", v.upper()):
+        return True
+    return False
+
+
+def normalize_memory(value: str) -> str:
+    """Normalize memory value to a standard format.
+    
+    Returns:
+    - Plain digits prefixed with "M": "16" -> "16M"
+    - Units already present: "16G" -> "16G"
+    - Preserves Slurm N/C suffix if present
+    """
+    v = value.strip().upper()
+    if not v:
+        return ""
+    # Plain digits: append M
+    if v.isdigit():
+        return f"{v}M"
+    # Already has unit: return as-is
+    if re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", v):
+        return v
+    # Invalid but return it anyway (validation should catch this)
+    return v
 
 
 def _detect_gpu_type(features: str, gres: str) -> str:
@@ -182,9 +233,10 @@ def fetch_public_partitions() -> list[dict[str, Any]]:
             allow_accounts.upper() == "ALL"
             and hidden.upper() != "YES"
         )
-        part["is_public"] = is_public
+        p = dict(part)
+        p["is_public"] = is_public
         if is_public:
-            result.append(part)
+            result.append(p)
 
     return result
 
@@ -231,7 +283,7 @@ def fetch_gpu_types_for_partition(partition: str) -> list[str]:
         ["sinfo", "-h", "-N", "-p", partition, "-o", "%f|%G"]
     )
     if rc != 0:
-        return []
+        return list(MOCK_GPU_TYPES)
 
     types: set[str] = set()
     for line in stdout.splitlines():
@@ -263,15 +315,13 @@ def fetch_conda_envs() -> list[str]:
 
 def fetch_available_modules() -> list[str]:
     """Parse `module avail` output into a sorted unique list of module names."""
-    if not is_tool_available("module"):
-        return list(MOCK_MODULES)
-
-    stdout, _, rc = _run_command(["module", "avail", "2>&1"])
+    stdout, stderr, rc = _run_command(["bash", "-lc", "command -v module && module -t avail 2>&1"])
+    output = stdout + stderr
     if rc != 0:
         return list(MOCK_MODULES)
 
     modules: set[str] = set()
-    for line in stdout.splitlines():
+    for line in output.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("-"):
             continue
@@ -403,18 +453,46 @@ def _format_eta(seconds: int) -> str:
     return f"~{seconds // 86400}d"
 
 
-def submit_sbatch(script_content: str) -> tuple[int, str, str]:
+def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, str, str]:
+    """Submit sbatch script and return (returncode, job_id_or_output, error_message).
+    
+    Args:
+        script_content: The sbatch script content
+        job_name: Job name for logging purposes
+        
+    Returns:
+        Tuple of (returncode, job_id_or_stdout, stderr)
+        - returncode: 0 on success, non-zero on failure
+        - job_id_or_stdout: Job ID (integer as string) on success, stdout on failure
+        - stderr: Error message on failure, empty string on success
+    """
     if not is_tool_available("sbatch"):
         return 0, "", "sbatch not available (mock mode) — no job submitted"
 
+    # Use --parsable for clean job ID output
     result = subprocess.run(
-        ["sbatch"],
+        ["sbatch", "--parsable"],
         input=script_content,
         capture_output=True,
         text=True,
         check=False,
     )
+    
     if result.returncode != 0:
         return result.returncode, result.stdout.strip(), result.stderr.strip()
 
-    return result.returncode, result.stdout.strip(), ""
+    job_id = result.stdout.strip()
+    
+    # Optionally save script to disk for reproducibility
+    log_dir = os.environ.get("SLURMIFY_LOG_DIR")
+    if log_dir:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            script_path = os.path.join(log_dir, f"{job_name}-{job_id}.sh")
+            with open(script_path, "w") as f:
+                f.write(script_content)
+        except OSError as e:
+            # Log but don't fail
+            pass
+
+    return result.returncode, job_id, ""
