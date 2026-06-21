@@ -35,7 +35,8 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
         if of.endswith(".out"):
             error_path = output_path[:-4] + ".err"
         else:
-            error_path = output_path + ".err"
+            output_path = output_path + ".out"
+            error_path = output_path[:-4] + ".err"
     elif output_dir:
         out_dir = output_dir.strip().rstrip("/")
         output_path = f"{out_dir}/{prefix}-%j.out"
@@ -125,16 +126,17 @@ def build_sbatch_script(
 
     if gpus > 0:
         gpu_fmt = gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type").lower()
-        if gpu_fmt == "gres_type" and gpu_type:
+        gpu_any = gpu_type is not None and gpu_type.lower() == "any"
+        if gpu_fmt == "gres_type" and gpu_type and not gpu_any:
             lines.append(f"#SBATCH --gres=gpu:{gpu_type}:{gpus}")
         elif gpu_fmt == "gpus":
-            if gpu_type:
+            if gpu_type and not gpu_any:
                 lines.append(f"#SBATCH --gpus={gpu_type}:{gpus}")
             else:
                 lines.append(f"#SBATCH --gpus={gpus}")
         else:  # "constraint"
             lines.append(f"#SBATCH --gres=gpu:{gpus}")
-            if gpu_type:
+            if gpu_type and not gpu_any:
                 lines.append(f"#SBATCH --constraint={gpu_type}")
 
     if array_spec:
@@ -166,17 +168,18 @@ def build_sbatch_script(
     if modules:
         lines.append("")
         for mod in modules:
+            # Strip "(default)" annotation that the module system appends
+            if mod.endswith("(default)"):
+                mod = mod[:-9]
             lines.append(f"module load {mod}")
 
     if env_name:
         strategy = (env_type or "conda").lower()
         if strategy == "conda":
             lines.append("")
-            lines.append("source $(conda info --base)/etc/profile.d/conda.sh")
-            lines.append(f"conda activate {env_name}")
+            lines.append(f"source activate {env_name}")
         elif strategy == "mamba":
             lines.append("")
-            lines.append("source $(conda info --base)/etc/profile.d/conda.sh")
             lines.append(f"mamba activate {env_name}")
         elif strategy in ("virtualenv (venv)", "venv"):
             lines.append("")

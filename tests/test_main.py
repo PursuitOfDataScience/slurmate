@@ -127,7 +127,7 @@ class TestPartitionLimitsValidation:
             "memory": "64G",
             "time_limit": "04:00:00",
             "gpus": 2,
-            "gpu_type": "v100",  # not in list
+            "gpu_type": "v100",  # not in static list, but in MOCK_GPU_TYPES — no warning
         }
         with console.capture() as capture:
             _validate_partition_limits(answers_exceed, console)
@@ -135,9 +135,23 @@ class TestPartitionLimitsValidation:
         assert "CPUs (16) exceeds partition limit" in warnings
         assert "Memory (64G) exceeds partition limit" in warnings
         assert "Time limit (04:00:00) exceeds partition limit" in warnings
-        assert "GPU type 'v100' not in partition list" in warnings
+        assert "GPU type 'v100' not in partition list" not in warnings  # found via dynamic check
 
-        # Case 3: Partition with no GPUs but GPUs requested
+        # Case 3: Not in either static or dynamic GPU types
+        answers_exceed2 = {
+            "_partition_obj": part_obj,
+            "cpus": 4,
+            "memory": "16G",
+            "time_limit": "01:00:00",
+            "gpus": 2,
+            "gpu_type": "b200",  # not in static list nor MOCK_GPU_TYPES
+        }
+        with console.capture() as capture:
+            _validate_partition_limits(answers_exceed2, console)
+        warnings = capture.get()
+        assert "GPU type 'b200' not in partition list" in warnings
+
+        # Case 4: Partition with no GPUs but GPUs requested
         part_no_gpu = {
             "name": "cpu-test",
             "cpus_per_node": 8,

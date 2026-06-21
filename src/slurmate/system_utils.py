@@ -134,21 +134,46 @@ def normalize_memory(value: str) -> str:
 
 
 def _detect_gpu_type(features: str, gres: str) -> str:
-    GPU_TYPE_CANDIDATES = (
-        "h200", "h100", "a100", "a40", "a30", "v100", "p100", "k80",
-        "t4", "l40", "l40s", "l4", "rtx6000", "rtx5000", "rtx4090", "rtx3090",
-        "rtx2080", "rtx", "mi300", "mi250", "mi200", "mi100", "tesla",
-    )
-    text = f"{features},{gres}".lower()
-    gres_model = re.search(r"gpu:([a-z0-9._-]+):\d+", text)
-    if gres_model:
-        candidate = gres_model.group(1).replace("_", "-")
-        if candidate not in {"gpu", "mps", "shard"}:
+    """Extract GPU model name from sinfo output.
+
+    Priority:
+    1. Parse model from ``gpu:MODEL:N`` in GRES.
+    2. If GRES has ``gpu:N`` (count-only), scan features for tokens that
+       cannot be dismissed as CPU models, memory sizes, or infrastructure
+       labels (negative filtering rather than a hardcoded GPU list).
+    3. If GRES has no ``gpu:`` at all the node has no GPUs — return empty.
+    """
+    text = f"{features},{gres}"
+    gres_match = re.search(r"gpu:([a-z0-9._-]+):\d+", text, re.IGNORECASE)
+    if gres_match:
+        candidate = gres_match.group(1).replace("_", "-")
+        if candidate.lower() not in {"gpu", "mps", "shard"}:
             return candidate
-    for token in GPU_TYPE_CANDIDATES:
-        if token in text:
-            return token
-    return "gpu" if "gpu" in text else ""
+
+    if "gpu:" not in text.lower():
+        return ""
+
+    for token in re.split(r"[,/ ]+", features):
+        token = token.strip()
+        if not token:
+            continue
+        if not re.match(r"[a-zA-Z]", token):
+            continue
+        if len(token) >= 15:
+            continue
+        if re.match(
+            r"(?:gold|xeon|epyc|ryzen|atom|i[3579])",
+            token, re.IGNORECASE
+        ):
+            continue
+        if token.lower() in {
+            "ssd", "nvme", "ib", "opa", "hdr", "hdd",
+            "scratch", "fat", "thin", "gpu", "cpu", "mem", "node",
+        }:
+            continue
+        return token
+
+    return "gpu"
 
 
 def _extract_token(line: str, key: str) -> str:
@@ -196,7 +221,7 @@ def fetch_partitions() -> list[dict[str, Any]]:
 
         gpu_types: list[str] = []
         if gres_raw and gres_raw != "(null)":
-            for match in re.finditer(r"gpu:([a-z0-9._-]+):\d+", gres_raw.lower()):
+            for match in re.finditer(r"gpu:([a-zA-Z0-9._-]+):\d+", gres_raw, re.IGNORECASE):
                 gpu_types.append(match.group(1).replace("_", "-"))
 
         if name not in partitions:
@@ -338,7 +363,12 @@ def fetch_available_modules() -> list[str]:
         stripped = line.strip()
         if not stripped or stripped.startswith("-"):
             continue
-        modules.update(stripped.split())
+        for mod in stripped.split():
+            # Strip "(default)" annotation that the module system appends
+            if mod.endswith("(default)"):
+                mod = mod[:-9]
+            if mod:
+                modules.add(mod)
     return sorted(modules)
 
 

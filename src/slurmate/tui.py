@@ -122,6 +122,36 @@ class LastTokenPathCompleter(Completer):
             )
 
 
+class LastTokenCommaCompleter(Completer):
+    """Fuzzy-word completion for the last comma-separated token.
+
+    Lets users type ``python/anaconda,cuda`` and get completions for ``cuda``
+    based on the word list, instead of trying to fuzzy-match the whole buffer
+    (which would never match a single word).
+    """
+
+    def __init__(self, words: list[str]) -> None:
+        self._words = words
+
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Completion:  # type: ignore[override]
+        text = document.text_before_cursor
+        idx = text.rfind(",")
+        prefix = text[idx + 1:] if idx >= 0 else text
+        stripped = prefix.lstrip()
+        if not stripped:
+            return
+        leading = len(prefix) - len(stripped)
+        fuzzy = FuzzyWordCompleter(self._words, WORD=False)
+        sub = Document(stripped, len(stripped))
+        for comp in fuzzy.get_completions(sub, complete_event):
+            yield Completion(
+                comp.text,
+                start_position=-len(prefix) + leading,
+                display=comp.display,
+                display_meta=comp.display_meta,
+            )
+
+
 def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any]:
     for p in partitions:
         if p["name"] == name:
@@ -235,7 +265,7 @@ STEPS: list[Step] = [
          subtitle="e.g. --exclusive --reservation=abc (optional)",
          choices=SBATCH_FLAGS),
     Step("modules", "Modules", "autocomplete",
-         subtitle="Comma-separated, e.g. python/anaconda,cuda (optional)",
+         subtitle="Enter a name, press Enter to add (comma auto-inserted); Tab to advance when done",
          fetch=fetch_available_modules),
     Step("env_type", "Environment type", "select",
          subtitle="Environment activation strategy",
@@ -245,7 +275,7 @@ STEPS: list[Step] = [
          subtitle="Conda environment name or virtualenv path",
          default=""),
     Step("command", "Command to run", "text",
-         subtitle="e.g. python train.py  (Tab completes file paths)",
+         subtitle="e.g. python train.py  (Enter=newline, Tab=complete, Ctrl+G=next)",
          required=True, multiline=True, path=True),
 ]
 
@@ -294,7 +324,6 @@ class Wizard:
         # RadioList (shared across select/partition/gpu_type steps)
         self.radio_list = RadioList([("", "")])
 
-        self.show_help = False
         # Mouse capture OFF by default so the terminal can natively select/copy
         # the script preview. Navigation is fully keyboard-driven; press F2 to
         # enable mouse click/scroll if preferred.
@@ -354,44 +383,41 @@ class Wizard:
     def _build_app(self) -> None:
         kb = KeyBindings()
 
-        @kb.add("f1")
-        @kb.add("?")
-        def _toggle_help(event: Any) -> None:
-            self.show_help = not self.show_help
-            self._invalidate()
-
-        @kb.add("escape", eager=True, filter=Condition(lambda: self.show_help))
-        @kb.add("enter", eager=True, filter=Condition(lambda: self.show_help))
-        def _close_help(event: Any) -> None:
-            self.show_help = False
-            self._invalidate()
-
-        @kb.add("tab", eager=True, filter=Condition(lambda: not self.show_help))
+        @kb.add("tab", eager=True, filter=Condition(lambda: True))
         def _tab(event: Any) -> None:
             buf = self._focused_buffer()
-            if buf is not None and buf.complete_state is not None:
-                buf.complete_next()  # cycle suggestions instead of advancing
-                return
+            if buf is not None:
+                buf.complete_next()
+                if buf.complete_state is not None:
+                    return
             self._confirm_and_next()
 
-        @kb.add("enter", eager=True, filter=Condition(lambda: not self.show_help))
+        @kb.add("enter", eager=True)
         def _enter(event: Any) -> None:
+            s = self.current_step
+            if getattr(s, "multiline", False):
+                buf = self._focused_buffer()
+                if buf is not None:
+                    buf.insert_text("\n")
+                return
             buf = self._focused_buffer()
             if buf is not None and buf.complete_state is not None \
                     and buf.complete_state.current_completion is not None:
                 buf.apply_completion(buf.complete_state.current_completion)
+                if s.key == "modules":
+                    buf.insert_text(", ")
                 return
             self._confirm_and_next()
 
-        @kb.add("s-tab", eager=True, filter=Condition(lambda: self._can_go_back() and not self.show_help))
+        @kb.add("s-tab", eager=True, filter=Condition(lambda: self._can_go_back()))
         def _stab(event: Any) -> None:
             self._go_back()
 
-        @kb.add("escape", eager=True, filter=Condition(lambda: self.idx > 0 and not self.show_help))
+        @kb.add("escape", eager=True, filter=Condition(lambda: self.idx > 0))
         def _esc(event: Any) -> None:
             self._go_back()
 
-        @kb.add("f2", eager=True, filter=Condition(lambda: not self.show_help))
+        @kb.add("f2", eager=True)
         def _toggle_mouse(event: Any) -> None:
             # Releasing mouse capture lets the terminal do native text selection,
             # so users can highlight/copy the script preview. Toggle it back on
@@ -402,6 +428,10 @@ class Wizard:
         @kb.add("c-c")
         def _cc(event: Any) -> None:
             raise KeyboardInterrupt
+
+        @kb.add("c-g", eager=True)
+        def _c_g(event: Any) -> None:
+            self._confirm_and_next()
 
         self.app = Application(
             layout=self._build_layout(),
@@ -515,6 +545,15 @@ class Wizard:
         self.step_cache.pop("partition_sub", None)
         self.step_cache.pop("gpu_sub", None)
         self.step_cache.pop("error", None)
+        # Save current text so it's preserved when returning to this step
+        if s.kind in ("text", "autocomplete", "ntasks_per_node"):
+            val = self._text_val()
+            if val:
+                self.answers[s.key] = self._coerce(val, s)
+        elif s.kind in ("select", "gpu_format"):
+            val = self._radio_value()
+            if val:
+                self.answers[s.key] = self._coerce(val, s)
         self.idx = max(0, self.idx - 1)
         self._on_enter_step("backward")
         self._invalidate()
@@ -588,8 +627,8 @@ class Wizard:
                     return f"Partition '{part.get('name')}' does not support GPUs"
         elif s.key == "gpu_type":
             val = self._radio_value() if self._is_select_active() else self._text_val()
-            gpu_types = part.get("gpu_types", [])
-            if val and gpu_types and val not in gpu_types:
+            gpu_types = self.transient.get("gpu_types", [])
+            if val and val.lower() != "any" and gpu_types and val.lower() not in {g.lower() for g in gpu_types}:
                 return f"GPU type '{val}' not in partition list ({', '.join(gpu_types)})"
 
         return None
@@ -629,7 +668,10 @@ class Wizard:
             if s.key == "env_name":
                 self._setup_env_name(direction)
             else:
-                self.text_area.text = str(prev or self._step_default(s) or "")
+                if isinstance(prev, list):
+                    self.text_area.text = ", ".join(prev)
+                else:
+                    self.text_area.text = str(prev or self._step_default(s) or "")
                 self._setup_autocomplete(s)
         elif s.kind == "select":
             self._setup_select(s, prev)
@@ -652,10 +694,13 @@ class Wizard:
 
     def _setup_autocomplete(self, s: Step) -> None:
         choices = self._resolve_choices(s)
-        if choices:
-            self._set_completer(FuzzyWordCompleter(choices))
-        else:
+        if not choices:
             self._set_completer(None)
+            return
+        if s.key == "modules":
+            self._set_completer(LastTokenCommaCompleter(choices))
+        else:
+            self._set_completer(FuzzyWordCompleter(choices))
 
     # ── Select ──────────────────────────────────────────────────────
 
@@ -874,34 +919,8 @@ class Wizard:
 
     # ── Layout ──────────────────────────────────────────────────────
 
-    def _help_modal(self) -> Frame:
-        help_text = (
-            "\n"
-            "  \u26a1  Slurmate TUI Help  \u26a1\n\n"
-            "  Keyboard Shortcuts:\n"
-            "    Enter / Tab      Go to next step\n"
-            "    Esc / Shift+Tab  Go back to the previous step\n"
-            "    \u2191 \u2193              Move within a list\n"
-            "    F2               Toggle mouse capture (off = select/copy text)\n"
-            "    F1 / ?           Toggle this help menu\n"
-            "    Ctrl + C         Exit wizard\n\n"
-            "  You can skip any step (leave it blank) and come back later.\n"
-            "  Missing required fields are flagged before you submit.\n\n"
-            "  Press F1 or ? to close this menu\n"
-        )
-        return Frame(
-            body=Window(
-                content=FormattedTextControl(help_text),
-                dont_extend_width=True,
-                dont_extend_height=True,
-            ),
-            style="bg:#222222 fg:#ffffff border:#0088ff",
-        )
-
     def _build_layout(self) -> Layout:
         floats = [Float(xcursor=True, ycursor=True, content=CompletionsMenu())]
-        if self.show_help:
-            floats.append(Float(content=self._help_modal()))
 
         focused: Any = self.text_area
         if self._is_text_active():
@@ -1106,12 +1125,14 @@ class Wizard:
         )
 
     def _render_footer(self) -> list[tuple[str, str]]:
-        left = "  Enter/Tab:Next  Esc:Back"
+        s = self.current_step
+        if getattr(s, "multiline", False):
+            left = "  Enter:newline  Tab:complete  Ctrl+G:next"
+        else:
+            left = "  Tab/Enter:Next"
         if self._is_select_active():
             left += "  \u2191\u2193:Move"
-        mouse = "Mouse:on (F2 to select text)" if self.mouse_enabled else "Select/copy text freely (F2=mouse nav)"
-        left += f"  {mouse}"
-        left += "  F1:Help  ^C:Quit"
+        left += "  Esc:Back  ^C:Quit"
         return [("class:info", left)]
 
     # ── Entry point ─────────────────────────────────────────────────

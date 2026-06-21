@@ -159,9 +159,21 @@ class TestHelpers:
 
     def test_detect_gpu_type(self):
         from slurmate.system_utils import _detect_gpu_type
+        # 1. Model from gpu:MODEL:N
         assert _detect_gpu_type("", "gpu:a100:4") == "a100"
-        assert _detect_gpu_type("", "gpu:4") == "gpu"
-        assert _detect_gpu_type("a100", "") == "a100"
+        assert _detect_gpu_type("", "gpu:H100:4") == "H100"  # case preserved
+        assert _detect_gpu_type("", "gpu:mi300x:8") == "mi300x"
+        # 2. Count-only GRES (gpu:N) — scan features with negative filter
+        assert _detect_gpu_type("a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("gold-6346,256g,a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("gold-6346", "gpu:4") == "gpu"
+        assert _detect_gpu_type("256g", "gpu:4") == "gpu"
+        # 3. No gpu: at all → empty
+        assert _detect_gpu_type("a100", "") == ""
+        assert _detect_gpu_type("a30", "") == ""
+        assert _detect_gpu_type("gold-6248r", "") == ""
+        assert _detect_gpu_type("1536g", "") == ""
+        assert _detect_gpu_type("", "") == ""
 
 
 class TestLoadConfig:

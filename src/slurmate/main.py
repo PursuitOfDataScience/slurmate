@@ -15,6 +15,7 @@ from rich.text import Text
 from .builder import build_from_answers, estimate_su
 from .system_utils import (
     _parse_slurm_time_to_minutes,
+    fetch_gpu_types_for_partition,
     fetch_partitions,
     fetch_queue_eta,
     load_config,
@@ -210,10 +211,16 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
     if gpus_val > 0 and not gpu_types:
         console.print(f"  [yellow]\u26a0 Warning: Partition '{part.get('name')}' does not support GPUs[/]")
 
-    # Check GPU type
     gpu_type = answers.get("gpu_type")
-    if gpu_type and gpu_types and gpu_type not in gpu_types:
-        console.print(f"  [yellow]\u26a0 Warning: GPU type '{gpu_type}' not in partition list ({', '.join(gpu_types)})[/]")
+    if gpu_type and gpu_type.lower() != "any" and gpu_type.lower() not in {g.lower() for g in gpu_types}:
+        part_name = part.get("name", "")
+        if part_name:
+            dyn_types = fetch_gpu_types_for_partition(part_name)
+            all_types = gpu_types + [t for t in dyn_types if t not in gpu_types]
+        else:
+            all_types = gpu_types
+        if gpu_type.lower() not in {g.lower() for g in all_types}:
+            console.print(f"  [yellow]\u26a0 Warning: GPU type '{gpu_type}' not in partition list ({', '.join(all_types)})[/]")
 
 
 _REQUIRED_FIELDS = [("job_name", "Job name"), ("partition", "Partition"), ("command", "Command to run")]
@@ -253,9 +260,6 @@ def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict
 def _show_script_and_summary(console: Console, script: str, answers: dict[str, Any],
                               su_estimate: str, queue_info: dict[str, Any] | None = None) -> None:
     print()
-    # Render the script as a Rich Text with our own line numbers + light
-    # highlighting. Text measures exactly (unlike Syntax, whose auto-measurement
-    # could render a broken/too-narrow box), so the panel always closes cleanly.
     script_lines = script.split("\n")
     num_w = len(str(len(script_lines)))
     body = Text()
@@ -274,19 +278,16 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         if i < len(script_lines):
             body.append("\n")
 
+    script_w = max(num_w + 1 + len(ln) for ln in script_lines)
     title_text = "Generated sbatch script"
-    content_w = num_w + 1 + max((len(ln) for ln in script_lines), default=10)
-    panel_w = min(console.width, max(len(title_text) + 6, content_w + 4))
     console.print(Panel(
         body,
         title=f"[bold]{c.PINK}{title_text}[/]",
         border_style="bright_magenta",
+        width=script_w + 4,
         padding=(0, 1),
-        width=panel_w,
     ))
 
-    # Build the summary as (label, value, value-style) rows and render as a Text
-    # with an explicitly computed width, so the box always closes cleanly.
     rows: list[tuple[str, str, str]] = [
         ("Job:", answers.get("job_name", "") or "", "cyan"),
         ("Partition:", answers.get("partition", "") or "", "cyan"),
@@ -317,20 +318,16 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         rows.append(("Est. ETA (rough):", str(queue_info["eta_label"]), eta_color))
 
     label_w = max(len(label) for label, _, _ in rows)
-    val_w = max(len(val) for _, val, _ in rows)
-    summary = Text()
-    for i, (label, val, style) in enumerate(rows):
-        summary.append(f"{label:<{label_w}}  ", style="bold bright_black")
-        summary.append(val, style=style)
-        if i < len(rows) - 1:
-            summary.append("\n")
+    summary_w = max(label_w + 2 + len(val) for label, val, _ in rows)
+    summary = "\n".join(
+        f"[bold bright_black]{label:<{label_w}}  [/][{style}]{val}[/]"
+        for label, val, style in rows
+    )
 
     s_title = "Summary"
-    s_w = min(console.width, max(len(s_title) + 6, label_w + 2 + val_w + 4))
     print()
     console.print(Panel(summary, title=f"[bold]{c.CYAN}{s_title}[/]", border_style="cyan",
-                        padding=(0, 1), width=s_w))
-    print()
+                        width=summary_w + 4, padding=(0, 1)))
 
 
 def _edit_script_in_editor(script: str) -> str:

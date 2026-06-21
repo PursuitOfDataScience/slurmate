@@ -52,7 +52,7 @@ class TestBuildSbatchScript:
         assert "#SBATCH --array=1-5" in script
         assert "module load python/3.10" in script
         assert "module load cuda/12.0" in script
-        assert "conda activate myenv" in script
+        assert "source activate myenv" in script
         assert "python train.py --epochs 100" in script
         assert "#SBATCH --exclusive" in script
         assert "#SBATCH --constraint=ssd" in script
@@ -127,7 +127,7 @@ class TestBuildSbatchScript:
             job_name="test", partition="cpu", cpus=1, memory="1G",
             time_limit="00:01:00", env_name="myenv", env_type="Conda", command="echo hi"
         )
-        assert "conda activate myenv" in script_conda
+        assert "source activate myenv" in script_conda
 
         script_mamba = build_sbatch_script(
             job_name="test", partition="cpu", cpus=1, memory="1G",
