@@ -1,118 +1,210 @@
-# Slurmify
+<div align="center">
 
-Interactive TUI wizard and CLI utility for generating and submitting Slurm `sbatch` scripts.
-
-## Installation
-
-From PyPI:
-
-```bash
-pipx install slurmify
-# or
-pip install slurmify
+```
+███████╗██╗     ██╗   ██╗██████╗ ███╗   ███╗██╗███████╗██╗   ██╗
+██╔════╝██║     ██║   ██║██╔══██╗████╗ ████║██║██╔════╝╚██╗ ██╔╝
+███████╗██║     ██║   ██║██████╔╝██╔████╔██║██║█████╗   ╚████╔╝
+╚════██║██║     ██║   ██║██╔══██╗██║╚██╔╝██║██║██╔══╝    ╚██╔╝
+███████║███████╗╚██████╔╝██║  ██║██║ ╚═╝ ██║██║██║        ██║
+╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝        ╚═╝
 ```
 
-From source:
+### ⚡ Stop hand-writing `sbatch` scripts. Let the wizard do it.
 
-```bash
-pip install .
-```
+A fast, friendly **TUI wizard + CLI** that builds and submits Slurm batch jobs —
+on any cluster, as long as `sbatch` is on your `PATH`.
 
-For development:
+[![CI](https://github.com/PursuitOfDataScience/slurmify/actions/workflows/ci.yml/badge.svg)](https://github.com/PursuitOfDataScience/slurmify/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](#-license)
+[![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#-status)
+[![Linter: ruff](https://img.shields.io/badge/lint-ruff-261230.svg)](https://github.com/astral-sh/ruff)
+[![Types: mypy](https://img.shields.io/badge/types-mypy%20strict-2a6db2.svg)](https://mypy-lang.org/)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#-contributing)
 
-```bash
-pip install -e ".[dev]"
-```
+</div>
 
-## Usage
+---
 
-### Interactive Mode (TUI)
+## ✨ Why Slurmify?
 
-Simply run:
+Writing `#SBATCH` headers by hand is fiddly and error-prone: which partition has
+H100s? what's the memory limit? did I get the `--gres` syntax right for *this*
+cluster? Slurmify turns that into a guided conversation — it reads your cluster
+live, validates as you go, and hands you a clean, ready-to-submit script.
 
 ```bash
 slurmify
 ```
 
-Follow the interactive prompts in the full-screen TUI to configure your job. Once finished, you will be prompted to edit the script in your editor and/or submit the job to Slurm.
+That's it. Answer a few prompts, watch the script build itself in a live
+preview, and submit — or save it for later.
 
-### Batch Mode (Non-interactive)
+---
 
-You can pass arguments to run in batch mode directly without loading the TUI:
-
-```bash
-slurmify --job-name "train_job" --partition "gpu" --cpus 8 --memory "32G" --time "04:00:00" --gpus 1 --command "python train.py"
-```
-
-To skip the final submission confirmation prompt and submit immediately:
+## 🚀 Quick start
 
 ```bash
-slurmify --partition "gpu" --command "python train.py" --yes
+# Recommended: isolated install
+pipx install slurmify
+
+# or plain pip
+pip install slurmify
 ```
 
-Use `slurmify --help` to see all available CLI options.
+<details>
+<summary>Install from source / for development</summary>
 
-## Features & Configurable Behavior
+```bash
+git clone https://github.com/PursuitOfDataScience/slurmify.git
+cd slurmify
+pip install -e ".[dev]"     # editable + dev tools (pytest, ruff, mypy)
+```
 
-- **Live Autocompletion:** Fetches live partitions, conda environments, user accounts, and available modules from the cluster.
-- **File-Path Completion:** When typing the command, a virtualenv path, or output paths, Tab completes filesystem paths (the last token), so you don't retype long project paths.
-- **Skip & Come Back:** Leave any step blank and continue; missing recommended fields are flagged at the final review before you submit. Press Esc (or Shift+Tab) to go back.
-- **Copy the Preview:** Press F2 in the TUI to release mouse capture, then select/copy the script with your terminal as usual; F2 again restores click/scroll.
-- **Auto-Directory Creation:** If output or error logs are configured to be saved inside subdirectories (e.g. `logs/job-%j.out`), those directories are automatically created before submission.
-- **Custom Output Names:** Set an output file name/pattern (`%j` = job ID) via the wizard or `--output-file`; the error path is derived automatically.
-- **Partition-Aware Validation:** Inline warnings in the TUI when your CPU, memory, time, or GPU selections exceed limits of the selected partition.
+</details>
 
-## Environment Variables
+### Interactive mode (the TUI)
 
-Configure Slurmify's behavior using the following environment variables:
+```bash
+slurmify
+```
 
-- `SLURMIFY_MOCK=1`: Force mock mode even if Slurm commands are available on `PATH`.
-- `SLURMIFY_NO_BANNER=1`: Suppress the colorful ASCII banner at startup.
-- `SLURMIFY_BANNER_ANIMATE=1`: Force the banner animation even when not in a standard TTY.
-- `SLURMIFY_LOG_DIR=/path/to/logs`: If set, a copy of every successfully submitted script is saved to this directory for reproducibility.
-- `SLURMIFY_DEBUG=1`: Enable detailed debug log statements.
-- `SLURMIFY_GPU_FORMAT`: Set the formatting style for GPU requests. Supported options:
-  - `constraint` (default): Emits `#SBATCH --gres=gpu:N` and `#SBATCH --constraint=type`.
-  - `gres_type`: Emits `#SBATCH --gres=gpu:type:N`.
-  - `gpus`: Emits `#SBATCH --gpus=type:N` (or `#SBATCH --gpus=N`).
+A full-screen wizard walks you through name → resources → environment →
+command. The generated script grows **live** in a preview pane as you answer,
+and when you're done you get a single menu: **Submit · Edit · Save · Show ·
+Quit**.
 
-## Configuration file
+> 💡 You can leave any step blank and come back to it — anything still missing is
+> flagged before you submit. `Esc` / `Shift+Tab` go back; `F1` opens help.
 
-To avoid retyping the same values every run, Slurmify reads default values from a
-TOML config file. It looks for, in order (first match wins):
+### Batch mode (scriptable, no TUI)
+
+```bash
+slurmify \
+  --job-name train_job \
+  --partition gpu \
+  --cpus 8 --memory 32G --time 04:00:00 \
+  --gpus 1 --gpu-type h100 \
+  --command "python train.py"
+```
+
+Submit immediately, no prompts:
+
+```bash
+slurmify --partition gpu --command "python train.py" --yes
+```
+
+Just want the script? Print it (great for piping or CI):
+
+```bash
+slurmify --partition gpu --command "python train.py" --print > job.sbatch
+```
+
+Run `slurmify --help` for the full flag list.
+
+---
+
+## 🎯 Features
+
+| | |
+|---|---|
+| 🧠 **Live cluster awareness** | Pulls real partitions, GPU types, QoS, accounts, conda envs, and modules from `sinfo` / `scontrol` / `sacctmgr` / `conda`. |
+| 👀 **Live preview** | The `#SBATCH` script builds incrementally as you answer — what you see is exactly what gets submitted. |
+| 🛡️ **Partition-aware validation** | Inline warnings when CPU / memory / time / GPU requests exceed the selected partition's limits. |
+| 📁 **Path autocomplete** | `Tab`-complete file paths while typing your command, virtualenv path, or output files — no more retyping long project paths. |
+| ↩️ **Skip & come back** | Leave steps blank, navigate freely with `Esc`, and get reminded of anything missing before submit. |
+| 📋 **Copy-friendly** | Mouse capture is off by default so you can select/copy the preview natively (`F2` toggles mouse nav). |
+| 🧩 **Cluster-agnostic GPU syntax** | Choose `--gres=gpu:type:N`, `--gres` + `--constraint`, or `--gpus` to match your site. |
+| 🐍 **Env activation** | Conda, Mamba, virtualenv, or none — generated automatically. |
+| 🗂️ **Smart output paths** | Set a custom log name/pattern (`%j` = job ID); error path is derived and log dirs are auto-created. |
+| ♻️ **Reproducible** | Save the script, edit it in `$EDITOR`, or keep a copy of every submission. |
+| 🧪 **Safe to explore** | No Slurm? It falls back to realistic mock data so you can try the whole flow anywhere. |
+
+---
+
+## ⚙️ Configuration file
+
+Stop retyping the same account and partition every run. Slurmify reads defaults
+from a TOML file (first match wins):
 
 1. `.slurmify.toml` in the current directory
 2. `~/.config/slurmify/config.toml`
 
-These defaults are used by **both** the interactive wizard (as prefilled values)
-and batch mode (as fallbacks for any flag you don't pass). Explicit CLI flags
-always override the config file.
-
-Keys may sit at the top level or under a `[defaults]` table. Example:
+These prefill the wizard **and** act as fallbacks in batch mode. Explicit CLI
+flags always win.
 
 ```toml
-account = "my_lab"
-partition = "gpu-shared"
-cpus = 8
-memory = "32G"
-time_limit = "04:00:00"
-gpu_format = "gres_type"      # gres_type | constraint | gpus
-env_type = "conda"            # conda | mamba | venv | none
-modules = ["cuda/12.1", "gcc/9.3.0"]
-output_dir = "logs"
+# .slurmify.toml — keys may be top-level or under a [defaults] table
+account     = "my_lab"
+partition   = "gpu-shared"
+cpus        = 8
+memory      = "32G"
+time_limit  = "04:00:00"
+gpu_format  = "gres_type"            # gres_type | constraint | gpus
+env_type    = "conda"                # conda | mamba | venv | none
+modules     = ["cuda/12.1", "gcc/9.3.0"]
+output_dir  = "logs"
 ```
 
-Recognized keys: `job_name`, `account`, `partition`, `qos`, `cpus`, `memory`,
+**Recognized keys:** `job_name`, `account`, `partition`, `qos`, `cpus`, `memory`,
 `time_limit`, `nodes`, `ntasks_per_node`, `gpus`, `gpu_type`, `gpu_format`,
 `array_spec`, `modules`, `env_type`, `env_name`, `output_dir`, `output_file`,
 `command`, `custom_sbatch`.
 
-> Real TOML parsing is used when available (`tomllib` on Python 3.11+, `tomli`
-> on older versions). If neither is installed, a minimal flat `key = value`
-> reader is used as a fallback — in that mode `[section]` headers are ignored.
+> Real TOML is used when available (`tomllib` on 3.11+, `tomli` otherwise);
+> without either, a minimal flat `key = value` reader is used as a fallback.
 
-## How it works
+---
 
-1. **Information Gathering:** Fetches partition limits, Conda/Mamba environments, and module data dynamically. If Slurm or Conda is not available, falls back to realistic mock metadata.
-2. **Interactive Wizard:** A terminal-based form that guides you through name, resources, dependencies, and shell commands.
-3. **Reproducible Script Generation:** Produces clean `#SBATCH` scripts. If configured, launches a temporary file inside your `$EDITOR` (e.g., `vim` or `nano`) for manual post-generation tweaks before piping directly to `sbatch`.
+## 🔧 Environment variables
+
+| Variable | Effect |
+|---|---|
+| `SLURMIFY_MOCK=1` | Force mock mode even when Slurm is installed (great for demos/tests). |
+| `SLURMIFY_GPU_FORMAT` | Default GPU syntax: `gres_type` (default) · `constraint` · `gpus`. |
+| `SLURMIFY_LOG_DIR=…` | Save a copy of every submitted script there for reproducibility. |
+| `SLURMIFY_NO_BANNER=1` | Hide the startup banner. |
+| `SLURMIFY_BANNER_ANIMATE=1` | Force the animated banner even when not a TTY. |
+| `SLURMIFY_DEBUG=1` | Verbose debug logging. |
+
+`NO_COLOR` and non-TTY output are respected automatically.
+
+---
+
+## 🛠️ How it works
+
+1. **Gather** — query the cluster (or fall back to mock data) for partitions,
+   limits, GPU types, environments, and modules.
+2. **Guide** — a keyboard-first wizard collects name, resources, dependencies,
+   and the command, validating against the chosen partition as you go.
+3. **Generate & submit** — produce a clean `#SBATCH` script, optionally edit it
+   in `$EDITOR`, then pipe it straight to `sbatch` (or save / print it).
+
+---
+
+## 🧪 Status
+
+Slurmify is **experimental** and pre-1.0 — the CLI, config keys, and defaults may
+change between releases. It's already useful day-to-day; pin a version if you
+script around it. Bug reports and cluster-specific quirks are very welcome.
+
+---
+
+## 🤝 Contributing
+
+Issues and PRs are welcome! For local development:
+
+```bash
+pip install -e ".[dev]"
+ruff check src/        # lint
+mypy src/              # types (strict)
+pytest                 # tests
+```
+
+CI runs the same three checks on Python 3.10–3.12 for every push and PR.
+
+---
+
+## 📄 License
+
+[MIT](LICENSE) © Youzhi Yu
