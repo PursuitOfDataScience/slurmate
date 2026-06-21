@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from typing import Any
 
 from prompt_toolkit.application import Application
@@ -30,7 +30,7 @@ from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style as PTStyle
-from prompt_toolkit.widgets import Frame, RadioList, TextArea
+from prompt_toolkit.widgets import RadioList, TextArea
 
 from .builder import build_from_answers
 from .system_utils import (
@@ -106,7 +106,7 @@ class LastTokenPathCompleter(Completer):
     def __init__(self) -> None:
         self._pc = PathCompleter(expanduser=True)
 
-    def get_completions(self, document: Document, complete_event: CompleteEvent):  # type: ignore[no-untyped-def]
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Generator[Completion, None, None]:
         text = document.text_before_cursor
         cut = max(text.rfind(" "), text.rfind("\t"), text.rfind("\n")) + 1
         token = text[cut:]
@@ -133,7 +133,7 @@ class LastTokenCommaCompleter(Completer):
     def __init__(self, words: list[str]) -> None:
         self._words = words
 
-    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Completion:  # type: ignore[override]
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Generator[Completion, None, None]:
         text = document.text_before_cursor
         idx = text.rfind(",")
         prefix = text[idx + 1:] if idx >= 0 else text
