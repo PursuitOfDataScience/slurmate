@@ -9,6 +9,3 @@ build/
 .mypy_cache/
 .ruff_cache/
 .coverage
-
-# Internal tracking
-issues.md
