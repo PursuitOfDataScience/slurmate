@@ -4,6 +4,10 @@ from slurmify.system_utils import normalize_memory
 from slurmify.tui import STEPS, Step, Wizard, _parse_custom_flags
 
 
+def _idx(key):
+    return next(i for i, s in enumerate(STEPS) if s.key == key)
+
+
 class TestStepDefinitions:
     def test_all_steps_have_keys(self):
         for s in STEPS:
@@ -29,10 +33,10 @@ class TestStepDefinitions:
 
     def test_steps_are_in_correct_order(self):
         expected_order = [
-            "job_name", "account", "partition", "qos", "cpus",
+            "job_name", "partition", "account", "qos", "cpus",
             "memory", "time_limit", "nodes", "ntasks_per_node", "gpus", "gpu_type", "gpu_format",
-            "array_spec", "modules", "env_type", "env_name", "output_dir", "output_file",
-            "command", "custom_sbatch",
+            "array_spec", "output_dir", "output_file", "custom_sbatch",
+            "modules", "env_type", "env_name", "command",
         ]
         assert [s.key for s in STEPS] == expected_order
 
@@ -88,7 +92,7 @@ class TestWizardNavigation:
 
     def test_coerce_modules(self):
         w = Wizard()
-        s = STEPS[13]  # modules
+        s = STEPS[_idx("modules")]
         assert w._coerce("python/3.10,cuda/12.0", s) == ["python/3.10", "cuda/12.0"]
         assert w._coerce("", s) is None
 
@@ -96,37 +100,40 @@ class TestWizardNavigation:
 class TestWizardStepKinds:
     def test_text_step_kind_check(self):
         w = Wizard()
-        for idx in [0, 4, 7, 8, 12, 16, 17]:  # text step indices
-            w.idx = idx
-            assert w._is_text_active(), f"Step {idx} should be text"
+        for i, s in enumerate(STEPS):
+            if s.kind in ("text", "autocomplete", "ntasks_per_node"):
+                w.idx = i
+                assert w._is_text_active(), f"Step {s.key} should be text-active"
 
     def test_select_step_kind_check(self):
         w = Wizard()
-        for idx in [3, 9, 11, 14]:  # select step indices
-            w.idx = idx
-            assert w._is_select_active(), f"Step {idx} should be select"
+        for i, s in enumerate(STEPS):
+            if s.kind in ("select", "gpu_format"):
+                w.idx = i
+                assert w._is_select_active(), f"Step {s.key} should be select-active"
 
     def test_autocomplete_step_kind_check(self):
         w = Wizard()
-        for idx in [1, 5, 6, 13, 15, 18]:  # autocomplete step indices
-            w.idx = idx
-            assert w._is_text_active(), f"Step {idx} should be autocomplete (text)"
+        for i, s in enumerate(STEPS):
+            if s.kind == "autocomplete":
+                w.idx = i
+                assert w._is_text_active(), f"Step {s.key} should be autocomplete (text)"
 
     def test_partition_step_kind(self):
         w = Wizard()
-        w.idx = 2  # partition
+        w.idx = _idx("partition")
         w._on_enter_step()
         assert w._is_select_active()  # partition starts in select sub-mode
 
     def test_partition_text_submode(self):
         w = Wizard()
-        w.idx = 2
+        w.idx = _idx("partition")
         w.step_cache["partition_sub"] = "text"
         assert w._is_text_active()
 
     def test_gpu_type_submode_select(self):
         w = Wizard()
-        w.idx = 10
+        w.idx = _idx("gpu_type")
         w.answers["gpus"] = 2
         w.answers["partition"] = "gpu-shared"
         w._on_enter_step()
@@ -134,7 +141,7 @@ class TestWizardStepKinds:
 
     def test_gpu_type_skip_when_zero_gpus(self):
         w = Wizard()
-        w.idx = 10
+        w.idx = _idx("gpu_type")
         w.answers["gpus"] = 0
         old_idx = w.idx
         w._on_enter_step()
@@ -144,7 +151,7 @@ class TestWizardStepKinds:
 class TestPartitionSubFlow:
     def test_setup_partition_creates_radio(self):
         w = Wizard()
-        w.idx = 2
+        w.idx = _idx("partition")
         w._on_enter_step()
         assert w.step_cache.get("partition_sub") == "select"
         assert hasattr(w.radio_list, "values")
@@ -153,14 +160,14 @@ class TestPartitionSubFlow:
 
     def test_partition_go_back_from_text(self):
         w = Wizard()
-        w.idx = 2
+        w.idx = _idx("partition")
         w.step_cache["partition_sub"] = "text"
         w._go_back()
         assert w.step_cache.get("partition_sub") == "select"
 
     def test_partition_go_back_from_all(self):
         w = Wizard()
-        w.idx = 2
+        w.idx = _idx("partition")
         w.step_cache["partition_sub"] = "all"
         w._go_back()
         assert w.step_cache.get("partition_sub") == "select"

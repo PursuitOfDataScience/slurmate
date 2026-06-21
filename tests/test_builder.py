@@ -236,3 +236,32 @@ class TestPartialOutputTiming:
         from slurmify.builder import build_from_answers
         s = build_from_answers({"job_name": "train", "partition": "p", "output_dir": "logs"}, partial=True)
         assert "#SBATCH --output=logs/train-%j.out" in s
+
+
+class TestDirectiveOrdering:
+    def test_sbatch_directives_in_wizard_order(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({
+            "job_name": "j", "partition": "p", "account": "a", "cpus": 4,
+            "memory": "16G", "time_limit": "01:00:00", "nodes": 1,
+            "output_dir": "logs", "command": "echo hi",
+        })
+        order = [ln for ln in s.splitlines() if ln.startswith("#SBATCH")]
+        keys = [ln.split("=")[0].split()[1] for ln in order]
+        assert keys == [
+            "--job-name", "--partition", "--account", "--cpus-per-task",
+            "--mem", "--time", "--nodes", "--output", "--error",
+        ]
+
+    def test_all_sbatch_before_modules_and_command(self):
+        from slurmify.builder import build_from_answers
+        s = build_from_answers({
+            "job_name": "j", "partition": "p", "output_dir": "logs",
+            "modules": ["cuda/12.1"], "env_type": "conda", "env_name": "ai",
+            "command": "python x.py",
+        })
+        lines = s.splitlines()
+        last_sbatch = max(i for i, ln in enumerate(lines) if ln.startswith("#SBATCH"))
+        first_cmd = min(i for i, ln in enumerate(lines)
+                        if ln and not ln.startswith("#") and ln.strip())
+        assert last_sbatch < first_cmd

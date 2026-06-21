@@ -10,7 +10,6 @@ from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 from .builder import build_from_answers, estimate_su
@@ -286,39 +285,51 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         width=panel_w,
     ))
 
-    table = Table.grid(padding=(0, 2))
-    table.add_column(style="bold bright_black")
-    table.add_column(style="cyan")
-    table.add_row("Job:", answers.get("job_name", ""))
-    table.add_row("Partition:", answers.get("partition", ""))
+    # Build the summary as (label, value, value-style) rows and render as a Text
+    # with an explicitly computed width, so the box always closes cleanly.
+    rows: list[tuple[str, str, str]] = [
+        ("Job:", answers.get("job_name", "") or "", "cyan"),
+        ("Partition:", answers.get("partition", "") or "", "cyan"),
+    ]
     if answers.get("account"):
-        table.add_row("Account:", answers["account"])
+        rows.append(("Account:", answers["account"], "cyan"))
     if answers.get("qos") and answers["qos"] != "Default (none)":
-        table.add_row("QoS:", f"[magenta]{answers['qos']}[/]")
-    table.add_row("CPUs:", str(answers.get("cpus", "")))
-    table.add_row("Memory:", answers.get("memory", ""))
-    table.add_row("Time:", answers.get("time_limit", ""))
-    table.add_row("Nodes:", str(answers.get("nodes", 1)))
+        rows.append(("QoS:", answers["qos"], "magenta"))
+    rows.append(("CPUs:", str(answers.get("cpus", "")), "cyan"))
+    rows.append(("Memory:", answers.get("memory", "") or "", "cyan"))
+    rows.append(("Time:", answers.get("time_limit", "") or "", "cyan"))
+    rows.append(("Nodes:", str(answers.get("nodes", 1)), "cyan"))
     if answers.get("gpus", 0) > 0:
         gt = answers.get("gpu_type") or "any"
-        table.add_row("GPUs:", f"{answers['gpus']} \u00d7 {gt}")
+        rows.append(("GPUs:", f"{answers['gpus']} \u00d7 {gt}", "cyan"))
     if answers.get("array_spec"):
-        table.add_row("Array:", f"[yellow]{answers['array_spec']}[/]")
+        rows.append(("Array:", str(answers["array_spec"]), "yellow"))
     if answers.get("modules"):
-        table.add_row("Modules:", ", ".join(answers["modules"]))
+        rows.append(("Modules:", ", ".join(answers["modules"]), "cyan"))
     if answers.get("env_name"):
-        table.add_row("Conda env:", answers["env_name"])
+        rows.append(("Env:", answers["env_name"], "cyan"))
     if answers.get("custom_sbatch"):
-        table.add_row("Custom flags:", ", ".join(answers["custom_sbatch"]))
-    table.add_row("Est. SU (rough):", f"[yellow]{su_estimate} SU[/]")
+        rows.append(("Custom flags:", ", ".join(answers["custom_sbatch"]), "cyan"))
+    rows.append(("Est. SU (rough):", f"{su_estimate} SU", "yellow"))
     if queue_info:
-        table.add_row("Queue:", f"{queue_info['running']} run [dim]/[/] {queue_info['pending']} wait")
+        rows.append(("Queue:", f"{queue_info['running']} run / {queue_info['pending']} wait", "white"))
         eta_color = "green" if queue_info["eta_seconds"] < 3600 else "yellow"
-        table.add_row("Est. ETA (rough):", f"[{eta_color}]{queue_info['eta_label']}[/]")
+        rows.append(("Est. ETA (rough):", str(queue_info["eta_label"]), eta_color))
 
+    label_w = max(len(label) for label, _, _ in rows)
+    val_w = max(len(val) for _, val, _ in rows)
+    summary = Text()
+    for i, (label, val, style) in enumerate(rows):
+        summary.append(f"{label:<{label_w}}  ", style="bold bright_black")
+        summary.append(val, style=style)
+        if i < len(rows) - 1:
+            summary.append("\n")
+
+    s_title = "Summary"
+    s_w = min(console.width, max(len(s_title) + 6, label_w + 2 + val_w + 4))
     print()
-    console.print(Panel(table, title=f"[bold]{c.CYAN}Summary[/]", border_style="cyan",
-                        padding=(0, 1), expand=False))
+    console.print(Panel(summary, title=f"[bold]{c.CYAN}{s_title}[/]", border_style="cyan",
+                        padding=(0, 1), width=s_w))
     print()
 
 
@@ -335,17 +346,15 @@ def _edit_script_in_editor(script: str) -> str:
         os.unlink(tmp_path)
 
 
-def _offer_save_script(script: str, default_name: str) -> None:
-    """When a job isn't submitted, offer to save the generated script to disk."""
+def _save_script(script: str, default_name: str) -> None:
+    """Prompt for a path and write the script (returns to caller either way)."""
     import questionary
 
     from .theme import questionary_style
     QS = questionary_style()
-    save = questionary.confirm("Save the script to a file?", default=True, qmark="", style=QS).ask()
-    if not save:
-        return
-    path = questionary.text("Save as:", default=default_name, qmark="", style=QS).ask()
+    path = questionary.text("Save as (Esc to cancel):", default=default_name, qmark="", style=QS).ask()
     if not path or not path.strip():
+        print(f"  {c.GRAY}Save cancelled.{c.RESET}")
         return
     path = os.path.expanduser(path.strip())
     try:
@@ -357,6 +366,34 @@ def _offer_save_script(script: str, default_name: str) -> None:
         print(f"  {c.GREEN}✓ Saved to {path}{c.RESET}")
     except OSError as e:
         print(f"  {c.RED}✗ Could not save: {e}{c.RESET}")
+
+
+def _submit_and_report(script: str, answers: dict[str, Any], console: Console) -> None:
+    """Submit the job and print the result, log path, and follow-up hints."""
+    retcode, stdout, stderr = submit_sbatch(script, job_name=answers.get("job_name", "slurm"))
+    if retcode != 0:
+        print(f"  {c.RED}✗ Submission failed (exit {retcode}){c.RESET}")
+        if stdout:
+            print(f"  {c.GRAY}{stdout}{c.RESET}")
+        if stderr:
+            print(f"  {c.RED}{stderr}{c.RESET}")
+        sys.exit(1)
+
+    job_id = stdout.strip()
+    print(f"  {c.GREEN}✓ Submitted!{c.RESET} Job ID: {c.CYAN}{job_id}{c.RESET}")
+
+    # Read the actual --output path from the generated script (source of truth).
+    log_path = f"{answers.get('job_name', '') or 'slurm'}-%j.out"
+    for line in script.splitlines():
+        if line.startswith("#SBATCH --output="):
+            log_path = line.split("=", 1)[1].strip()
+            break
+    resolved_log = log_path.replace("%j", job_id)
+    print(f"  {c.GRAY}Log path: {resolved_log}{c.RESET}")
+    print(f"  {c.GRAY}Hints:{c.RESET}")
+    print(f"    squeue -j {job_id}")
+    print(f"    tail -f {resolved_log}")
+    print(f"    scancel {job_id}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -425,60 +462,50 @@ def main() -> None:
 
     script, queue_info = build_and_show(answers, console)
 
-    if not args.yes:
-        import questionary
-
-        from .theme import questionary_style
-        QS = questionary_style()
-        editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vim"))
-        edit = questionary.confirm(f"Open in {editor} to edit?", default=True, qmark="", style=QS).ask()
-        if edit is None:
-            print(f"  {c.YELLOW}Cancelled.{c.RESET}")
-            return
-        if edit:
-            script = _edit_script_in_editor(script)
-            _show_script_and_summary(console, script, answers, estimate_su(
-                answers.get("cpus", 1), answers.get("time_limit", "02:00:00"), answers.get("nodes", 1),
-            ), queue_info)
-
     if args.yes:
-        submit = True
-    else:
-        import questionary
+        _submit_and_report(script, answers, console)
+        return
 
-        from .theme import questionary_style
-        QS = questionary_style()
-        submit = questionary.confirm("Submit this job to Slurm?", default=True, qmark="", style=QS).ask()
-        if submit is None or not submit:
-            print(f"  {c.YELLOW}Job not submitted.{c.RESET}")
-            _offer_save_script(script, f"{answers.get('job_name', '') or 'slurm'}.sh")
+    import questionary
+
+    from .theme import questionary_style
+    QS = questionary_style()
+    editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vim"))
+    default_name = f"{answers.get('job_name', '') or 'slurm'}.sh"
+
+    def _resummarize() -> None:
+        _show_script_and_summary(console, script, answers, estimate_su(
+            answers.get("cpus", 1), answers.get("time_limit", "02:00:00"), answers.get("nodes", 1),
+        ), queue_info)
+
+    # A navigable action menu instead of a one-way confirm chain: every action
+    # returns here, and Esc/Ctrl-C cancels cleanly.
+    while True:
+        action = questionary.select(
+            "What would you like to do?",
+            choices=[
+                "Submit to Slurm",
+                f"Edit in {editor}",
+                "Save script to a file",
+                "Show script again",
+                "Quit without submitting",
+            ],
+            qmark="", style=QS,
+        ).ask()
+
+        if action is None or action.startswith("Quit"):
+            print(f"  {c.YELLOW}Not submitted.{c.RESET}")
             return
-
-    retcode, stdout, stderr = submit_sbatch(script, job_name=answers.get("job_name", "slurm"))
-    if retcode != 0:
-        print(f"  {c.RED}\u2717 Submission failed (exit {retcode}){c.RESET}")
-        if stdout:
-            print(f"  {c.GRAY}{stdout}{c.RESET}")
-        if stderr:
-            print(f"  {c.RED}{stderr}{c.RESET}")
-        sys.exit(1)
-
-    job_id = stdout.strip()
-    print(f"  {c.GREEN}\u2713 Submitted!{c.RESET} Job ID: {c.CYAN}{job_id}{c.RESET}")
-
-    # Read the actual --output path from the generated script (source of truth).
-    log_path = f"{answers.get('job_name', '') or 'slurm'}-%j.out"
-    for line in script.splitlines():
-        if line.startswith("#SBATCH --output="):
-            log_path = line.split("=", 1)[1].strip()
-            break
-
-    resolved_log = log_path.replace("%j", job_id)
-    print(f"  {c.GRAY}Log path: {resolved_log}{c.RESET}")
-    print(f"  {c.GRAY}Hints:{c.RESET}")
-    print(f"    squeue -j {job_id}")
-    print(f"    tail -f {resolved_log}")
-    print(f"    scancel {job_id}")
+        if action.startswith("Submit"):
+            _submit_and_report(script, answers, console)
+            return
+        if action.startswith("Edit"):
+            script = _edit_script_in_editor(script)
+            _resummarize()
+        elif action.startswith("Save"):
+            _save_script(script, default_name)
+        elif action.startswith("Show"):
+            _resummarize()
 
 
 if __name__ == "__main__":

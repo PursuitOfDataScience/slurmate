@@ -1039,8 +1039,7 @@ class Wizard:
         return Window(
             FormattedTextControl(self._render_preview_text),
             style="bg:#1a1a2e",
-            dont_extend_height=True,
-            height=D(max=10),
+            height=D(min=8),
         )
 
     def _tokenize_bash_line(self, line: str) -> list[tuple[str, str]]:
