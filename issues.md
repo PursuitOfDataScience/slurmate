@@ -1,6 +1,6 @@
 # Issues and Resolutions
 
-_All entries from #1 – #20 were resolved before commit `2ffcd5d` (the first tracked version). Entries from #21 onward are resolved in the current version and later._
+_Entries #1 – #21 were resolved in v0.2.0. Entries from #22 onward are tracked moving forward._
 
 ## 1. Output file extension inconsistency
 **Problem:** `#SBATCH --output=logs/test` (no `.out` extension) but `#SBATCH --error=logs/test.err` has `.err`. Bare filenames lacked the `.out` extension.
