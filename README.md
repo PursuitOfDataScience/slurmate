@@ -19,8 +19,6 @@ on any cluster, as long as `sbatch` is on your `PATH`.
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](#-license)
 [![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#-status)
 [![Linter: ruff](https://img.shields.io/badge/lint-ruff-261230.svg)](https://github.com/astral-sh/ruff)
-[![Types: mypy](https://img.shields.io/badge/types-mypy%20strict-2a6db2.svg)](https://mypy-lang.org/)
-[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#-contributing)
 
 </div>
 
@@ -207,4 +205,4 @@ CI runs the same three checks on Python 3.10–3.12 for every push and PR.
 
 ## 📄 License
 
-[MIT](LICENSE) © Youzhi Yu
+Released under the [MIT License](LICENSE).
