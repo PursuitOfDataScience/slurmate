@@ -386,9 +386,14 @@ class Wizard:
         @kb.add("tab", eager=True, filter=Condition(lambda: True))
         def _tab(event: Any) -> None:
             buf = self._focused_buffer()
+            s = self.current_step
             if buf is not None:
                 buf.complete_next()
                 if buf.complete_state is not None:
+                    return
+                # Multiline steps with path completers rely on Ctrl+G to
+                # advance — Tab only tries to complete, never navigates away.
+                if getattr(s, "multiline", False):
                     return
             self._confirm_and_next()
 

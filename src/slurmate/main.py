@@ -282,7 +282,7 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
     title_text = "Generated sbatch script"
     console.print(Panel(
         body,
-        title=f"[bold]{c.PINK}{title_text}[/]",
+        title=f"[bold #ff0080]{title_text}[/]",
         border_style="bright_magenta",
         width=script_w + 4,
         padding=(0, 1),
@@ -326,7 +326,7 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
 
     s_title = "Summary"
     print()
-    console.print(Panel(summary, title=f"[bold]{c.CYAN}{s_title}[/]", border_style="cyan",
+    console.print(Panel(summary, title=f"[bold cyan]{s_title}[/]", border_style="cyan",
                         width=summary_w + 4, padding=(0, 1)))
 
 
