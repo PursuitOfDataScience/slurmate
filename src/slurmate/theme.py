@@ -51,12 +51,12 @@ class C:
 c = C()
 
 BANNER_LINES = [
-    r"    ███████╗██╗     ██╗   ██╗██████╗ ███╗   ███╗██╗███████╗██╗   ██╗",
-    r"    ██╔════╝██║     ██║   ██║██╔══██╗████╗ ████║██║██╔════╝╚██╗ ██╔╝",
-    r"    ███████╗██║     ██║   ██║██████╔╝██╔████╔██║██║█████╗   ╚████╔╝ ",
-    r"    ╚════██║██║     ██║   ██║██╔══██╗██║╚██╔╝██║██║██╔══╝    ╚██╔╝  ",
-    r"    ███████║███████╗╚██████╔╝██║  ██║██║ ╚═╝ ██║██║██║        ██║   ",
-    r"    ╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝        ╚═╝   ",
+    r"    ███████╗██╗     ██╗   ██╗██████╗ ███╗   ███╗ █████╗ ████████╗███████╗",
+    r"    ██╔════╝██║     ██║   ██║██╔══██╗████╗ ████║██╔══██╗╚══██╔══╝██╔════╝",
+    r"    ███████╗██║     ██║   ██║██████╔╝██╔████╔██║███████║   ██║   █████╗  ",
+    r"    ╚════██║██║     ██║   ██║██╔══██╗██║╚██╔╝██║██╔══██║   ██║   ██╔══╝  ",
+    r"    ███████║███████╗╚██████╔╝██║  ██║██║ ╚═╝ ██║██║  ██║   ██║   ███████╗",
+    r"    ╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝",
 ]
 
 # Use class-level access (not the `c` instance) so the gradient codes are not
@@ -83,17 +83,17 @@ BASE_RGB = [_to_rgb(g) for g in BANNER_GRADIENT]
 
 
 def print_banner(animate: bool | str | None = False) -> None:
-    """Print banner, respecting NO_COLOR and SLURMIFY_NO_BANNER env vars.
+    """Print banner, respecting NO_COLOR and SLURMATE_NO_BANNER env vars.
 
     Args:
         animate: If True, show animation. Default is False (instant display).
-                 Can be overridden with SLURMIFY_BANNER_ANIMATE=1.
+                 Can be overridden with SLURMATE_BANNER_ANIMATE=1.
     """
-    if os.environ.get("SLURMIFY_NO_BANNER"):
+    if os.environ.get("SLURMATE_NO_BANNER"):
         return
 
     use_color = _should_use_color()
-    use_animation = animate or os.environ.get("SLURMIFY_BANNER_ANIMATE") == "1"
+    use_animation = animate or os.environ.get("SLURMATE_BANNER_ANIMATE") == "1"
 
     print()
     if use_color:
@@ -106,9 +106,9 @@ def print_banner(animate: bool | str | None = False) -> None:
 
     if not use_animation or not use_color:
         if use_color:
-            subtitle = f"{c.CYAN}Slurmify{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
+            subtitle = f"{c.CYAN}Slurmate{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
         else:
-            subtitle = "Slurmify  \u2014  interactive sbatch wizard"
+            subtitle = "Slurmate  \u2014  interactive sbatch wizard"
         print(f"  {subtitle}")
         print(f"  {c.GRAY if use_color else ''}ESC to go back{c.RESET if use_color else ''}")
         print()
@@ -133,7 +133,7 @@ def print_banner(animate: bool | str | None = False) -> None:
     for i, line in enumerate(BANNER_LINES):
         print(f"\033[2K{BANNER_GRADIENT[i]}{c.BOLD}\033[3m{line}\033[23m{c.RESET}")
     print()
-    subtitle = f"{c.CYAN}Slurmify{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
+    subtitle = f"{c.CYAN}Slurmate{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
     print(f"  {subtitle}")
     print(f"  {c.GRAY}ESC to go back{c.RESET}")
     print()

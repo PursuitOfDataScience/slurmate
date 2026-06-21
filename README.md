@@ -14,7 +14,7 @@
 A fast, friendly **TUI wizard + CLI** that builds and submits Slurm batch jobs —
 on any cluster, as long as `sbatch` is on your `PATH`.
 
-[![CI](https://github.com/PursuitOfDataScience/slurmify/actions/workflows/ci.yml/badge.svg)](https://github.com/PursuitOfDataScience/slurmify/actions/workflows/ci.yml)
+[![CI](https://github.com/PursuitOfDataScience/slurmate/actions/workflows/ci.yml/badge.svg)](https://github.com/PursuitOfDataScience/slurmate/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](#-license)
 [![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#-status)
@@ -24,15 +24,15 @@ on any cluster, as long as `sbatch` is on your `PATH`.
 
 ---
 
-## ✨ Why Slurmify?
+## ✨ Why Slurmate?
 
 Writing `#SBATCH` headers by hand is fiddly and error-prone: which partition has
 H100s? what's the memory limit? did I get the `--gres` syntax right for *this*
-cluster? Slurmify turns that into a guided conversation — it reads your cluster
+cluster? Slurmate turns that into a guided conversation — it reads your cluster
 live, validates as you go, and hands you a clean, ready-to-submit script.
 
 ```bash
-slurmify
+slurmate
 ```
 
 That's it. Answer a few prompts, watch the script build itself in a live
@@ -44,18 +44,18 @@ preview, and submit — or save it for later.
 
 ```bash
 # Recommended: isolated install
-pipx install slurmify
+pipx install slurmate
 
 # or plain pip
-pip install slurmify
+pip install slurmate
 ```
 
 <details>
 <summary>Install from source / for development</summary>
 
 ```bash
-git clone https://github.com/PursuitOfDataScience/slurmify.git
-cd slurmify
+git clone https://github.com/PursuitOfDataScience/slurmate.git
+cd slurmate
 pip install -e ".[dev]"     # editable + dev tools (pytest, ruff, mypy)
 ```
 
@@ -64,7 +64,7 @@ pip install -e ".[dev]"     # editable + dev tools (pytest, ruff, mypy)
 ### Interactive mode (the TUI)
 
 ```bash
-slurmify
+slurmate
 ```
 
 A full-screen wizard walks you through name → resources → environment →
@@ -78,7 +78,7 @@ Quit**.
 ### Batch mode (scriptable, no TUI)
 
 ```bash
-slurmify \
+slurmate \
   --job-name train_job \
   --partition gpu \
   --cpus 8 --memory 32G --time 04:00:00 \
@@ -89,16 +89,16 @@ slurmify \
 Submit immediately, no prompts:
 
 ```bash
-slurmify --partition gpu --command "python train.py" --yes
+slurmate --partition gpu --command "python train.py" --yes
 ```
 
 Just want the script? Print it (great for piping or CI):
 
 ```bash
-slurmify --partition gpu --command "python train.py" --print > job.sbatch
+slurmate --partition gpu --command "python train.py" --print > job.sbatch
 ```
 
-Run `slurmify --help` for the full flag list.
+Run `slurmate --help` for the full flag list.
 
 ---
 
@@ -122,17 +122,17 @@ Run `slurmify --help` for the full flag list.
 
 ## ⚙️ Configuration file
 
-Stop retyping the same account and partition every run. Slurmify reads defaults
+Stop retyping the same account and partition every run. Slurmate reads defaults
 from a TOML file (first match wins):
 
-1. `.slurmify.toml` in the current directory
-2. `~/.config/slurmify/config.toml`
+1. `.slurmate.toml` in the current directory
+2. `~/.config/slurmate/config.toml`
 
 These prefill the wizard **and** act as fallbacks in batch mode. Explicit CLI
 flags always win.
 
 ```toml
-# .slurmify.toml — keys may be top-level or under a [defaults] table
+# .slurmate.toml — keys may be top-level or under a [defaults] table
 account     = "my_lab"
 partition   = "gpu-shared"
 cpus        = 8
@@ -158,12 +158,12 @@ output_dir  = "logs"
 
 | Variable | Effect |
 |---|---|
-| `SLURMIFY_MOCK=1` | Force mock mode even when Slurm is installed (great for demos/tests). |
-| `SLURMIFY_GPU_FORMAT` | Default GPU syntax: `gres_type` (default) · `constraint` · `gpus`. |
-| `SLURMIFY_LOG_DIR=…` | Save a copy of every submitted script there for reproducibility. |
-| `SLURMIFY_NO_BANNER=1` | Hide the startup banner. |
-| `SLURMIFY_BANNER_ANIMATE=1` | Force the animated banner even when not a TTY. |
-| `SLURMIFY_DEBUG=1` | Verbose debug logging. |
+| `SLURMATE_MOCK=1` | Force mock mode even when Slurm is installed (great for demos/tests). |
+| `SLURMATE_GPU_FORMAT` | Default GPU syntax: `gres_type` (default) · `constraint` · `gpus`. |
+| `SLURMATE_LOG_DIR=…` | Save a copy of every submitted script there for reproducibility. |
+| `SLURMATE_NO_BANNER=1` | Hide the startup banner. |
+| `SLURMATE_BANNER_ANIMATE=1` | Force the animated banner even when not a TTY. |
+| `SLURMATE_DEBUG=1` | Verbose debug logging. |
 
 `NO_COLOR` and non-TTY output are respected automatically.
 
@@ -182,7 +182,7 @@ output_dir  = "logs"
 
 ## 🧪 Status
 
-Slurmify is **experimental** and pre-1.0 — the CLI, config keys, and defaults may
+Slurmate is **experimental** and pre-1.0 — the CLI, config keys, and defaults may
 change between releases. It's already useful day-to-day; pin a version if you
 script around it. Bug reports and cluster-specific quirks are very welcome.
 

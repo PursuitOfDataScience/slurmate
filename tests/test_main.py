@@ -1,6 +1,6 @@
 """Tests for the CLI entry point and batch mode."""
 
-from slurmify.main import _parse_custom_flags, parse_args, run_batch
+from slurmate.main import _parse_custom_flags, parse_args, run_batch
 
 
 class TestParseArgs:
@@ -95,7 +95,7 @@ class TestRunBatch:
 class TestPartitionLimitsValidation:
     def test_validate_partition_limits_warnings(self):
         from rich.console import Console
-        from slurmify.main import _validate_partition_limits
+        from slurmate.main import _validate_partition_limits
 
         # Mock partition object
         part_obj = {
@@ -157,7 +157,7 @@ class TestPartitionLimitsValidation:
 
 class TestColorSuppression:
     def test_no_color_env_var(self, monkeypatch):
-        from slurmify.theme import C
+        from slurmate.theme import C
         monkeypatch.setenv("NO_COLOR", "1")
         theme_c = C()
         assert theme_c.PINK == ""
@@ -167,7 +167,7 @@ class TestColorSuppression:
 class TestMissingRequired:
     def test_warns_about_blank_required(self):
         from rich.console import Console
-        from slurmify.main import _warn_missing_required
+        from slurmate.main import _warn_missing_required
         console = Console(width=100)
         with console.capture() as cap:
             missing = _warn_missing_required({"partition": "gpu"}, console)
@@ -177,7 +177,7 @@ class TestMissingRequired:
 
     def test_no_warning_when_complete(self):
         from rich.console import Console
-        from slurmify.main import _warn_missing_required
+        from slurmate.main import _warn_missing_required
         console = Console(width=100)
         with console.capture() as cap:
             missing = _warn_missing_required(

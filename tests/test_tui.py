@@ -1,7 +1,7 @@
 """Tests for the TUI wizard step definitions and logic."""
 
-from slurmify.system_utils import normalize_memory
-from slurmify.tui import STEPS, Step, Wizard, _parse_custom_flags
+from slurmate.system_utils import normalize_memory
+from slurmate.tui import STEPS, Step, Wizard, _parse_custom_flags
 
 
 def _idx(key):
@@ -24,7 +24,7 @@ class TestStepDefinitions:
 
     def test_required_keys_have_validation(self):
         """job_name and command have inline required-field checks."""
-        from slurmify.tui import Wizard
+        from slurmate.tui import Wizard
         w = Wizard()
         for s in STEPS:
             if s.key in ("job_name", "command"):
@@ -223,8 +223,8 @@ class TestStepValidation:
 class TestWizardConfigDefaults:
     def test_config_does_not_mutate_global_steps(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("SLURMIFY_MOCK", raising=False)
-        (tmp_path / ".slurmify.toml").write_text('cpus = 99\nenv_type = "venv"\n')
+        monkeypatch.delenv("SLURMATE_MOCK", raising=False)
+        (tmp_path / ".slurmate.toml").write_text('cpus = 99\nenv_type = "venv"\n')
         before = {s.key: s.default for s in STEPS}
         w = Wizard()
         after = {s.key: s.default for s in STEPS}
@@ -238,7 +238,7 @@ class TestRadioSelection:
     def test_reads_highlighted_row_not_initial_value(self):
         # Regression: the wizard handles Enter eagerly, so RadioList.current_value
         # never syncs to the navigated row. Selecting must read _selected_index.
-        from slurmify.tui import STEPS, Wizard
+        from slurmate.tui import STEPS, Wizard
         w = Wizard()
         w.idx = next(i for i, s in enumerate(STEPS) if s.key == "gpus")
         s = STEPS[w.idx]
@@ -249,7 +249,7 @@ class TestRadioSelection:
         assert w._radio_value() == "4"
 
     def test_set_radio_default_moves_cursor(self):
-        from slurmify.tui import STEPS, Wizard
+        from slurmate.tui import STEPS, Wizard
         w = Wizard()
         w.idx = next(i for i, st in enumerate(STEPS) if st.key == "gpus")
         s = STEPS[w.idx]
@@ -259,7 +259,7 @@ class TestRadioSelection:
 
 class TestFreeNavigation:
     def test_can_skip_required_empty_field(self):
-        from slurmify.tui import STEPS, Wizard
+        from slurmate.tui import STEPS, Wizard
         w = Wizard()
         w.idx = next(i for i, s in enumerate(STEPS) if s.key == "job_name")
         w.text_area.text = ""  # leave required job_name blank
@@ -269,7 +269,7 @@ class TestFreeNavigation:
         assert w.idx > 0
 
     def test_invalid_nonempty_still_blocks(self):
-        from slurmify.tui import STEPS, Wizard
+        from slurmate.tui import STEPS, Wizard
         w = Wizard()
         w.idx = next(i for i, s in enumerate(STEPS) if s.key == "memory")
         start = w.idx
@@ -281,7 +281,7 @@ class TestFreeNavigation:
 
 class TestQosCoerceAndPathCompleter:
     def test_qos_default_coerces_to_none(self):
-        from slurmify.tui import STEPS, Wizard
+        from slurmate.tui import STEPS, Wizard
         w = Wizard()
         qos = next(s for s in STEPS if s.key == "qos")
         assert w._coerce("Default (none)", qos) is None
@@ -291,7 +291,7 @@ class TestQosCoerceAndPathCompleter:
         from prompt_toolkit.completion import CompleteEvent
         from prompt_toolkit.document import Document
         from prompt_toolkit.formatted_text import fragment_list_to_text
-        from slurmify.tui import LastTokenPathCompleter
+        from slurmate.tui import LastTokenPathCompleter
         (tmp_path / "alpha.txt").write_text("x")
         (tmp_path / "beta.txt").write_text("x")
         pc = LastTokenPathCompleter()
@@ -303,7 +303,7 @@ class TestQosCoerceAndPathCompleter:
         assert all("beta.txt" not in n for n in names)
 
     def test_path_steps_flagged(self):
-        from slurmify.tui import STEPS
+        from slurmate.tui import STEPS
         path_keys = {s.key for s in STEPS if getattr(s, "path", False)}
         assert {"output_dir", "output_file", "command"} <= path_keys
 
@@ -311,8 +311,8 @@ class TestQosCoerceAndPathCompleter:
 class TestNoneTextAreaGuards:
     def test_gpu_type_text_branch_with_none(self, monkeypatch):
         # Regression: answers["gpu_type"] == None must not crash TextArea.
-        import slurmify.tui as t
-        from slurmify.tui import STEPS, Wizard
+        import slurmate.tui as t
+        from slurmate.tui import STEPS, Wizard
         monkeypatch.setattr(t, "fetch_gpu_types_for_partition", lambda p: [])
         w = Wizard()
         w.idx = next(i for i, s in enumerate(STEPS) if s.key == "gpu_type")
@@ -321,7 +321,7 @@ class TestNoneTextAreaGuards:
         assert w.text_area.text == ""
 
     def test_env_name_venv_with_none(self, monkeypatch):
-        from slurmify.tui import STEPS, Wizard
+        from slurmate.tui import STEPS, Wizard
         w = Wizard()
         w.idx = next(i for i, s in enumerate(STEPS) if s.key == "env_name")
         w.answers.update({"env_type": "Virtualenv (venv)", "env_name": None})

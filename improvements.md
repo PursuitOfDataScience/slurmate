@@ -1,4 +1,4 @@
-# Slurmify — Improvements & Issues (Third pass)
+# Slurmate — Improvements & Issues (Third pass)
 
 Re-evaluation after the second fix round. **Verdict: the codebase is in good
 shape.** Every release-blocker and almost every item from the previous two
@@ -23,7 +23,7 @@ Severity: 🔴 Critical · 🟠 Major · 🟡 Minor
 
 **Yes, CI is enabled and correct.** `.github/workflows/ci.yml` runs on every
 push and PR to `master`, across a Python 3.9–3.12 matrix, and executes:
-`ruff check src/` → `mypy src/` → `pytest` (with `SLURMIFY_MOCK=1`). A push to
+`ruff check src/` → `mypy src/` → `pytest` (with `SLURMATE_MOCK=1`). A push to
 GitHub will block on any lint, type, or test failure. `.pre-commit-config.yaml`
 mirrors this locally (ruff + ruff-format + mypy).
 
@@ -58,7 +58,7 @@ All previously-open items, verified against the current source:
 | UX | 3.6 help overlay | ✅ F1/`?` modal |
 | UX | 3.7 highlighted preview | ✅ `_tokenize_bash_line` colorizes the live preview |
 | Tests | 6.1 memory rejection cases | ✅ `validate_memory("")/"0"/"abc"` asserted |
-| Tests | 6.3 conftest | ✅ `tests/conftest.py` sets path + `SLURMIFY_MOCK` |
+| Tests | 6.3 conftest | ✅ `tests/conftest.py` sets path + `SLURMATE_MOCK` |
 | Tooling | 7.2 mypy strict | ✅ `strict = true` |
 | Tooling | 7.3 release workflow | ⚠️ Exists but does not publish (R1) |
 | Tooling | 7.4 pre-commit | ✅ Added |
@@ -85,20 +85,20 @@ This is the single biggest gap versus the project goal. `release.yml` ends at
 
 Also recommended: gate the publish on the test job passing, and add a TestPyPI
 dry-run on pre-release tags. Until this exists, “as long as Slurm is installed,
-`pip install slurmify`” is not yet true — the package isn’t on the index.
+`pip install slurmate`” is not yet true — the package isn’t on the index.
 
 ### R2 🟠 `NO_COLOR` / non-TTY is only half-honored
 `theme._should_use_color()` correctly checks `NO_COLOR`, `TERM=dumb`, and TTY —
 but it **only gates the banner**. The status messages in `main.py`
 (“Running in batch mode”, “Cancelled.”, “✗ Submission failed”, “✓ Submitted!”,
 the job ID) print raw `c.YELLOW` / `c.GREEN` / `c.RED` escape codes
-unconditionally. Result: `NO_COLOR=1 slurmify …` and piping to a file still emit
+unconditionally. Result: `NO_COLOR=1 slurmate …` and piping to a file still emit
 ANSI in those lines. The `rich` panels are fine (rich auto-detects), but the
 hand-rolled `c.*` output is not. Route all `c.*` printing through a helper that
 returns `""` when `_should_use_color()` is false (or build a no-op `C` instance).
 
 ### R3 🟠 GPU encoding is configurable but not reachable from the UI
-`gpu_format` only comes from the `SLURMIFY_GPU_FORMAT` env var — there is **no
+`gpu_format` only comes from the `SLURMATE_GPU_FORMAT` env var — there is **no
 wizard step and no `--gpu-format` CLI flag**, and the wizard never sets the
 `gpu_format` answer key. So the great new flexibility is invisible to users, and
 the default `constraint` mode emits `--gres=gpu:N` **plus** `--constraint=<type>`
@@ -116,7 +116,7 @@ ruff release in CI could turn this into an error. Move them under
 ### R5 🟡 Default job output still lands in the submission CWD
 `submit_sbatch` now `mkdir -p`s directories named in `--output`/`--error`, but
 the **default** `output_path` is `{job}-%j.out` (no directory) — so logs go to
-wherever the user ran `slurmify`, and there is no wizard step or `--output-dir`
+wherever the user ran `slurmate`, and there is no wizard step or `--output-dir`
 flag to put them somewhere sane (e.g. `logs/`). The mkdir only helps users who
 already know to type a path. Add an output-directory prompt/flag defaulting to
 `logs/`.
@@ -142,7 +142,7 @@ flags). Consider a “tasks per node” step shown only when `nodes > 1`.
 `estimate_su` = `cpus × hours × nodes`. It ignores GPU weighting and per-partition
 charge multipliers, which is how most allocations actually bill. The “(rough)”
 label is honest, but consider making the multiplier pluggable
-(`SLURMIFY_SU_PER_*`) or dropping SU entirely and keeping only the Slurm-backed
+(`SLURMATE_SU_PER_*`) or dropping SU entirely and keeping only the Slurm-backed
 ETA.
 
 ### R10 🟡 `requires-python` vs mypy target mismatch
@@ -172,7 +172,7 @@ Coverage breadth improved (76 tests, real value assertions for
   These parsers are where cluster-to-cluster breakage will actually happen; add
   a `tests/fixtures/` of recorded command output and parse it.
 - **6.4** No coverage measurement — add `pytest-cov` to dev-deps and a
-  `--cov=slurmify` step (even non-gating) in CI.
+  `--cov=slurmate` step (even non-gating) in CI.
 
 ---
 
@@ -181,8 +181,8 @@ Coverage breadth improved (76 tests, real value assertions for
 These aren’t bugs — they’re what would make a returning user’s second run
 trivial:
 
-- **Config file / saved defaults.** A `~/.config/slurmify/config.toml` (or
-  `.slurmify.toml` in CWD) for `account`, `partition`, `gpu_format`, default
+- **Config file / saved defaults.** A `~/.config/slurmate/config.toml` (or
+  `.slurmate.toml` in CWD) for `account`, `partition`, `gpu_format`, default
   modules. On a single cluster a user re-types the same account every time;
   remembering it is the highest-value usability win.
 - **`--dry-run` / `--print`.** A batch flag that prints the script and exits
@@ -201,7 +201,7 @@ trivial:
 
 **Phase 0 — Make the PyPI goal real (do first)**
 1. Add a real publish step to `release.yml` (Trusted Publishing or token). 🔴
-2. Update README install docs to `pipx install slurmify` / `pip install slurmify`
+2. Update README install docs to `pipx install slurmate` / `pip install slurmate`
    once the index has it.
 
 **Phase 1 — Correctness polish**

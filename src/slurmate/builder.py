@@ -124,7 +124,7 @@ def build_sbatch_script(
         lines.append("#SBATCH --ntasks-per-node=1")
 
     if gpus > 0:
-        gpu_fmt = gpu_format or os.environ.get("SLURMIFY_GPU_FORMAT", "gres_type").lower()
+        gpu_fmt = gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type").lower()
         if gpu_fmt == "gres_type" and gpu_type:
             lines.append(f"#SBATCH --gres=gpu:{gpu_type}:{gpus}")
         elif gpu_fmt == "gpus":

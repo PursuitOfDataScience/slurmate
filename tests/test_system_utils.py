@@ -1,6 +1,6 @@
 """Tests for the Slurm system utilities (mock mode)."""
 
-from slurmify.system_utils import (
+from slurmate.system_utils import (
     MOCK_ACCOUNTS,
     MOCK_CONDA_ENVS,
     MOCK_GPU_TYPES,
@@ -105,7 +105,7 @@ class TestFetchQueueEta:
         assert MOCK_QUEUE_INFO["eta_seconds"] >= 0
 
     def test_queue_eta_format(self):
-        from slurmify.system_utils import _format_eta
+        from slurmate.system_utils import _format_eta
         assert _format_eta(0) == "now"
         assert _format_eta(30) == "~30s"
         assert _format_eta(300) == "~5min"
@@ -137,7 +137,7 @@ echo hello
 
 class TestHelpers:
     def test_validate_memory(self):
-        from slurmify.system_utils import validate_memory
+        from slurmate.system_utils import validate_memory
         assert validate_memory("16G") is True
         assert validate_memory("64000M") is True
         assert validate_memory("1T") is True
@@ -146,19 +146,19 @@ class TestHelpers:
         assert validate_memory("abc") is False
 
     def test_parse_mem_to_mb(self):
-        from slurmify.system_utils import _parse_mem_to_mb
+        from slurmate.system_utils import _parse_mem_to_mb
         assert _parse_mem_to_mb("16G") == 16384
         assert _parse_mem_to_mb("1T") == 1048576
         assert _parse_mem_to_mb("64000M") == 64000
 
     def test_parse_slurm_time(self):
-        from slurmify.system_utils import _parse_slurm_time_to_minutes
+        from slurmate.system_utils import _parse_slurm_time_to_minutes
         assert _parse_slurm_time_to_minutes("01:00:00") == 60.0
         assert _parse_slurm_time_to_minutes("02:30:00") == 150.0
         assert _parse_slurm_time_to_minutes("1-00:00:00") == 1440.0
 
     def test_detect_gpu_type(self):
-        from slurmify.system_utils import _detect_gpu_type
+        from slurmate.system_utils import _detect_gpu_type
         assert _detect_gpu_type("", "gpu:a100:4") == "a100"
         assert _detect_gpu_type("", "gpu:4") == "gpu"
         assert _detect_gpu_type("a100", "") == "a100"
@@ -168,18 +168,18 @@ class TestLoadConfig:
     def test_mock_mode_is_hermetic(self, tmp_path, monkeypatch):
         # Even with a real config present, mock mode must ignore it.
         monkeypatch.chdir(tmp_path)
-        (tmp_path / ".slurmify.toml").write_text('account = "x"\n')
-        monkeypatch.setenv("SLURMIFY_MOCK", "1")
-        from slurmify.system_utils import load_config
+        (tmp_path / ".slurmate.toml").write_text('account = "x"\n')
+        monkeypatch.setenv("SLURMATE_MOCK", "1")
+        from slurmate.system_utils import load_config
         assert load_config() == {}
 
     def test_reads_toml_with_section_and_types(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("SLURMIFY_MOCK", raising=False)
-        (tmp_path / ".slurmify.toml").write_text(
+        monkeypatch.delenv("SLURMATE_MOCK", raising=False)
+        (tmp_path / ".slurmate.toml").write_text(
             'partition = "gpu"\ncpus = 8\n[defaults]\nmodules = ["a", "b"]\n'
         )
-        from slurmify.system_utils import load_config
+        from slurmate.system_utils import load_config
         cfg = load_config()
         assert cfg["partition"] == "gpu"
         assert cfg["cpus"] == 8
@@ -187,7 +187,7 @@ class TestLoadConfig:
 
     def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("SLURMIFY_MOCK", raising=False)
+        monkeypatch.delenv("SLURMATE_MOCK", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
-        from slurmify.system_utils import load_config
+        from slurmate.system_utils import load_config
         assert load_config() == {}

@@ -400,7 +400,7 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console) -
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     from . import __version__
-    parser = argparse.ArgumentParser(description="Slurmify \u2014 sbatch wizard")
+    parser = argparse.ArgumentParser(description="Slurmate \u2014 sbatch wizard")
     parser.add_argument("--job-name", default=None, help="Job name")
     parser.add_argument("--account", default=None, help="Slurm account")
     parser.add_argument("--partition", default=None, help="Target partition")
@@ -428,7 +428,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--yes", action="store_true", help="Skip confirmation and submit")
     parser.add_argument("--dry-run", action="store_true", help="Print the script and exit without submitting")
     parser.add_argument("--print", action="store_true", help="Print the script to stdout and exit")
-    parser.add_argument("--version", action="version", version=f"slurmify {__version__}")
+    parser.add_argument("--version", action="version", version=f"slurmate {__version__}")
     return parser.parse_args(argv)
 
 

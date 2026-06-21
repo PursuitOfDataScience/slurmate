@@ -39,7 +39,7 @@ def _run_command(cmd: list[str], timeout: int = _RUN_TIMEOUT) -> tuple[str, str,
 
 
 def _force_mock() -> bool:
-    return os.environ.get("SLURMIFY_MOCK", "").lower() in ("1", "true", "yes")
+    return os.environ.get("SLURMATE_MOCK", "").lower() in ("1", "true", "yes")
 
 
 def is_tool_available(name: str) -> bool:
@@ -501,7 +501,7 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
     job_id = result.stdout.strip()
 
     # Optionally save script to disk for reproducibility
-    log_dir = os.environ.get("SLURMIFY_LOG_DIR")
+    log_dir = os.environ.get("SLURMATE_LOG_DIR")
     if log_dir:
         try:
             os.makedirs(log_dir, exist_ok=True)
@@ -509,7 +509,7 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
             with open(script_path, "w") as f:
                 f.write(script_content)
         except OSError as e:
-            logger.debug(f"Failed to save script copy to SLURMIFY_LOG_DIR: {e}")
+            logger.debug(f"Failed to save script copy to SLURMATE_LOG_DIR: {e}")
 
     return result.returncode, job_id, ""
 
@@ -543,9 +543,9 @@ def _parse_config_naive(text: str) -> dict[str, Any]:
 
 
 def _flatten_config(data: dict[str, Any]) -> dict[str, Any]:
-    """Take top-level scalar keys, then merge an optional [defaults]/[slurmify] table."""
+    """Take top-level scalar keys, then merge an optional [defaults]/[slurmate] table."""
     config: dict[str, Any] = {k: v for k, v in data.items() if not isinstance(v, dict)}
-    for section in ("defaults", "slurmify"):
+    for section in ("defaults", "slurmate"):
         sect = data.get(section)
         if isinstance(sect, dict):
             config.update(sect)
@@ -555,13 +555,13 @@ def _flatten_config(data: dict[str, Any]) -> dict[str, Any]:
 def load_config() -> dict[str, Any]:
     """Load configuration defaults from a TOML file.
 
-    Looks for ``.slurmify.toml`` in the current directory, then
-    ``~/.config/slurmify/config.toml``; the first file found wins. Keys may sit
-    at the top level or under a ``[defaults]`` (or ``[slurmify]``) table. Real
+    Looks for ``.slurmate.toml`` in the current directory, then
+    ``~/.config/slurmate/config.toml``; the first file found wins. Keys may sit
+    at the top level or under a ``[defaults]`` (or ``[slurmate]``) table. Real
     TOML is used when a parser is available (``tomllib`` on 3.11+, ``tomli`` on
     older Pythons), otherwise a minimal flat key=value reader is used.
 
-    Returns ``{}`` in mock mode (``SLURMIFY_MOCK``) so tests stay hermetic, and
+    Returns ``{}`` in mock mode (``SLURMATE_MOCK``) so tests stay hermetic, and
     on any missing or unreadable file.
     """
     if _force_mock():
@@ -581,8 +581,8 @@ def load_config() -> dict[str, Any]:
             toml = None
 
     paths = [
-        Path.cwd() / ".slurmify.toml",
-        Path.home() / ".config" / "slurmify" / "config.toml",
+        Path.cwd() / ".slurmate.toml",
+        Path.home() / ".config" / "slurmate" / "config.toml",
     ]
     for p in paths:
         if not p.exists():

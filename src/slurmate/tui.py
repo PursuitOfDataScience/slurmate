@@ -48,9 +48,9 @@ from .system_utils import (
     validate_time,
 )
 
-# Setup debug logging if SLURMIFY_DEBUG is set
+# Setup debug logging if SLURMATE_DEBUG is set
 logger = logging.getLogger(__name__)
-if os.environ.get("SLURMIFY_DEBUG"):
+if os.environ.get("SLURMATE_DEBUG"):
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -877,7 +877,7 @@ class Wizard:
     def _help_modal(self) -> Frame:
         help_text = (
             "\n"
-            "  \u26a1  Slurmify TUI Help  \u26a1\n\n"
+            "  \u26a1  Slurmate TUI Help  \u26a1\n\n"
             "  Keyboard Shortcuts:\n"
             "    Enter / Tab      Go to next step\n"
             "    Esc / Shift+Tab  Go back to the previous step\n"
@@ -939,7 +939,7 @@ class Wizard:
         ])
 
     def _render_header_left(self) -> list[tuple[str, str]]:
-        return [("class:status-bar", "  \u26a1  Slurmify \u2014 sbatch wizard")]
+        return [("class:status-bar", "  \u26a1  Slurmate \u2014 sbatch wizard")]
 
     def _render_header_right(self) -> list[tuple[str, str]]:
         s = self.current_step

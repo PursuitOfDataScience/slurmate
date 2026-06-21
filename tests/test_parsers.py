@@ -4,7 +4,7 @@ from typing import Any
 import pytest
 from unittest.mock import MagicMock
 
-from slurmify.system_utils import (
+from slurmate.system_utils import (
     fetch_partitions,
     fetch_public_partitions,
     fetch_qos_for_partition,
@@ -12,7 +12,7 @@ from slurmify.system_utils import (
     fetch_queue_eta,
     submit_sbatch,
 )
-from slurmify.tui import Wizard
+from slurmate.tui import Wizard
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
@@ -58,9 +58,9 @@ class TestRealParsers:
     @pytest.fixture(autouse=True)
     def setup_mocks(self, mocker):
         # Force is_tool_available to return True for Slurm tools
-        mocker.patch("slurmify.system_utils.is_tool_available", return_value=True)
+        mocker.patch("slurmate.system_utils.is_tool_available", return_value=True)
         # Mock _run_command with our fixture router
-        mocker.patch("slurmify.system_utils._run_command", side_effect=mock_run_command)
+        mocker.patch("slurmate.system_utils._run_command", side_effect=mock_run_command)
 
     def test_fetch_partitions_real(self):
         parts = fetch_partitions()
@@ -109,7 +109,7 @@ class TestRealParsers:
 
 class TestSubmitSbatchReal:
     def test_submit_sbatch_success(self, mocker):
-        mocker.patch("slurmify.system_utils.is_tool_available", return_value=True)
+        mocker.patch("slurmate.system_utils.is_tool_available", return_value=True)
         # Mock subprocess.run for sbatch
         mock_run = MagicMock()
         mock_run.returncode = 0
@@ -123,7 +123,7 @@ class TestSubmitSbatchReal:
         assert err == ""
 
     def test_submit_sbatch_failure(self, mocker):
-        mocker.patch("slurmify.system_utils.is_tool_available", return_value=True)
+        mocker.patch("slurmate.system_utils.is_tool_available", return_value=True)
         # Mock subprocess.run error
         mock_run = MagicMock()
         mock_run.returncode = 1
@@ -137,7 +137,7 @@ class TestSubmitSbatchReal:
         assert "sbatch: error:" in err
 
     def test_submit_sbatch_timeout(self, mocker):
-        mocker.patch("slurmify.system_utils.is_tool_available", return_value=True)
+        mocker.patch("slurmate.system_utils.is_tool_available", return_value=True)
         import subprocess
         mocker.patch("subprocess.run", side_effect=subprocess.TimeoutExpired(["sbatch"], 30))
 
@@ -157,10 +157,10 @@ class TestWizardFlow:
 
     def test_wizard_partition_mapping(self, mocker):
         wizard = Wizard()
-        mocker.patch("slurmify.tui.fetch_public_partitions", return_value=[
+        mocker.patch("slurmate.tui.fetch_public_partitions", return_value=[
             {"name": "cpu-shared", "nodes": 100, "cpus_per_node": 32, "mem_per_node_mb": 131072, "gpu_types": []}
         ])
-        mocker.patch("slurmify.tui.fetch_partitions", return_value=[
+        mocker.patch("slurmate.tui.fetch_partitions", return_value=[
             {"name": "cpu-shared", "nodes": 100, "cpus_per_node": 32, "mem_per_node_mb": 131072, "gpu_types": []}
         ])
 

@@ -1,6 +1,6 @@
 """Tests for the sbatch script builder."""
 
-from slurmify.builder import build_sbatch_script, estimate_su
+from slurmate.builder import build_sbatch_script, estimate_su
 
 
 class TestBuildSbatchScript:
@@ -166,7 +166,7 @@ class TestEstimateSu:
 
 class TestPartialPreview:
     def test_partial_omits_unentered_fields(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "j", "partition": "p"}, partial=True)
         assert "--job-name=j" in s
         assert "--partition=p" in s
@@ -177,19 +177,19 @@ class TestPartialPreview:
         assert "--mem=" not in s
 
     def test_partial_hides_partition_until_entered(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "j"}, partial=True)
         assert "--partition" not in s
         assert "--job-name=j" in s
 
     def test_partial_hides_output_until_name(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"cpus": 4}, partial=True)
         assert "--output" not in s
         assert "--cpus-per-task=4" in s
 
     def test_full_build_still_fills_defaults(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "j", "partition": "p", "command": "echo hi"})
         assert "--time=02:00:00" in s
         assert "--nodes=1" in s
@@ -200,24 +200,24 @@ class TestPartialPreview:
 
 class TestQosAndOutputFile:
     def test_qos_default_none_omitted(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "j", "partition": "p", "qos": "Default (none)"})
         assert "--qos" not in s
 
     def test_qos_explicit_kept(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "j", "partition": "p", "qos": "high"})
         assert "#SBATCH --qos=high" in s
 
     def test_output_file_in_dir_and_derived_error(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "j", "partition": "p",
                                 "output_dir": "logs", "output_file": "run-%j.out"})
         assert "#SBATCH --output=logs/run-%j.out" in s
         assert "#SBATCH --error=logs/run-%j.err" in s
 
     def test_output_file_explicit_path_ignores_dir(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "j", "partition": "p",
                                 "output_dir": "logs", "output_file": "/tmp/x.out"})
         assert "#SBATCH --output=/tmp/x.out" in s
@@ -226,21 +226,21 @@ class TestQosAndOutputFile:
 
 class TestPartialOutputTiming:
     def test_output_hidden_until_dir_or_file(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         # just job name + partition -> no output lines yet
         s = build_from_answers({"job_name": "train", "partition": "p"}, partial=True)
         assert "--output" not in s
         assert "--error" not in s
 
     def test_output_shown_once_dir_entered(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "train", "partition": "p", "output_dir": "logs"}, partial=True)
         assert "#SBATCH --output=logs/train-%j.out" in s
 
 
 class TestDirectiveOrdering:
     def test_sbatch_directives_in_wizard_order(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({
             "job_name": "j", "partition": "p", "account": "a", "cpus": 4,
             "memory": "16G", "time_limit": "01:00:00", "nodes": 1,
@@ -254,7 +254,7 @@ class TestDirectiveOrdering:
         ]
 
     def test_all_sbatch_before_modules_and_command(self):
-        from slurmify.builder import build_from_answers
+        from slurmate.builder import build_from_answers
         s = build_from_answers({
             "job_name": "j", "partition": "p", "output_dir": "logs",
             "modules": ["cuda/12.1"], "env_type": "conda", "env_name": "ai",
