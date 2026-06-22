@@ -15,6 +15,7 @@ A fast, friendly **TUI wizard + CLI** that builds and submits Slurm batch jobs �
 on any cluster, as long as `sbatch` is on your `PATH`.
 
 [![CI](https://github.com/PursuitOfDataScience/slurmate/actions/workflows/ci.yml/badge.svg)](https://github.com/PursuitOfDataScience/slurmate/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/slurmate.svg)](https://pypi.org/project/slurmate/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](#-license)
 [![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#-status)
@@ -68,12 +69,16 @@ slurmate
 ```
 
 A full-screen wizard walks you through name → resources → environment →
-command. The generated script grows **live** in a preview pane as you answer,
-and when you're done you get a single menu: **Submit · Edit · Save · Show ·
-Quit**.
+command. The generated script grows **live** in a preview pane as you answer.
+A final **Review & Submit** screen shows your full configuration and the
+generated script side by side, then a single menu lets you **submit**, **go
+back to edit your answers**, **open the script in `$EDITOR`**, **save** it, or
+**quit**.
 
 > 💡 You can leave any step blank and come back to it — anything still missing is
-> flagged before you submit. `Esc` / `Shift+Tab` go back; `F1` opens help.
+> flagged before you submit. `Esc` / `Shift+Tab` go back at any step (including
+> from the action menu, to re-edit your answers); navigation is fully
+> keyboard-driven.
 
 ### Batch mode (scriptable, no TUI)
 
@@ -111,11 +116,11 @@ Run `slurmate --help` for the full flag list.
 | 🛡️ **Partition-aware validation** | Inline warnings when CPU / memory / time / GPU requests exceed the selected partition's limits. |
 | 📁 **Path autocomplete** | `Tab`-complete file paths while typing your command, virtualenv path, or output files — no more retyping long project paths. |
 | ↩️ **Skip & come back** | Leave steps blank, navigate freely with `Esc`, and get reminded of anything missing before submit. |
-| 📋 **Copy-friendly** | Mouse capture is off by default so you can select/copy the preview natively (`F2` toggles mouse nav). |
+| 📋 **Copy-friendly** | Mouse capture is off so you can select/copy the preview natively; navigation is fully keyboard-driven. |
 | 🧩 **Cluster-agnostic GPU syntax** | Choose `--gres=gpu:type:N`, `--gres` + `--constraint`, or `--gpus` to match your site. |
 | 🐍 **Env activation** | Conda, Mamba, virtualenv, or none — generated automatically. |
 | 🗂️ **Smart output paths** | Set a custom log name/pattern (`%j` = job ID); error path is derived and log dirs are auto-created. |
-| ♻️ **Reproducible** | Save the script, edit it in `$EDITOR`, or keep a copy of every submission. |
+| ♻️ **Reproducible** | Every submission is saved locally as `<job>-<job-id>.sh`; you can also save manually or edit in `$EDITOR` before submitting. |
 | 🧪 **Safe to explore** | No Slurm? It falls back to realistic mock data so you can try the whole flow anywhere. |
 
 ---
