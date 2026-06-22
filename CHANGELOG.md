@@ -5,6 +5,16 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.2.1] — 2026-06-22
+
+### Fixed
+
+- PyPI `README` was out of sync with the GitHub `README` — the `v0.2.0`
+  release was cut before a documentation polish commit landed, so PyPI was
+  missing the `[PyPI]` badge, had an older "Interactive mode" description
+  (lacked the **Review & Submit** walkthrough), and used shorter feature-table
+  text. Now resolved for the `v0.2.1` release.
+
 ## [0.2.0] — 2026-06-21
 
 ### Added
@@ -199,5 +209,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - `ruff` and `mypy` CI checks.
 - Test suite with fixtures for partition, queue, and GPU type parsing.
 
+[0.2.1]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/PursuitOfDataScience/slurmate/releases/tag/v0.1.0

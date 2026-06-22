@@ -2,6 +2,8 @@
 
 _Entries #1 – #21 were resolved in v0.2.0 (see [CHANGELOG.md](CHANGELOG.md))._
 
+_Issues resolved in v0.2.1 are folded into the [0.2.1] entry of the CHANGELOG._
+
 _Second-round issues #22 – #27 and the regressions #28 – #29 introduced by the
 UI work are all **resolved** and folded into the v0.2.0 entry of the CHANGELOG.
 Verified 2026-06-22: ruff + mypy clean, 120 tests pass, and the
