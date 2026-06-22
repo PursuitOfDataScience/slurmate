@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 from .system_utils import _parse_slurm_time_to_minutes
+
+logger = logging.getLogger(__name__)
 
 
 def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
@@ -31,12 +34,13 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
     error_path: str | None
     if output_file:
         of = output_file.strip()
-        output_path = _in_dir(of)
-        if of.endswith(".out"):
-            error_path = output_path[:-4] + ".err"
+        base, ext = os.path.splitext(of)
+        if ext:
+            output_path = _in_dir(of)
+            error_path = _in_dir(base + ".err")
         else:
-            output_path = output_path + ".out"
-            error_path = output_path[:-4] + ".err"
+            output_path = _in_dir(of + ".out")
+            error_path = _in_dir(of + ".err")
     elif output_dir:
         out_dir = output_dir.strip().rstrip("/")
         output_path = f"{out_dir}/{prefix}-%j.out"
@@ -152,6 +156,11 @@ def build_sbatch_script(
         lines.append(f"#SBATCH --error={err}")
 
     if custom_sbatch:
+        # Defensive: a bare string here would be iterated character-by-character
+        # (#SBATCH m, #SBATCH i, …). Callers should pass a list; coerce just in
+        # case by splitting on commas.
+        if isinstance(custom_sbatch, str):
+            custom_sbatch = [f.strip() for f in custom_sbatch.split(",") if f.strip()]
         for flag in custom_sbatch:
             if gpus > 0:
                 parts = flag.strip().split('=', 1)
@@ -184,6 +193,8 @@ def build_sbatch_script(
         elif strategy in ("virtualenv (venv)", "venv"):
             lines.append("")
             lines.append(f"source {env_name}/bin/activate")
+        else:
+            logger.warning(f"env_type '{env_type}' with env_name '{env_name}' — no activation line emitted")
 
     if command:
         lines.append("")

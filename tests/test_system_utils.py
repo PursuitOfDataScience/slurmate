@@ -168,12 +168,37 @@ class TestHelpers:
         assert _detect_gpu_type("gold-6346,256g,a100", "gpu:4") == "a100"
         assert _detect_gpu_type("gold-6346", "gpu:4") == "gpu"
         assert _detect_gpu_type("256g", "gpu:4") == "gpu"
-        # 3. No gpu: at all → empty
+        # 3. Regression: micro-arch/ISA tokens must not be detected as GPU types
+        assert _detect_gpu_type("avx512,skylake,a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("skylake", "gpu:4") == "gpu"
+        assert _detect_gpu_type("avx512,sse42,fma", "gpu:4") == "gpu"
+        assert _detect_gpu_type("cascadelake", "gpu:4") == "gpu"
+        assert _detect_gpu_type("sapphirerapids", "gpu:4") == "gpu"
+        assert _detect_gpu_type("zen3", "gpu:4") == "gpu"
+        assert _detect_gpu_type("icelake,broadwell,haswell", "gpu:4") == "gpu"
+        # 4. No gpu: at all → empty
         assert _detect_gpu_type("a100", "") == ""
         assert _detect_gpu_type("a30", "") == ""
         assert _detect_gpu_type("gold-6248r", "") == ""
         assert _detect_gpu_type("1536g", "") == ""
         assert _detect_gpu_type("", "") == ""
+
+    def test_detect_gpu_type_with_known_models(self):
+        from slurmate.system_utils import _detect_gpu_type
+        # known_models is *preferred* — a corroborated token wins even when a
+        # non-GPU label appears before it in the features string.
+        assert _detect_gpu_type("rack5,gpfs,a40", "gpu:4", known_models={"a40"}) == "a40"
+        # Case-insensitive corroboration, original casing preserved.
+        assert _detect_gpu_type("rack5,A100", "gpu:4", known_models={"a100"}) == "A100"
+        # Fallback: a real GPU model that is NOT in known_models is still
+        # detected via negative filtering (regression guard — feature-only GPU
+        # types must not be dropped just because some other node had a typed GRES).
+        assert _detect_gpu_type("a100", "gpu:4", known_models={"a30"}) == "a100"
+        assert _detect_gpu_type("gold-6346,256g,h100", "gpu:4", known_models={"a30"}) == "h100"
+        # Fallback still rejects pure CPU/arch junk.
+        assert _detect_gpu_type("avx512,skylake", "gpu:4", known_models={"a30"}) == "gpu"
+        # Typed GRES overrides everything.
+        assert _detect_gpu_type("rack5,gpfs", "gpu:a40:4", known_models={"h100"}) == "a40"
 
 
 class TestLoadConfig:

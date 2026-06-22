@@ -133,14 +133,20 @@ def normalize_memory(value: str) -> str:
     return v
 
 
-def _detect_gpu_type(features: str, gres: str) -> str:
+def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = None) -> str:
     """Extract GPU model name from sinfo output.
 
     Priority:
     1. Parse model from ``gpu:MODEL:N`` in GRES.
-    2. If GRES has ``gpu:N`` (count-only), scan features for tokens that
-       cannot be dismissed as CPU models, memory sizes, or infrastructure
-       labels (negative filtering rather than a hardcoded GPU list).
+    2. If GRES is count-only (``gpu:N``), scan node features:
+       a. When ``known_models`` is given, *prefer* a feature token that matches
+          a model seen in a typed GRES elsewhere in the partition. This
+          disambiguates nodes whose features list rack/filesystem labels
+          *before* the GPU (e.g. ``rack5,gpfs,a40`` → ``a40``).
+       b. Otherwise (no corroborating match, or no ``known_models``), fall back
+          to negative filtering: reject obvious CPU/arch/infra tokens and return
+          the first plausible one. This keeps detecting GPU types that only ever
+          appear in features and never in a typed GRES.
     3. If GRES has no ``gpu:`` at all the node has no GPUs — return empty.
     """
     text = f"{features},{gres}"
@@ -153,16 +159,30 @@ def _detect_gpu_type(features: str, gres: str) -> str:
     if "gpu:" not in text.lower():
         return ""
 
-    for token in re.split(r"[,/ ]+", features):
-        token = token.strip()
-        if not token:
-            continue
+    tokens = [t.strip() for t in re.split(r"[,/ ]+", features) if t.strip()]
+
+    # Prefer a feature token corroborated by a typed GRES elsewhere.
+    if known_models:
+        known_lower = {m.lower() for m in known_models}
+        for token in tokens:
+            if token.lower() in known_lower:
+                return token
+
+    # Fall back to negative filtering: reject obvious non-GPU tokens and return
+    # the first plausible one. Never drops a real GPU type that lives only in
+    # the features string.
+    for token in tokens:
         if not re.match(r"[a-zA-Z]", token):
             continue
         if len(token) >= 15:
             continue
         if re.match(
-            r"(?:gold|xeon|epyc|ryzen|atom|i[3579])",
+            r"(?:gold|xeon|epyc|ryzen|atom|i[3579]|avx\d*|sse\d*|fma)",
+            token, re.IGNORECASE
+        ):
+            continue
+        if re.match(
+            r"(?:skylake|cascadelake|icelake|sapphirerapids|broadwell|haswell|zen\d*)",
             token, re.IGNORECASE
         ):
             continue
@@ -323,32 +343,77 @@ def fetch_gpu_types_for_partition(partition: str) -> list[str]:
     if rc != 0:
         return list(MOCK_GPU_TYPES)
 
-    types: set[str] = set()
+    # Pass 1: collect typed GPU models from gpu:MODEL:N across all nodes,
+    # and stash the raw lines for a second pass.
+    typed_models: set[str] = set()
+    lines_data: list[tuple[str, str]] = []
     for line in stdout.splitlines():
         parts = line.strip().split("|", 1)
         if len(parts) < 2:
             continue
         features, gres = parts[0].strip(), parts[1].strip()
-        gpu_type = _detect_gpu_type(features, gres)
+        lines_data.append((features, gres))
+        gres_match = re.search(
+            r"gpu:([a-z0-9._-]+):\d+", f"{features},{gres}", re.IGNORECASE
+        )
+        if gres_match:
+            candidate = gres_match.group(1).replace("_", "-")
+            if candidate.lower() not in {"gpu", "mps", "shard"}:
+                typed_models.add(candidate)
+
+    # Pass 2: detect a type per node, *preferring* corroboration against the
+    # typed models (to disambiguate nodes that list non-GPU labels first) but
+    # still falling back to feature scanning, so count-only GPU nodes whose
+    # model lives only in features are never lost.
+    types: set[str] = set()
+    for features, gres in lines_data:
+        gpu_type = _detect_gpu_type(features, gres, known_models=typed_models)
         if gpu_type and gpu_type != "gpu":
             types.add(gpu_type)
     return sorted(types)
 
 
-def fetch_conda_envs() -> list[str]:
-    if not is_tool_available("conda"):
+def fetch_conda_envs(modules: list[str] | None = None) -> list[str]:
+    """List conda environment names.
+
+    Conda is frequently provided by a module (e.g. ``module load anaconda``)
+    rather than being on ``PATH`` directly, so when ``modules`` are given we load
+    them first — inside a login shell where ``module`` is defined — and then run
+    ``conda env list``. This surfaces every env that becomes visible under the
+    user's chosen module stack. With no modules we still try a bare ``conda``.
+    """
+    if _force_mock():
         return list(MOCK_CONDA_ENVS)
 
-    stdout, _, rc = _run_command(["conda", "env", "list", "--json"])
+    prefix = ""
+    if modules:
+        names = " ".join(
+            (m[:-9] if m.endswith("(default)") else m).strip()
+            for m in modules
+            if m and m.strip()
+        )
+        if names.strip():
+            prefix = f"module load {names} >/dev/null 2>&1; "
+
+    stdout, _, rc = _run_command(
+        ["bash", "-lc", f"{prefix}conda env list --json 2>/dev/null"]
+    )
     if rc != 0:
-        return list(MOCK_CONDA_ENVS)
+        # Real failure (conda/module not found): return nothing rather than
+        # misleading mock names so the user can just type their env/path.
+        return []
 
     try:
-        data = json.loads(stdout)
-        envs = data.get("envs", [])
-        return [env.split("/")[-1] for env in envs]
+        # A login shell may emit banner text before the JSON; slice it out.
+        start, end = stdout.find("{"), stdout.rfind("}")
+        if start == -1 or end == -1:
+            return []
+        data = json.loads(stdout[start:end + 1])
+        envs = [env.rstrip("/").split("/")[-1] for env in data.get("envs", []) if env]
+        # De-dup while preserving order.
+        return list(dict.fromkeys(envs))
     except (json.JSONDecodeError, KeyError):
-        return list(MOCK_CONDA_ENVS)
+        return []
 
 
 def fetch_available_modules() -> list[str]:

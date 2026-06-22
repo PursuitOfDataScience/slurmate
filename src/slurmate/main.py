@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 import tempfile
 from typing import Any
 
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 from .builder import build_from_answers, estimate_su
 from .system_utils import (
+    _parse_mem_to_mb,
     _parse_slurm_time_to_minutes,
     fetch_gpu_types_for_partition,
     fetch_partitions,
@@ -26,6 +28,9 @@ from .system_utils import (
 )
 from .theme import c, print_banner
 from .tui import Wizard, _parse_custom_flags
+
+# Sentinel returned by the action menu when the user presses Esc to go back.
+_GO_BACK = "\x00__go_back__"
 
 # ── Batch mode helpers ───────────────────────────────────────────────────
 
@@ -173,19 +178,10 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
     memory = answers.get("memory")
     if memory:
         if validate_memory(str(memory)):
-            norm = normalize_memory(str(memory))
-            m = re.match(r"^(\d+)([MGT]?)$", norm)
-            if m:
-                amt = int(m.group(1))
-                unit = m.group(2)
-                mb = amt
-                if unit == "G":
-                    mb = amt * 1024
-                elif unit == "T":
-                    mb = amt * 1024 * 1024
-                limit = part.get("mem_per_node_mb", 0)
-                if limit and mb > limit:
-                    console.print(f"  [yellow]\u26a0 Warning: Memory ({memory}) exceeds partition limit ({limit} MB per node)[/]")
+            mb = _parse_mem_to_mb(str(memory))
+            limit = part.get("mem_per_node_mb", 0)
+            if limit and mb > limit:
+                console.print(f"  [yellow]\u26a0 Warning: Memory ({memory}) exceeds partition limit ({limit} MB per node)[/]")
 
     # Check Time Limit
     time_limit = answers.get("time_limit")
@@ -280,13 +276,13 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
 
     script_w = max(num_w + 1 + len(ln) for ln in script_lines)
     title_text = "Generated sbatch script"
-    console.print(Panel(
+    script_panel = Panel(
         body,
         title=f"[bold #ff0080]{title_text}[/]",
         border_style="bright_magenta",
         width=script_w + 4,
         padding=(0, 1),
-    ))
+    )
 
     rows: list[tuple[str, str, str]] = [
         ("Job:", answers.get("job_name", "") or "", "cyan"),
@@ -311,11 +307,11 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         rows.append(("Env:", answers["env_name"], "cyan"))
     if answers.get("custom_sbatch"):
         rows.append(("Custom flags:", ", ".join(answers["custom_sbatch"]), "cyan"))
-    rows.append(("Est. SU (rough):", f"{su_estimate} SU", "yellow"))
+    rows.append(("Est. SU:", f"{su_estimate} SU", "yellow"))
     if queue_info:
         rows.append(("Queue:", f"{queue_info['running']} run / {queue_info['pending']} wait", "white"))
         eta_color = "green" if queue_info["eta_seconds"] < 3600 else "yellow"
-        rows.append(("Est. ETA (rough):", str(queue_info["eta_label"]), eta_color))
+        rows.append(("ETA:", str(queue_info["eta_label"]), eta_color))
 
     label_w = max(len(label) for label, _, _ in rows)
     summary_w = max(label_w + 2 + len(val) for label, val, _ in rows)
@@ -325,9 +321,21 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
     )
 
     s_title = "Summary"
-    print()
-    console.print(Panel(summary, title=f"[bold cyan]{s_title}[/]", border_style="cyan",
-                        width=summary_w + 4, padding=(0, 1)))
+    summary_panel = Panel(summary, title=f"[bold cyan]{s_title}[/]", border_style="cyan",
+                          width=summary_w + 4, padding=(0, 1))
+
+    # Use the width smartly: place the two panels side by side when the terminal
+    # is wide enough, otherwise fall back to stacking them.
+    if console.width >= (script_w + 4) + (summary_w + 4) + 2:
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column()
+        grid.add_column()
+        grid.add_row(script_panel, summary_panel)
+        console.print(grid)
+    else:
+        console.print(script_panel)
+        print()
+        console.print(summary_panel)
 
 
 def _edit_script_in_editor(script: str) -> str:
@@ -365,6 +373,19 @@ def _save_script(script: str, default_name: str) -> None:
         print(f"  {c.RED}✗ Could not save: {e}{c.RESET}")
 
 
+def _save_submitted_script(script: str, job_name: str, job_id: str) -> str | None:
+    """Write the exact submitted script to the working dir for reproducibility."""
+    safe = (job_name or "slurm").replace("/", "_").strip() or "slurm"
+    path = os.path.join(os.getcwd(), f"{safe}-{job_id}.sh")
+    try:
+        with open(path, "w") as f:
+            f.write(script)
+        return path
+    except OSError as e:
+        print(f"  {c.YELLOW}⚠ Could not save script copy: {e}{c.RESET}")
+        return None
+
+
 def _submit_and_report(script: str, answers: dict[str, Any], console: Console) -> None:
     """Submit the job and print the result, log path, and follow-up hints."""
     retcode, stdout, stderr = submit_sbatch(script, job_name=answers.get("job_name", "slurm"))
@@ -378,6 +399,13 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console) -
 
     job_id = stdout.strip()
     print(f"  {c.GREEN}✓ Submitted!{c.RESET} Job ID: {c.CYAN}{job_id}{c.RESET}")
+
+    # Save a copy of the exact submitted script locally by default, so every
+    # submission leaves a reproducible record next to where it was launched.
+    if job_id:
+        saved = _save_submitted_script(script, answers.get("job_name", "") or "slurm", job_id)
+        if saved:
+            print(f"  {c.GRAY}Script saved: {saved}{c.RESET}")
 
     # Read the actual --output path from the generated script (source of truth).
     log_path = f"{answers.get('job_name', '') or 'slurm'}-%j.out"
@@ -438,19 +466,21 @@ def main() -> None:
 
     config = load_config()
 
-    answers: dict[str, Any] | None = None
+    answers_opt: dict[str, Any] | None = None
+    wizard: Wizard | None = None
     if args.partition is not None:
-        answers = run_batch(args, console, config)
+        answers_opt = run_batch(args, console, config)
     else:
         wizard = Wizard()
-        answers = wizard.run()
+        answers_opt = wizard.run()
 
-    if not answers:
+    if not answers_opt:
         if not (args.print or args.dry_run):
             print(f"  {c.YELLOW}Cancelled.{c.RESET}")
         else:
             sys.exit(1)
         return
+    answers: dict[str, Any] = answers_opt
 
     if args.print or args.dry_run:
         script = build_from_answers(answers)
@@ -476,33 +506,44 @@ def main() -> None:
         ), queue_info)
 
     # A navigable action menu instead of a one-way confirm chain: every action
-    # returns here, and Esc/Ctrl-C cancels cleanly.
+    # returns here. Esc (or the explicit option) re-opens the wizard to edit
+    # answers; Ctrl-C/Quit cancels cleanly.
+    can_edit = wizard is not None
     while True:
-        action = questionary.select(
-            "What would you like to do?",
-            choices=[
-                "Submit to Slurm",
-                f"Edit in {editor}",
-                "Save script to a file",
-                "Show script again",
-                "Quit without submitting",
-            ],
-            qmark="", style=QS,
-        ).ask()
+        choices = ["Submit to Slurm"]
+        if can_edit:
+            choices.append("Go back to edit answers")
+        choices += [f"Open script in {editor}", "Save script to a file",
+                    "Quit without submitting"]
 
+        q = questionary.select(
+            "What would you like to do?", choices=choices, qmark="", style=QS,
+            instruction="(Esc to go back)" if can_edit else None,
+        )
+        kb = q.application.key_bindings
+        if can_edit and isinstance(kb, KeyBindings):
+            @kb.add("escape", eager=True)
+            def _back(event: Any) -> None:
+                event.app.exit(result=_GO_BACK)
+        action = q.ask()
+
+        if action == _GO_BACK or (action is not None and action.startswith("Go back")):
+            assert wizard is not None
+            answers = wizard.edit()
+            default_name = f"{answers.get('job_name', '') or 'slurm'}.sh"
+            script, queue_info = build_and_show(answers, console)
+            continue
         if action is None or action.startswith("Quit"):
             print(f"  {c.YELLOW}Not submitted.{c.RESET}")
             return
         if action.startswith("Submit"):
             _submit_and_report(script, answers, console)
             return
-        if action.startswith("Edit"):
+        if action.startswith("Open"):
             script = _edit_script_in_editor(script)
             _resummarize()
         elif action.startswith("Save"):
             _save_script(script, default_name)
-        elif action.startswith("Show"):
-            _resummarize()
 
 
 if __name__ == "__main__":

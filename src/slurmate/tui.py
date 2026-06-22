@@ -173,16 +173,30 @@ def _fmt_partition(p: dict[str, Any]) -> str:
 
 
 def _parse_custom_flags(raw: str) -> list[str]:
-    flags = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
+    """Parse custom #SBATCH flags from free-form input into one flag per entry.
+
+    Options are separated by spaces or commas, so ``--exclusive --reservation=abc``
+    and ``--exclusive,--reservation=abc`` both yield two directives. Only a comma
+    that introduces another flag (one followed by ``-``) separates options — a
+    comma inside a value is kept, so ``--exclude=node1,node2`` stays a single
+    directive. Give an option its value with ``=``; a bare word is taken as a
+    standalone option (``exclusive`` -> ``--exclusive``), *not* glued onto the
+    previous flag, since the wizard can't know which options take a value. A
+    leading ``#SBATCH`` (pasted by mistake) is stripped.
+    """
+    # Turn only "flag-separating" commas (those before a dash) into spaces;
+    # commas inside a value (e.g. a node list) survive.
+    raw = re.sub(r",(\s*-)", r" \1", raw)
+    flags: list[str] = []
+    for tok in raw.split():
+        if tok.startswith("#SBATCH"):
+            tok = tok[len("#SBATCH"):]
+        tok = tok.strip().rstrip(",")
+        if not tok:
             continue
-        if part.startswith("#SBATCH"):
-            part = part.replace("#SBATCH", "", 1).strip()
-        if not part.startswith("--"):
-            part = f"--{part}"
-        flags.append(part)
+        if not tok.startswith("-"):
+            tok = f"--{tok}"
+        flags.append(tok)
     return flags
 
 
@@ -190,9 +204,10 @@ MEMORY_CHOICES = ["4G", "8G", "16G", "32G", "64G", "128G", "256G", "512G", "6400
 TIME_CHOICES = ["01:00:00", "02:00:00", "04:00:00", "08:00:00", "12:00:00",
                 "24:00:00", "48:00:00", "7-00:00:00"]
 SBATCH_FLAGS = [
-    "--exclusive", "--reservation=", "--ntasks=", "--ntasks-per-node=",
-    "--threads-per-core=", "--mem-per-cpu=", "--constraint=",
-    "--licenses=", "--gres=", "--tmp=", "--hint=", "--signal=",
+    "--exclusive", "--exclude=", "--nodelist=", "--reservation=",
+    "--ntasks=", "--ntasks-per-node=", "--threads-per-core=",
+    "--mem-per-cpu=", "--constraint=", "--licenses=", "--gres=",
+    "--tmp=", "--hint=", "--signal=",
 ]
 
 
@@ -251,8 +266,10 @@ STEPS: list[Step] = [
     Step("ntasks_per_node", "Tasks per node", "ntasks_per_node",
          subtitle="Tasks per node (optional, for multi-node)", default="1",
          validate=lambda v: not v.strip() or (v.strip().isdigit() and int(v) > 0)),
-    Step("gpus", "GPUs", "select", subtitle="Number of GPUs",
-         choices=["0", "1", "2", "4", "8"], default="0"),
+    Step("gpus", "GPUs", "autocomplete",
+         subtitle="Number of GPUs — type any number (suggestions: 0, 1, 2, 4, 8)",
+         choices=["0", "1", "2", "4", "8"], default="0",
+         validate=lambda v: v.strip().isdigit()),
     Step("gpu_type", "GPU type", "gpu_type", subtitle="GPU hardware type"),
     Step("gpu_format", "GPU format", "gpu_format", subtitle="Format style for GPU requests"),
     Step("array_spec", "Array spec", "text",
@@ -260,9 +277,9 @@ STEPS: list[Step] = [
     Step("output_dir", "Output directory", "text",
          subtitle="Directory for stdout/stderr logs (optional)", default="logs", path=True),
     Step("output_file", "Output file", "text",
-         subtitle="Log file name, %j = job ID (optional, blank = <job>-%j.out)", path=True),
+         subtitle="Log file name, %j = job ID (optional, blank = <job>-%j.out). Bare name gets .out; .err derived", path=True),
     Step("custom_sbatch", "Custom #SBATCH flags", "autocomplete",
-         subtitle="e.g. --exclusive --reservation=abc (optional)",
+         subtitle="e.g. --exclusive --reservation=abc  (space- or comma-separated, optional)",
          choices=SBATCH_FLAGS),
     Step("modules", "Modules", "autocomplete",
          subtitle="Enter a name, press Enter to add (comma auto-inserted); Tab to advance when done",
@@ -275,8 +292,10 @@ STEPS: list[Step] = [
          subtitle="Conda environment name or virtualenv path",
          default=""),
     Step("command", "Command to run", "text",
-         subtitle="e.g. python train.py  (Enter=newline, Tab=complete, Ctrl+G=next)",
+         subtitle="e.g. python train.py  (Enter=next, Ctrl+J=newline, Tab=complete)",
          required=True, multiline=True, path=True),
+    Step("review", "Review & Submit", "review",
+         subtitle="Review your job configuration before submitting"),
 ]
 
 
@@ -324,11 +343,26 @@ class Wizard:
         # RadioList (shared across select/partition/gpu_type steps)
         self.radio_list = RadioList([("", "")])
 
-        # Mouse capture OFF by default so the terminal can natively select/copy
-        # the script preview. Navigation is fully keyboard-driven; press F2 to
-        # enable mouse click/scroll if preferred.
-        self.mouse_enabled = False
+        # Mouse capture stays OFF so the terminal can natively select/copy the
+        # script preview. Navigation is fully keyboard-driven.
         self._path_completer = LastTokenPathCompleter()
+        self._skipped_indices: set[int] = set()
+        # The review step shows the job config (left) and the final script
+        # (right) side by side. The script is taller than the screen, so it must
+        # scroll. FormattedTextControl windows don't scroll on their own and
+        # their cursor fights ``get_vertical_scroll``; instead we slice the
+        # visible lines ourselves by ``_review_scroll`` (driven by the
+        # up/down/page key bindings).
+        self._review_scroll = 0
+        self._review_total_lines = 0
+        self._review_config_window = Window(
+            FormattedTextControl(self._render_review_config),
+            width=D(weight=2), wrap_lines=True,
+        )
+        self._review_script_window = Window(
+            FormattedTextControl(self._render_review_script, focusable=True),
+            width=D(weight=3),
+        )
 
         self._build_app()
 
@@ -391,22 +425,22 @@ class Wizard:
                 buf.complete_next()
                 if buf.complete_state is not None:
                     return
-                # Multiline steps with path completers rely on Ctrl+G to
-                # advance — Tab only tries to complete, never navigates away.
+                # On multiline steps Tab only tries to complete (never advances);
+                # Enter proceeds, Ctrl+J inserts a newline.
                 if getattr(s, "multiline", False):
                     return
             self._confirm_and_next()
 
         @kb.add("enter", eager=True)
         def _enter(event: Any) -> None:
+            # Enter always proceeds — consistent across every step, including the
+            # multiline command step. (Use Ctrl+J for a literal newline there.)
             s = self.current_step
-            if getattr(s, "multiline", False):
-                buf = self._focused_buffer()
-                if buf is not None:
-                    buf.insert_text("\n")
-                return
             buf = self._focused_buffer()
-            if buf is not None and buf.complete_state is not None \
+            # On non-multiline steps, Enter first applies an active completion
+            # rather than advancing; multiline accepts completions with Tab.
+            if not getattr(s, "multiline", False) and buf is not None \
+                    and buf.complete_state is not None \
                     and buf.complete_state.current_completion is not None:
                 buf.apply_completion(buf.complete_state.current_completion)
                 if s.key == "modules":
@@ -422,28 +456,47 @@ class Wizard:
         def _esc(event: Any) -> None:
             self._go_back()
 
-        @kb.add("f2", eager=True)
-        def _toggle_mouse(event: Any) -> None:
-            # Releasing mouse capture lets the terminal do native text selection,
-            # so users can highlight/copy the script preview. Toggle it back on
-            # to use click/scroll inside the TUI again.
-            self.mouse_enabled = not self.mouse_enabled
-            self._invalidate()
+        review_active = Condition(lambda: self.current_step.kind == "review")
+
+        @kb.add("up", eager=True, filter=review_active)
+        def _review_up(event: Any) -> None:
+            self._review_scroll = max(0, self._review_scroll - 1)
+            self.app.invalidate()
+
+        @kb.add("down", eager=True, filter=review_active)
+        def _review_down(event: Any) -> None:
+            self._review_scroll = min(self._review_max_scroll(), self._review_scroll + 1)
+            self.app.invalidate()
+
+        @kb.add("pageup", eager=True, filter=review_active)
+        def _review_pgup(event: Any) -> None:
+            self._review_scroll = max(0, self._review_scroll - 10)
+            self.app.invalidate()
+
+        @kb.add("pagedown", eager=True, filter=review_active)
+        def _review_pgdn(event: Any) -> None:
+            self._review_scroll = min(self._review_max_scroll(), self._review_scroll + 10)
+            self.app.invalidate()
 
         @kb.add("c-c")
         def _cc(event: Any) -> None:
             raise KeyboardInterrupt
 
-        @kb.add("c-g", eager=True)
-        def _c_g(event: Any) -> None:
-            self._confirm_and_next()
+        @kb.add("c-j", eager=True,
+                filter=Condition(lambda: getattr(self.current_step, "multiline", False)))
+        def _newline(event: Any) -> None:
+            # Ctrl+J inserts a literal newline on the multiline command step.
+            # (Shift+Enter can't be distinguished from Enter by the terminal.)
+            buf = self._focused_buffer()
+            if buf is not None:
+                buf.insert_text("\n")
 
         self.app = Application(
             layout=self._build_layout(),
             key_bindings=kb,
             full_screen=True,
             style=_TUI_STYLE,
-            mouse_support=Condition(lambda: self.mouse_enabled),
+            mouse_support=False,
         )
 
     # ── Navigation ──────────────────────────────────────────────────
@@ -498,6 +551,10 @@ class Wizard:
             self._handle_gpu_type_confirm()
             return
 
+        if s.kind == "review":
+            self._advance()
+            return
+
         if s.kind in ("select", "gpu_format"):
             val = self._radio_value()
             if val:
@@ -547,6 +604,7 @@ class Wizard:
                 self.step_cache.pop("gpu_types", None)
                 self._invalidate()
                 return
+        self._skipped_indices = {i for i in self._skipped_indices if i < self.idx - 1}
         self.step_cache.pop("partition_sub", None)
         self.step_cache.pop("gpu_sub", None)
         self.step_cache.pop("error", None)
@@ -564,8 +622,10 @@ class Wizard:
         self._invalidate()
 
     def _coerce(self, val: str, s: Step) -> Any:
-        if s.key in ("cpus", "gpus"):
+        if s.key == "cpus":
             return int(val) if val else 4
+        if s.key == "gpus":
+            return int(val) if val.strip().isdigit() else 0
         if s.key == "nodes":
             return int(val) if val else 1
         if s.key == "ntasks_per_node":
@@ -574,6 +634,10 @@ class Wizard:
             return normalize_memory(val) if val else "16G"
         if s.key == "modules":
             return [m.strip() for m in val.split(",") if m.strip()] if val else None
+        if s.key == "custom_sbatch":
+            # Parse into a list of flags; the builder iterates this, so a raw
+            # string would be split character-by-character (#SBATCH m, i, d, …).
+            return _parse_custom_flags(val) if val else None
         if s.key == "qos":
             return None if (not val or val == "Default (none)") else val
         if s.key in ("account", "array_spec", "gpu_type", "gpu_format",
@@ -597,19 +661,11 @@ class Wizard:
         elif s.key == "memory":
             val = self._text_val()
             if validate_memory(val):
-                norm = normalize_memory(val)
-                m = re.match(r"^(\d+)([MGT]?)$", norm)
-                if m:
-                    amt = int(m.group(1))
-                    unit = m.group(2)
-                    mb = amt
-                    if unit == "G":
-                        mb = amt * 1024
-                    elif unit == "T":
-                        mb = amt * 1024 * 1024
-                    limit = part.get("mem_per_node_mb", 0)
-                    if limit and mb > limit:
-                        return f"Memory exceeds partition limit ({limit} MB per node)"
+                from .system_utils import _parse_mem_to_mb
+                mb = _parse_mem_to_mb(val)
+                limit = part.get("mem_per_node_mb", 0)
+                if limit and mb > limit:
+                    return f"Memory exceeds partition limit ({limit} MB per node)"
         elif s.key == "time_limit":
             val = self._text_val()
             if val:
@@ -624,7 +680,7 @@ class Wizard:
                 except Exception:
                     pass
         elif s.key == "gpus":
-            val = self._radio_value()
+            val = self._text_val()
             if val and val.isdigit():
                 gpus = int(val)
                 gpu_types = part.get("gpu_types", [])
@@ -686,6 +742,8 @@ class Wizard:
             self._setup_gpu_type(direction)
         elif s.kind == "gpu_format":
             self._setup_gpu_format(direction)
+        elif s.kind == "review":
+            self._setup_review(direction)
 
     # ── Autocomplete ────────────────────────────────────────────────
 
@@ -831,6 +889,7 @@ class Wizard:
             gpus = int(gpus) if gpus.isdigit() else 0
         if gpus == 0:
             self.answers["gpu_type"] = None
+            self._skipped_indices.add(self.idx)
             if direction == "forward":
                 self._advance()
             else:
@@ -861,6 +920,7 @@ class Wizard:
             gpus = int(gpus) if gpus.isdigit() else 0
         if gpus == 0:
             self.answers["gpu_format"] = None
+            self._skipped_indices.add(self.idx)
             if direction == "forward":
                 self._advance()
             else:
@@ -878,6 +938,7 @@ class Wizard:
             nodes = int(nodes) if nodes.isdigit() else 1
         if nodes <= 1:
             self.answers["ntasks_per_node"] = None
+            self._skipped_indices.add(self.idx)
             if direction == "forward":
                 self._advance()
             else:
@@ -891,6 +952,7 @@ class Wizard:
         env_type = self.answers.get("env_type", "None (skip)")
         if env_type == "None (skip)":
             self.answers["env_name"] = None
+            self._skipped_indices.add(self.idx)
             if direction == "forward":
                 self._advance()
             else:
@@ -899,16 +961,31 @@ class Wizard:
 
         if env_type in ("Conda", "Mamba"):
             try:
-                envs = fetch_conda_envs()
+                # Load the modules the user picked first, so envs from a
+                # module-provided conda (e.g. `module load anaconda`) show up.
+                envs = fetch_conda_envs(self.answers.get("modules"))
             except Exception as e:
                 logger.debug(f"Failed to fetch conda envs: {e}")
                 envs = []
             self.step_cache["choices_env_name"] = envs
             self.text_area.text = self.answers.get("env_name") or ""
             self._setup_autocomplete(self.current_step)
+            if envs:
+                # Pop the dropdown so the discovered envs are visible up front,
+                # not only once the user starts typing.
+                self._open_completion_menu()
         else:  # Virtualenv (venv) — complete filesystem paths
             self.text_area.text = self.answers.get("env_name") or ""
             self._set_completer(self._path_completer)
+
+    def _open_completion_menu(self) -> None:
+        """Open the completion dropdown so choices show without typing."""
+        try:
+            buf = self.text_area.buffer
+            if buf.completer is not None and not buf.complete_state:
+                buf.start_completion(select_first=False)
+        except Exception as e:
+            logger.debug(f"Could not open completion menu: {e}")
 
     def _handle_gpu_type_confirm(self) -> None:
         sub = self.step_cache.get("gpu_sub", "select")
@@ -920,7 +997,17 @@ class Wizard:
             self.answers["gpu_type"] = val or None
         self._advance()
 
+    def _setup_review(self, direction: str = "forward") -> None:
+        self.transient["preview_dirty"] = True
+        self._review_scroll = 0
 
+    def _review_max_scroll(self) -> int:
+        """Largest scroll offset that still keeps the last script line on screen."""
+        info = self._review_script_window.render_info
+        # The script window's first row is a fixed "── Final Script ──" header
+        # that doesn't scroll, so the body viewport is one row shorter.
+        visible = (info.window_height - 1) if info else 0
+        return max(0, self._review_total_lines - max(1, visible))
 
     # ── Layout ──────────────────────────────────────────────────────
 
@@ -936,6 +1023,8 @@ class Wizard:
                 focused = self.text_area
         elif self._is_select_active():
             focused = self.radio_list
+        elif self.current_step.kind == "review":
+            focused = self._review_script_window
 
         return Layout(
             FloatContainer(
@@ -967,12 +1056,10 @@ class Wizard:
 
     def _render_header_right(self) -> list[tuple[str, str]]:
         s = self.current_step
-        right = f"  Step {self.idx + 1}/{len(STEPS)}  {s.title}"
-        progress = "".join(
-            "\u25c9" if i <= self.idx else "\u25cb"
-            for i in range(len(STEPS))
-        )
-        return [("class:status-bar", f"  {right}  {progress}  ")]
+        visible_total = len(STEPS) - len(self._skipped_indices)
+        visible_done = sum(1 for i in range(self.idx) if i not in self._skipped_indices)
+        right = f"  {visible_done + 1}/{visible_total}  {s.title}"
+        return [("class:status-bar", f"  {right}  ")]
 
     def _sidebar(self) -> Window:
         return Window(
@@ -984,6 +1071,8 @@ class Wizard:
     def _render_sidebar(self) -> list[tuple[str, str]]:
         lines: list[tuple[str, str]] = [("class:subtitle", "  Steps\n\n")]
         for i, s in enumerate(STEPS):
+            if i in self._skipped_indices:
+                continue
             if i < self.idx:
                 lines.append(("class:sidebar-done", f"  \u2713 {s.title}\n"))
             elif i == self.idx:
@@ -1024,6 +1113,15 @@ class Wizard:
         select_active = self._is_select_active()
 
         children: list[Any] = []
+        if s.kind == "review":
+            return HSplit([
+                title_win,
+                VSplit([
+                    self._review_config_window,
+                    Window(width=1, char="│", style="class:subtitle"),
+                    self._review_script_window,
+                ], padding=1),
+            ])
         if text_active:
             if getattr(s, "multiline", False):
                 children = [self.multiline_text_area]
@@ -1034,19 +1132,30 @@ class Wizard:
 
         return HSplit([title_win] + error_control + children + [self._queue_panel(), self._preview_panel()])
 
+    def _past_hardware_config(self) -> bool:
+        """True once every resource/hardware step is done (modules onward).
+
+        The queue ETA is surfaced here as a heads-up — how long the job will
+        wait before modules load and the script runs — rather than during the
+        hardware steps, where it would keep shifting as choices change.
+        """
+        modules_idx = next(
+            (i for i, s in enumerate(STEPS) if s.key == "modules"), len(STEPS)
+        )
+        return self.idx >= modules_idx
+
     def _queue_panel(self) -> Window:
-        qinfo = self.transient.get("queue_info")
-        h = 2 if qinfo else 0
+        show = bool(self.transient.get("queue_info")) and self._past_hardware_config()
         return Window(
             FormattedTextControl(self._render_queue_text),
             style="bg:#1a1a2e",
             dont_extend_height=True,
-            height=h,
+            height=2 if show else 0,
         )
 
     def _render_queue_text(self) -> list[tuple[str, str]]:
         qinfo = self.transient.get("queue_info")
-        if not qinfo:
+        if not qinfo or not self._past_hardware_config():
             return []
         part = self.transient.get("queue_info_part", "")
         eta_sec = qinfo.get("eta_seconds", 0)
@@ -1055,7 +1164,7 @@ class Wizard:
             ("", "\n  "),
             ("class:preview-header", f"Queue status ({part}): "),
             ("class:info", f"{qinfo.get('running', 0)} running / {qinfo.get('pending', 0)} pending   "),
-            ("class:preview-header", "Est. ETA (rough): "),
+            ("class:preview-header", "ETA: "),
             (eta_color, f"{qinfo.get('eta_label', 'now')}\n"),
         ]
 
@@ -1065,6 +1174,70 @@ class Wizard:
             style="bg:#1a1a2e",
             height=D(min=8),
         )
+
+    def _review_summary_items(self) -> list[tuple[str, str | None]]:
+        return [
+            ("Job name", self.answers.get("job_name", "")),
+            ("Partition", self.answers.get("partition", "")),
+            ("Account", self.answers.get("account")),
+            ("QoS", self.answers.get("qos")),
+            ("CPUs", str(self.answers.get("cpus", ""))),
+            ("Memory", self.answers.get("memory", "")),
+            ("Time limit", self.answers.get("time_limit", "")),
+            ("Nodes", str(self.answers.get("nodes", 1))),
+            ("GPUs", f"{self.answers.get('gpus', 0)} \u00d7 {self.answers.get('gpu_type') or 'any'}"
+                     if self.answers.get("gpus", 0) > 0 else None),
+            ("Array spec", self.answers.get("array_spec")),
+            ("Output dir", self.answers.get("output_dir")),
+            ("Output file", self.answers.get("output_file")),
+            ("Env", self.answers.get("env_name")),
+            ("Command", self.answers.get("command", "")),
+        ]
+
+    def _render_review_config(self) -> list[tuple[str, str]]:
+        """Left column of the review step \u2014 the job configuration summary."""
+        out: list[tuple[str, str]] = [
+            ("class:preview-header", " \u2500\u2500 Job Configuration \u2500\u2500\n\n")
+        ]
+        label_w = 12
+        # Continuation lines of a multi-line value (e.g. a multi-command script)
+        # line up under the value column instead of starting at column 0.
+        indent = " " + " " * label_w + " "
+        for label, val in self._review_summary_items():
+            if not val:
+                continue
+            parts = str(val).split("\n")
+            out.append(("", f" {label:<{label_w}} "))
+            out.append(("class:preview-text", f"{parts[0]}\n"))
+            for cont in parts[1:]:
+                out.append(("class:preview-text", f"{indent}{cont}\n"))
+        return out
+
+    def _build_script_lines(self) -> list[list[tuple[str, str]]]:
+        """Final script as a list of lines (each a fragment list, no trailing \\n)."""
+        lines: list[list[tuple[str, str]]] = []
+        script = build_from_answers(self.answers)
+        for line in script.split("\n"):
+            frags = self._tokenize_bash_line(line)
+            # _tokenize_bash_line appends a trailing "\n"; drop it for the line model.
+            if frags:
+                style, text = frags[-1]
+                text = text[:-1] if text.endswith("\n") else text
+                frags = frags[:-1] + ([(style, text)] if text else [])
+            lines.append(frags or [("", "")])
+        return lines
+
+    def _render_review_script(self) -> list[tuple[str, str]]:
+        """Right column \u2014 the final script, manually scrolled by ``_review_scroll``."""
+        lines = self._build_script_lines()
+        self._review_total_lines = len(lines)
+        out: list[tuple[str, str]] = [
+            ("class:preview-header", " \u2500\u2500 Final Script \u2500\u2500\n")
+        ]
+        for frags in lines[self._review_scroll:]:
+            out.extend(frags)
+            out.append(("", "\n"))
+        return out
 
     def _tokenize_bash_line(self, line: str) -> list[tuple[str, str]]:
         if not line.strip():
@@ -1131,13 +1304,16 @@ class Wizard:
 
     def _render_footer(self) -> list[tuple[str, str]]:
         s = self.current_step
-        if getattr(s, "multiline", False):
-            left = "  Enter:newline  Tab:complete  Ctrl+G:next"
+        if s.key == "review":
+            left = "  ↑↓/PgUp/PgDn:Scroll  Tab/Enter:Submit  Esc:Back  ^C:Quit"
         else:
-            left = "  Tab/Enter:Next"
-        if self._is_select_active():
-            left += "  \u2191\u2193:Move"
-        left += "  Esc:Back  ^C:Quit"
+            if getattr(s, "multiline", False):
+                left = "  Enter:Next  Ctrl+J:newline  Tab:complete"
+            else:
+                left = "  Tab/Enter:Next"
+            if self._is_select_active():
+                left += "  \u2191\u2193:Move"
+            left += "  Esc:Back  ^C:Quit"
         return [("class:info", left)]
 
     # ── Entry point ─────────────────────────────────────────────────
@@ -1149,3 +1325,16 @@ class Wizard:
             return self.answers
         except (KeyboardInterrupt, EOFError):
             return None
+
+    def edit(self) -> dict[str, Any]:
+        """Re-enter the wizard (keeping prior answers) at the review step.
+
+        Used to jump back from the post-build action menu to fix a field after
+        seeing the generated script. Returns the (in-place updated) answers; a
+        Ctrl-C while editing just returns the current answers unchanged.
+        """
+        self.idx = len(STEPS) - 1
+        self.submitted = False
+        self._build_app()  # the previous Application already exited; make a fresh one
+        self.run()
+        return self.answers

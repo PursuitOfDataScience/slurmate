@@ -12,7 +12,7 @@ class TestStepDefinitions:
     def test_all_steps_have_keys(self):
         for s in STEPS:
             assert s.key, f"Step missing key: {s.title}"
-            assert s.kind in ("text", "select", "autocomplete", "partition", "gpu_type", "gpu_format", "ntasks_per_node")
+            assert s.kind in ("text", "select", "autocomplete", "partition", "gpu_type", "gpu_format", "ntasks_per_node", "review")
 
     def test_no_duplicate_keys(self):
         keys = [s.key for s in STEPS]
@@ -36,7 +36,7 @@ class TestStepDefinitions:
             "job_name", "partition", "account", "qos", "cpus",
             "memory", "time_limit", "nodes", "ntasks_per_node", "gpus", "gpu_type", "gpu_format",
             "array_spec", "output_dir", "output_file", "custom_sbatch",
-            "modules", "env_type", "env_name", "command",
+            "modules", "env_type", "env_name", "command", "review",
         ]
         assert [s.key for s in STEPS] == expected_order
 
@@ -84,6 +84,12 @@ class TestWizardNavigation:
         assert w._coerce("8", s) == 8
         assert w._coerce("", s) == 4
 
+    def test_coerce_gpus_defaults_zero(self):
+        w = Wizard()
+        s = STEPS[_idx("gpus")]
+        assert w._coerce("4", s) == 4
+        assert w._coerce("", s) == 0
+
     def test_coerce_memory(self):
         w = Wizard()
         s = STEPS[5]  # memory
@@ -94,6 +100,17 @@ class TestWizardNavigation:
         w = Wizard()
         s = STEPS[_idx("modules")]
         assert w._coerce("python/3.10,cuda/12.0", s) == ["python/3.10", "cuda/12.0"]
+        assert w._coerce("", s) is None
+
+    def test_coerce_custom_sbatch_returns_list(self):
+        # Regression: a raw string here gets iterated char-by-char by the builder
+        # (#SBATCH m, #SBATCH i, …); it must be parsed into a flag list.
+        w = Wizard()
+        s = STEPS[_idx("custom_sbatch")]
+        assert w._coerce("--exclusive, --reservation=abc", s) == [
+            "--exclusive", "--reservation=abc",
+        ]
+        assert w._coerce("midway3", s) == ["--midway3"]
         assert w._coerce("", s) is None
 
 
@@ -186,6 +203,26 @@ class TestHelpers:
         result = _parse_custom_flags("exclusive, #SBATCH --reservation=abc")
         assert result == ["--exclusive", "--reservation=abc"]
 
+    def test_parse_custom_flags_space_separated(self):
+        # Space-separated flags each become their own directive (not one combined).
+        assert _parse_custom_flags("--exclusive --reservation=abc") == [
+            "--exclusive", "--reservation=abc",
+        ]
+        # Values must be written with '='; a bare word is its own option, never
+        # glued onto the previous flag (so we don't invent --exclusive=<node>).
+        assert _parse_custom_flags("--nodelist=midway3-0100") == ["--nodelist=midway3-0100"]
+        assert _parse_custom_flags("--exclusive midway3-0100") == [
+            "--exclusive", "--midway3-0100",
+        ]
+        assert _parse_custom_flags("exclusive") == ["--exclusive"]
+        # Both flags together, and a comma inside a value (node list) survives.
+        assert _parse_custom_flags("--exclusive --exclude=node1,node2") == [
+            "--exclusive", "--exclude=node1,node2",
+        ]
+        assert _parse_custom_flags("--exclusive,--exclude=node1") == [
+            "--exclusive", "--exclude=node1",
+        ]
+
     def test_parse_custom_flags_empty(self):
         assert _parse_custom_flags("") == []
 
@@ -255,6 +292,19 @@ class TestRadioSelection:
         s = STEPS[w.idx]
         w._setup_select(s, "2")  # prev answer "2"
         assert w._radio_value() == "2"  # cursor sits on the default, not index 0
+
+
+class TestReviewStep:
+    def test_review_step_layout_does_not_crash(self):
+        w = Wizard()
+        w.idx = _idx("review")
+        w.answers = {
+            "job_name": "test", "partition": "cpu", "cpus": 4,
+            "memory": "16G", "time_limit": "01:00:00", "nodes": 1,
+            "gpus": 0, "command": "echo hi",
+        }
+        layout = w._build_layout()
+        assert layout is not None
 
 
 class TestFreeNavigation:

@@ -198,6 +198,49 @@ class TestPartialPreview:
         assert "echo hi" in s
 
 
+class TestOutputFileWithExtensions:
+    def test_non_dot_out_extension_preserved(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "logs", "output_file": "run.log"})
+        assert "#SBATCH --output=logs/run.log" in s
+        assert "#SBATCH --error=logs/run.err" in s
+
+    def test_txt_extension_preserved(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "logs", "output_file": "run.txt"})
+        assert "#SBATCH --output=logs/run.txt" in s
+        assert "#SBATCH --error=logs/run.err" in s
+
+    def test_dot_out_extension_unchanged(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "logs", "output_file": "run-%j.out"})
+        assert "#SBATCH --output=logs/run-%j.out" in s
+        assert "#SBATCH --error=logs/run-%j.err" in s
+
+    def test_bare_name_gets_dot_out(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "logs", "output_file": "run"})
+        assert "#SBATCH --output=logs/run.out" in s
+        assert "#SBATCH --error=logs/run.err" in s
+
+
+class TestEnvTypeNoneWithEnv:
+    def test_env_type_none_with_env_still_emits(self):
+        from slurmate.builder import build_sbatch_script
+        s = build_sbatch_script(
+            job_name="test", partition="cpu", cpus=1, memory="1G",
+            time_limit="00:01:00", env_name="myenv", env_type="none",
+            command="echo hi",
+        )
+        # env_name is set, so builder enters the env block but no activation
+        # line is emitted for unrecognized "none" strategy.
+        assert "activate" not in s
+
+
 class TestQosAndOutputFile:
     def test_qos_default_none_omitted(self):
         from slurmate.builder import build_from_answers
