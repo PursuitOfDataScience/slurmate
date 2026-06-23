@@ -20,7 +20,10 @@ class C:
     PINK = "\033[38;2;255;0;128m"
     CYAN = "\033[38;2;0;255;255m"
     MAGENTA = "\033[38;2;191;0;255m"
-    YELLOW = "\033[38;2;255;255;0m"
+    # Amber rather than pure yellow: readable on light backgrounds and unified
+    # with the TUI's amber `warning` style (used for warnings, "Cancelled",
+    # SU/array labels). Pure #ffff00 was nearly invisible on light terminals.
+    YELLOW = "\033[38;2;255;170;0m"
     GREEN = "\033[38;2;0;255;128m"
     ORANGE = "\033[38;2;255;128;0m"
     RED = "\033[38;2;255;0;0m"
@@ -41,9 +44,17 @@ class C:
     G6 = "\033[38;2;0;255;255m"
 
     def __getattribute__(self, name: str) -> Any:
-        if name.startswith("__"):
+        if name.startswith("_"):
             return object.__getattribute__(self, name)
-        if not _should_use_color():
+        # Decide once per instance and cache it — `__getattribute__` runs on
+        # every color access (the banner animation hits it many times per
+        # frame), and `_should_use_color()` does an isatty()/env probe each call.
+        cache = object.__getattribute__(self, "__dict__")
+        use_color = cache.get("_use_color")
+        if use_color is None:
+            use_color = _should_use_color()
+            cache["_use_color"] = use_color
+        if not use_color:
             return ""
         return object.__getattribute__(self, name)
 
@@ -82,12 +93,14 @@ def _to_rgb(ansi_code: str) -> tuple[int, int, int]:
 BASE_RGB = [_to_rgb(g) for g in BANNER_GRADIENT]
 
 
-def print_banner(animate: bool | str | None = False) -> None:
+def print_banner(animate: bool | str | None = False, interactive: bool = True) -> None:
     """Print banner, respecting NO_COLOR and SLURMATE_NO_BANNER env vars.
 
     Args:
         animate: If True, show animation. Default is False (instant display).
                  Can be overridden with SLURMATE_BANNER_ANIMATE=1.
+        interactive: When False (batch/non-interactive mode), the "ESC to go
+                 back" hint is suppressed \u2014 there's no wizard to go back in.
     """
     if os.environ.get("SLURMATE_NO_BANNER"):
         return
@@ -110,7 +123,8 @@ def print_banner(animate: bool | str | None = False) -> None:
         else:
             subtitle = "Slurmate  \u2014  interactive sbatch wizard"
         print(f"  {subtitle}")
-        print(f"  {c.GRAY if use_color else ''}ESC to go back{c.RESET if use_color else ''}")
+        if interactive:
+            print(f"  {c.GRAY if use_color else ''}ESC to go back{c.RESET if use_color else ''}")
         print()
         return
 
@@ -135,7 +149,8 @@ def print_banner(animate: bool | str | None = False) -> None:
     print()
     subtitle = f"{c.CYAN}Slurmate{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
     print(f"  {subtitle}")
-    print(f"  {c.GRAY}ESC to go back{c.RESET}")
+    if interactive:
+        print(f"  {c.GRAY}ESC to go back{c.RESET}")
     print()
 
 

@@ -5,6 +5,105 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.3.0] — 2026-06-23
+
+A correctness- and polish-focused release that works through the v0.3.0
+planning backlog (see the prior `issues.md`). Highlights: the version is now
+single-sourced, batch mode is far more robust, time/memory validation matches
+Slurm, and the wizard's visuals are cleaner.
+
+### Fixed
+
+- **Version drift** — `slurmate --version` is now single-sourced from the
+  installed package metadata (`importlib.metadata`), so it can never disagree
+  with the published version again. (P0-1)
+- **`SLURMATE_GPU_FORMAT` had no effect** — the env var is now the actual
+  default GPU syntax in both batch mode and the wizard's GPU-format step, as the
+  README always advertised. (P0-2)
+- **Stringy config values crashed batch mode** — a `.slurmate.toml` with e.g.
+  `gpus = "2"` no longer raises `TypeError`; numeric config values are coerced.
+  (P0-3)
+- **`--time` validation was too strict** — now accepts Slurm's full grammar
+  (`minutes`, `mm:ss`, `hh:mm:ss`, `days-hours`, `days-hours:minutes`,
+  `days-hours:minutes:seconds`) with 1–2 digit lead fields, so `30`, `5:00`,
+  `2:30:00`, and `1-12` are accepted. (P0-4)
+- **Error log dropped `%j`** — an output pattern like `run.%j` no longer derives
+  a fixed `run.err` (which every task would overwrite); a `%`-bearing suffix is
+  treated as part of the log pattern, not a file extension. (P0-5)
+- **Batch mode only triggered on `--partition`** — any job-defining flag (or
+  `--yes`) now enters non-interactive mode, so flags like `--cpus`/`--command`
+  are no longer silently dropped into the TUI. (P1-1)
+- **In-TUI Review hid fields** — the Review step now shows Modules, Custom
+  `#SBATCH` flags, GPU format, and Tasks-per-node, sharing one ordered field
+  list with the CLI summary so the two surfaces always agree. (P1-2, P3-9)
+- **Lossy config on Python 3.10** — `tomli` is now a dependency on `<3.11`, so
+  real TOML parsing is guaranteed on every supported Python; the naive flat
+  reader is only a last resort and now strips inline comments and parses numeric
+  arrays/floats/negatives correctly. (P1-3, P3-13)
+- **Mock-mode submit printed a blank Job ID** and broken `squeue`/`scancel`
+  hints — it now prints a clear "(mock mode — not actually submitted)". (P1-7)
+- **Job names weren't sanitized** — whitespace and shell-unsafe characters are
+  normalized (`my training job` → `my_training_job`) so the directive and the
+  auto-saved filename are always well-formed. (P1-8)
+- **Submission errors went to stdout** — failures now go to stderr for clean
+  pipelines. (P1-9)
+- **Batch mode skipped numeric validation** — `--cpus`/`--nodes` must be
+  positive and `--gpus`/`--ntasks-per-node` non-negative, matching the wizard,
+  instead of emitting invalid directives like `--cpus-per-task=0`. (P1-11)
+- **`validate_memory` accepted `0G`/`0M`** — a zero magnitude is now rejected
+  regardless of unit. (P3-11)
+- **`_parse_mem_to_mb` mis-parsed bad input** — `16GB`/`16 G`/`1.5.5G` now
+  return `0` (unknown) instead of a misleading partial that masqueraded as a
+  tiny valid size in partition-limit checks. (P3-12)
+- **Redundant cluster queries** — the partition step fetches once and caches for
+  the session; re-entering or going back reuses the result instead of re-running
+  `sinfo`/`scontrol`. (P1-5, P3-5)
+- **Unquoted module names in `bash -lc`** — module tokens are now `shlex`-quoted
+  before interpolation. (P3-2)
+- **Cleared config-defaulted fields** fell back to hard-coded literals — they now
+  fall back to the configured value (e.g. clearing a `cpus = 8` field returns
+  `8`, not `4`). (P3-10)
+- **Mock queue ETA label** is now derived from the real formatter (`~1h`), not a
+  hand-written `~1 hour`. (P3-7)
+
+### Added
+
+- **`--no-save-script` / `SLURMATE_NO_SAVE=1`** to opt out of the auto-saved
+  `<job>-<id>.sh` copy; when `SLURMATE_LOG_DIR` is set the script is saved there
+  once (no more double-save into the working directory). (P1-6)
+- **Array-aware log defaults** — array jobs (`--array`) now default to the
+  idiomatic `%A_%a` (array id + task id) pattern instead of `%j`. (P1-10)
+- **Python 3.13** added to the CI matrix and the classifier list. (P2-1)
+- A release-workflow guard that fails if the pushed tag doesn't match the
+  `pyproject` version, and a test asserting `__version__` equals the installed
+  metadata. (P2-2, P4-2)
+- A `MANIFEST.in` so the sdist ships `CHANGELOG.md` and the full (runnable) test
+  suite, including `conftest.py` and the parser fixtures. (P2-5)
+- Many regression and integration tests covering each fix above.
+
+### Changed
+
+- **`--print` and `--dry-run` are now distinct** — `--print` emits only the raw
+  script (clean for pipes/CI); `--dry-run` shows the full summary panel,
+  partition-limit warnings, SU/ETA, and missing-field reminders without
+  submitting. (P1-4)
+- **SU estimate** now factors in `--ntasks-per-node`, and the CPU
+  partition-limit warning compares `ntasks-per-node × cpus-per-task` against the
+  node core count. (P3-3, P3-4)
+- **UI polish:** focused text inputs now stand out (distinct background); the
+  central column uses one consistent background instead of a patchwork; warnings
+  are amber across both CLI and TUI (was pure yellow on the CLI); the header
+  reuses the `status-bar` style; the sidebar is wider (and ellipsizes long step
+  titles) so "Environment name/path" no longer clips; the startup banner is
+  instant by default (animate via `SLURMATE_BANNER_ANIMATE=1`); and the "ESC to
+  go back" hint is suppressed in batch mode. (D1, D2, D4, D5, D6, D7, D8)
+- The color decision is computed once per process instead of on every color
+  access (the banner hit it hundreds of times). (P3-6)
+- Migrated `pyproject` to the PEP 639 SPDX `license = "MIT"` form, dropped the
+  redundant license classifier, fixed the environment classifier
+  (`Console`, not `Console :: Curses`), and pinned `prompt_toolkit>=3.0,<4`.
+  (P2-3, P2-4, P3-1)
+
 ## [0.2.1] — 2026-06-22
 
 ### Fixed
@@ -209,6 +308,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - `ruff` and `mypy` CI checks.
 - Test suite with fixtures for partition, queue, and GPU type parsing.
 
+[0.3.0]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/PursuitOfDataScience/slurmate/releases/tag/v0.1.0

@@ -29,7 +29,7 @@ class TestParseArgs:
             "--modules", "python/3.10,cuda/12.0",
             "--env", "myenv",
             "--command", "python train.py",
-            f"--custom-sbatch=--exclusive,--reservation=abc",
+            "--custom-sbatch=--exclusive,--reservation=abc",
             "--yes",
         ])
         assert args.job_name == "test"
@@ -50,8 +50,9 @@ class TestParseArgs:
 
 class TestRunBatch:
     def test_batch_mode_creates_answers(self):
-        from rich.console import Console
         import argparse
+
+        from rich.console import Console
 
         args = argparse.Namespace(
             job_name="test", account=None, partition="gpu", qos=None,
@@ -72,8 +73,9 @@ class TestRunBatch:
         assert answers["env_type"] == "mamba"
 
     def test_batch_no_modules(self):
-        from rich.console import Console
         import argparse
+
+        from rich.console import Console
 
         args = argparse.Namespace(
             job_name="t", account=None, partition="cpu", qos=None,
@@ -95,6 +97,7 @@ class TestRunBatch:
 class TestPartitionLimitsValidation:
     def test_validate_partition_limits_warnings(self):
         from rich.console import Console
+
         from slurmate.main import _validate_partition_limits
 
         # Mock partition object
@@ -169,6 +172,171 @@ class TestPartitionLimitsValidation:
         assert "Partition 'cpu-test' does not support GPUs" in warnings
 
 
+class TestVersionConsistency:
+    def test_version_matches_metadata(self):
+        # P4-2 / P0-1: __version__ is single-sourced from package metadata, so
+        # `slurmate --version` can never drift from the published version.
+        import importlib.metadata
+
+        import slurmate
+        assert slurmate.__version__ == importlib.metadata.version("slurmate")
+
+
+class TestBatchModeDetection:
+    def test_any_job_flag_triggers_batch(self):
+        from slurmate.main import _is_batch_mode, parse_args
+        assert _is_batch_mode(parse_args(["--job-name", "x", "--command", "c"])) is True
+        assert _is_batch_mode(parse_args(["--cpus", "8"])) is True
+        assert _is_batch_mode(parse_args(["--yes"])) is True
+
+    def test_no_flags_is_interactive(self):
+        from slurmate.main import _is_batch_mode, parse_args
+        assert _is_batch_mode(parse_args([])) is False
+        # Output-only modes don't force batch by themselves.
+        assert _is_batch_mode(parse_args(["--print"])) is False
+        assert _is_batch_mode(parse_args(["--no-save-script"])) is False
+
+
+class TestBatchNumericValidation:
+    def _ns(self, **over):
+        import argparse
+        base = dict(
+            job_name=None, account=None, partition="cpu-shared", qos=None,
+            cpus=None, memory=None, time=None, nodes=None, ntasks_per_node=None,
+            gpus=None, gpu_type=None, gpu_format=None, array=None, modules=None,
+            env=None, env_type=None, output_dir=None, output_file=None,
+            command="echo hi", custom_sbatch=None, yes=False,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_cpus_zero_rejected(self):
+        import pytest
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        with pytest.raises(SystemExit):
+            run_batch(self._ns(cpus=0), Console(), {})
+
+    def test_nodes_negative_rejected(self):
+        import pytest
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        with pytest.raises(SystemExit):
+            run_batch(self._ns(nodes=-2), Console(), {})
+
+    def test_gpus_negative_rejected(self):
+        import pytest
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        with pytest.raises(SystemExit):
+            run_batch(self._ns(gpus=-1), Console(), {})
+
+    def test_valid_numbers_pass(self):
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        ans = run_batch(self._ns(cpus=8, nodes=2, gpus=1), Console(), {})
+        assert ans["cpus"] == 8 and ans["nodes"] == 2 and ans["gpus"] == 1
+
+
+class TestBatchStringyConfigCoercion:
+    def test_stringy_config_numerics_do_not_crash(self):
+        # P0-3: quoted/stringy numbers in config must be coerced, not crash on
+        # the `gpus > 0` comparison.
+        import argparse
+
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        ns = argparse.Namespace(partition=None, command="echo hi")
+        cfg = {"partition": "gpu-shared", "gpus": "2", "cpus": "8", "nodes": "1"}
+        ans = run_batch(ns, Console(), cfg)
+        assert ans["cpus"] == 8 and ans["gpus"] == 2 and ans["nodes"] == 1
+
+
+class TestBatchGpuFormatEnv:
+    def test_env_seeds_gpu_format(self, monkeypatch):
+        # P0-2: SLURMATE_GPU_FORMAT is the default in batch mode.
+        import argparse
+
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        monkeypatch.setenv("SLURMATE_GPU_FORMAT", "gpus")
+        ns = argparse.Namespace(partition="gpu-shared", gpus=2, command="echo hi")
+        ans = run_batch(ns, Console(), {})
+        assert ans["gpu_format"] == "gpus"
+
+
+class TestBatchJobNameSanitized:
+    def test_spaces_collapsed(self):
+        import argparse
+
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        ns = argparse.Namespace(partition="cpu-shared", job_name="my job", command="x")
+        ans = run_batch(ns, Console(), {})
+        assert ans["job_name"] == "my_job"
+
+
+class TestSubmitAndReport:
+    _answers = {"job_name": "j", "command": "echo hi"}
+
+    def test_mock_mode_reports_clearly(self, capsys):
+        # P1-7: empty job ID (mock) → clear message, no blank ID / broken hints.
+        from rich.console import Console
+
+        from slurmate.main import _submit_and_report
+        _submit_and_report("#!/bin/bash\necho hi", self._answers, Console())
+        out = capsys.readouterr().out
+        assert "mock mode" in out
+        assert "Job ID:" not in out
+        assert "squeue -j" not in out
+
+    def test_failure_goes_to_stderr(self, capsys, mocker):
+        # P1-9: submission errors write to stderr, not stdout.
+        import pytest
+        from rich.console import Console
+
+        from slurmate.main import _submit_and_report
+        mocker.patch("slurmate.main.submit_sbatch", return_value=(1, "", "boom"))
+        with pytest.raises(SystemExit):
+            _submit_and_report("script", self._answers, Console())
+        cap = capsys.readouterr()
+        assert "boom" in cap.err
+        assert "boom" not in cap.out
+
+    def test_no_save_script_skips_copy(self, capsys, mocker, tmp_path, monkeypatch):
+        # P1-6: --no-save-script / save_script=False suppresses the CWD copy.
+        from rich.console import Console
+
+        from slurmate.main import _submit_and_report
+        monkeypatch.chdir(tmp_path)
+        mocker.patch("slurmate.main.submit_sbatch", return_value=(0, "12345", ""))
+        _submit_and_report("script", self._answers, Console(), save_script=False)
+        assert list(tmp_path.glob("*.sh")) == []
+        assert "Submitted!" in capsys.readouterr().out
+
+
+class TestPartitionLimitNtasks:
+    def test_cpu_total_accounts_for_ntasks(self):
+        # P3-4: ntasks_per_node × cpus is compared to the node core count.
+        from rich.console import Console
+
+        from slurmate.main import _validate_partition_limits
+        part = {"name": "p", "cpus_per_node": 16, "mem_per_node_mb": 0,
+                "timelimit": None, "gpu_types": []}
+        console = Console(width=100)
+        with console.capture() as cap:
+            _validate_partition_limits(
+                {"_partition_obj": part, "cpus": 8, "ntasks_per_node": 4}, console)
+        assert "exceeds partition limit" in cap.get()  # 4×8=32 > 16
+
+
 class TestColorSuppression:
     def test_no_color_env_var(self, monkeypatch):
         from slurmate.theme import C
@@ -181,6 +349,7 @@ class TestColorSuppression:
 class TestMissingRequired:
     def test_warns_about_blank_required(self):
         from rich.console import Console
+
         from slurmate.main import _warn_missing_required
         console = Console(width=100)
         with console.capture() as cap:
@@ -191,6 +360,7 @@ class TestMissingRequired:
 
     def test_no_warning_when_complete(self):
         from rich.console import Console
+
         from slurmate.main import _warn_missing_required
         console = Console(width=100)
         with console.capture() as cap:

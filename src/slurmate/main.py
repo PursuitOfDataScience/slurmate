@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .builder import build_from_answers, estimate_su
+from .builder import build_from_answers, estimate_su, job_summary_rows, sanitize_job_name
 from .system_utils import (
     _parse_mem_to_mb,
     _parse_slurm_time_to_minutes,
@@ -42,15 +42,29 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
             "gpu_types": [], "timelimit": None, "is_public": True}
 
 
+def _coerce_int(value: Any, default: int) -> int:
+    """Coerce a CLI/config value to int, falling back to ``default``.
+
+    Config values can be stringy (e.g. ``gpus = "2"`` in TOML), which used to
+    crash batch mode on the later ``gpus > 0`` comparison.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]) -> dict[str, Any]:
-    print(f"  {c.CYAN}\u25b8{c.RESET} {c.GRAY}Running in batch mode{c.RESET}\n")
+    err_console = Console(stderr=True)
 
     # Get values fallback from config
     args_partition = getattr(args, "partition", None)
     partition = args_partition if args_partition is not None else config.get("partition", "")
 
     args_cpus = getattr(args, "cpus", None)
-    cpus = args_cpus if args_cpus is not None else config.get("cpus", 4)
+    cpus = _coerce_int(args_cpus if args_cpus is not None else config.get("cpus", 4), 4)
 
     args_memory = getattr(args, "memory", None)
     memory_val = args_memory if args_memory is not None else config.get("memory", "16G")
@@ -59,13 +73,14 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     time_val = args_time if args_time is not None else config.get("time_limit", "02:00:00")
 
     args_nodes = getattr(args, "nodes", None)
-    nodes = args_nodes if args_nodes is not None else config.get("nodes", 1)
+    nodes = _coerce_int(args_nodes if args_nodes is not None else config.get("nodes", 1), 1)
 
     args_gpus = getattr(args, "gpus", None)
-    gpus = args_gpus if args_gpus is not None else config.get("gpus", 0)
+    gpus = _coerce_int(args_gpus if args_gpus is not None else config.get("gpus", 0), 0)
 
     args_ntasks_per_node = getattr(args, "ntasks_per_node", None)
-    ntasks_per_node = args_ntasks_per_node if args_ntasks_per_node is not None else config.get("ntasks_per_node")
+    raw_ntasks = args_ntasks_per_node if args_ntasks_per_node is not None else config.get("ntasks_per_node")
+    ntasks_per_node = _coerce_int(raw_ntasks, 0) if raw_ntasks is not None else None
 
     args_gpu_type = getattr(args, "gpu_type", None)
     gpu_type = args_gpu_type if args_gpu_type is not None else config.get("gpu_type")
@@ -79,17 +94,35 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     args_output_file = getattr(args, "output_file", None)
     output_file = args_output_file if args_output_file is not None else config.get("output_file")
 
+    # Seed the GPU format from SLURMATE_GPU_FORMAT (default gres_type) so the
+    # env var documented in the README actually takes effect in batch mode.
     if gpus > 0 and not gpu_format:
-        gpu_format = "gres_type"
+        gpu_format = os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")
+
+    # Hard-validate numeric flags so batch mode rejects the same bad input the
+    # wizard does (positive cpus/nodes, non-negative gpus/ntasks), instead of
+    # emitting Slurm-invalid directives like --cpus-per-task=0 or --nodes=-2.
+    if cpus <= 0:
+        err_console.print(f"  {c.RED}\u2717 Error: --cpus must be a positive integer (got {cpus}){c.RESET}")
+        sys.exit(1)
+    if nodes <= 0:
+        err_console.print(f"  {c.RED}\u2717 Error: --nodes must be a positive integer (got {nodes}){c.RESET}")
+        sys.exit(1)
+    if gpus < 0:
+        err_console.print(f"  {c.RED}\u2717 Error: --gpus must be a non-negative integer (got {gpus}){c.RESET}")
+        sys.exit(1)
+    if ntasks_per_node is not None and ntasks_per_node <= 0:
+        err_console.print(f"  {c.RED}\u2717 Error: --ntasks-per-node must be a positive integer (got {ntasks_per_node}){c.RESET}")
+        sys.exit(1)
 
     # Hard-validate memory
     if not validate_memory(str(memory_val)):
-        Console(stderr=True).print(f"  {c.RED}\u2717 Error: Invalid memory value: {memory_val}{c.RESET}")
+        err_console.print(f"  {c.RED}\u2717 Error: Invalid memory value: {memory_val}{c.RESET}")
         sys.exit(1)
 
     # Hard-validate time limit
     if not validate_time(str(time_val)):
-        Console(stderr=True).print(f"  {c.RED}\u2717 Error: Invalid time limit value: {time_val}{c.RESET}")
+        err_console.print(f"  {c.RED}\u2717 Error: Invalid time limit value: {time_val}{c.RESET}")
         sys.exit(1)
 
     all_parts = fetch_partitions()
@@ -133,8 +166,9 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     args_array = getattr(args, "array", None)
     args_command = getattr(args, "command", None)
 
+    raw_job_name = args_job_name if args_job_name is not None else config.get("job_name", "")
     return {
-        "job_name": args_job_name if args_job_name is not None else config.get("job_name", ""),
+        "job_name": sanitize_job_name(str(raw_job_name)),
         "account": args_account if args_account is not None else config.get("account"),
         "partition": partition,
         "_partition_obj": part_obj,
@@ -163,15 +197,20 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
     if not part:
         return
 
-    # Check CPUs
+    # Check CPUs \u2014 compare the per-node total (ntasks-per-node \u00d7 cpus-per-task)
+    # against the node's core count, so multi-task over-allocation is caught.
     cpus = answers.get("cpus")
     if cpus is not None:
         try:
             cores = int(cpus)
+            ntpn_raw = answers.get("ntasks_per_node")
+            ntpn = int(ntpn_raw) if ntpn_raw else 1
+            total = cores * max(1, ntpn)
             limit = part.get("cpus_per_node", 0)
-            if limit and cores > limit:
-                console.print(f"  [yellow]\u26a0 Warning: CPUs ({cores}) exceeds partition limit ({limit} per node)[/]")
-        except ValueError:
+            if limit and total > limit:
+                detail = f"{ntpn}\u00d7{cores}={total}" if ntpn > 1 else str(total)
+                console.print(f"  [yellow]\u26a0 Warning: CPUs ({detail}) exceeds partition limit ({limit} per node)[/]")
+        except (ValueError, TypeError):
             pass
 
     # Check Memory
@@ -240,6 +279,7 @@ def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict
         answers.get("cpus", 1),
         answers.get("time_limit", "02:00:00"),
         answers.get("nodes", 1),
+        answers.get("ntasks_per_node"),
     )
 
     queue_info = fetch_queue_eta(
@@ -284,33 +324,18 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         padding=(0, 1),
     )
 
-    rows: list[tuple[str, str, str]] = [
-        ("Job:", answers.get("job_name", "") or "", "cyan"),
-        ("Partition:", answers.get("partition", "") or "", "cyan"),
-    ]
-    if answers.get("account"):
-        rows.append(("Account:", answers["account"], "cyan"))
-    if answers.get("qos") and answers["qos"] != "Default (none)":
-        rows.append(("QoS:", answers["qos"], "magenta"))
-    rows.append(("CPUs:", str(answers.get("cpus", "")), "cyan"))
-    rows.append(("Memory:", answers.get("memory", "") or "", "cyan"))
-    rows.append(("Time:", answers.get("time_limit", "") or "", "cyan"))
-    rows.append(("Nodes:", str(answers.get("nodes", 1)), "cyan"))
-    if answers.get("gpus", 0) > 0:
-        gt = answers.get("gpu_type") or "any"
-        rows.append(("GPUs:", f"{answers['gpus']} \u00d7 {gt}", "cyan"))
-    if answers.get("array_spec"):
-        rows.append(("Array:", str(answers["array_spec"]), "yellow"))
-    if answers.get("modules"):
-        rows.append(("Modules:", ", ".join(answers["modules"]), "cyan"))
-    if answers.get("env_name"):
-        rows.append(("Env:", answers["env_name"], "cyan"))
-    if answers.get("custom_sbatch"):
-        rows.append(("Custom flags:", ", ".join(answers["custom_sbatch"]), "cyan"))
-    rows.append(("Est. SU:", f"{su_estimate} SU", "yellow"))
+    # Share the ordered field list with the in-TUI Review step (job_summary_rows)
+    # so both summaries agree on what's shown; append the CLI-only SU/queue rows.
+    rows: list[tuple[str, str, str]] = []
+    for label, val in job_summary_rows(answers):
+        style = "magenta" if label == "QoS" else "cyan"
+        # Collapse a multi-line command to a single summary line (the full text
+        # is still in the script panel) so the panel width stays correct.
+        rows.append((f"{label}:", val.replace("\n", " \u21b5 "), style))
+    rows.append(("Est. SU:", f"{su_estimate} SU", "#ffaa00"))
     if queue_info:
         rows.append(("Queue:", f"{queue_info['running']} run / {queue_info['pending']} wait", "white"))
-        eta_color = "green" if queue_info["eta_seconds"] < 3600 else "yellow"
+        eta_color = "green" if queue_info["eta_seconds"] < 3600 else "#ffaa00"
         rows.append(("ETA:", str(queue_info["eta_label"]), eta_color))
 
     label_w = max(len(label) for label, _, _ in rows)
@@ -375,7 +400,7 @@ def _save_script(script: str, default_name: str) -> None:
 
 def _save_submitted_script(script: str, job_name: str, job_id: str) -> str | None:
     """Write the exact submitted script to the working dir for reproducibility."""
-    safe = (job_name or "slurm").replace("/", "_").strip() or "slurm"
+    safe = sanitize_job_name(job_name) or "slurm"
     path = os.path.join(os.getcwd(), f"{safe}-{job_id}.sh")
     try:
         with open(path, "w") as f:
@@ -386,24 +411,47 @@ def _save_submitted_script(script: str, job_name: str, job_id: str) -> str | Non
         return None
 
 
-def _submit_and_report(script: str, answers: dict[str, Any], console: Console) -> None:
+def _no_save_requested(save_script: bool) -> bool:
+    if not save_script:
+        return True
+    return os.environ.get("SLURMATE_NO_SAVE", "").lower() in ("1", "true", "yes")
+
+
+def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
+                       save_script: bool = True) -> None:
     """Submit the job and print the result, log path, and follow-up hints."""
-    retcode, stdout, stderr = submit_sbatch(script, job_name=answers.get("job_name", "slurm"))
+    job_name = answers.get("job_name", "") or "slurm"
+    retcode, stdout, stderr = submit_sbatch(script, job_name=job_name)
     if retcode != 0:
-        print(f"  {c.RED}✗ Submission failed (exit {retcode}){c.RESET}")
+        # Submission errors go to stderr so they don't pollute stdout pipelines.
+        print(f"  {c.RED}✗ Submission failed (exit {retcode}){c.RESET}", file=sys.stderr)
         if stdout:
-            print(f"  {c.GRAY}{stdout}{c.RESET}")
+            print(f"  {c.GRAY}{stdout}{c.RESET}", file=sys.stderr)
         if stderr:
-            print(f"  {c.RED}{stderr}{c.RESET}")
+            print(f"  {c.RED}{stderr}{c.RESET}", file=sys.stderr)
         sys.exit(1)
 
     job_id = stdout.strip()
+    # An empty job ID with rc 0 means mock mode (sbatch unavailable) — say so
+    # plainly instead of printing a blank ID and broken `squeue -j`/`scancel` hints.
+    if not job_id:
+        print(f"  {c.YELLOW}(mock mode — not actually submitted){c.RESET}")
+        if stderr:
+            print(f"  {c.GRAY}{stderr}{c.RESET}")
+        return
+
     print(f"  {c.GREEN}✓ Submitted!{c.RESET} Job ID: {c.CYAN}{job_id}{c.RESET}")
 
-    # Save a copy of the exact submitted script locally by default, so every
-    # submission leaves a reproducible record next to where it was launched.
-    if job_id:
-        saved = _save_submitted_script(script, answers.get("job_name", "") or "slurm", job_id)
+    # Save a copy of the exact submitted script for reproducibility. Routed
+    # through SLURMATE_LOG_DIR when set (submit_sbatch already wrote it there —
+    # report that single path instead of double-saving into the CWD), and
+    # skippable via --no-save-script / SLURMATE_NO_SAVE=1.
+    if not _no_save_requested(save_script):
+        log_dir = os.environ.get("SLURMATE_LOG_DIR")
+        if log_dir:
+            saved: str | None = os.path.join(log_dir, f"{sanitize_job_name(job_name) or 'slurm'}-{job_id}.sh")
+        else:
+            saved = _save_submitted_script(script, job_name, job_id)
         if saved:
             print(f"  {c.GRAY}Script saved: {saved}{c.RESET}")
 
@@ -451,24 +499,56 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--custom-sbatch", default=None,
                         help="Comma-separated extra #SBATCH flags (e.g. --exclusive,--reservation=abc)")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation and submit")
-    parser.add_argument("--dry-run", action="store_true", help="Print the script and exit without submitting")
-    parser.add_argument("--print", action="store_true", help="Print the script to stdout and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show the full summary (script, limit warnings, SU/ETA, "
+                             "missing-field reminders) without submitting")
+    parser.add_argument("--print", action="store_true",
+                        help="Print only the raw script to stdout and exit (nothing else)")
+    parser.add_argument("--no-save-script", action="store_true",
+                        help="Do not auto-save a <job>-<id>.sh copy on submit")
     parser.add_argument("--version", action="version", version=f"slurmate {__version__}")
     return parser.parse_args(argv)
+
+
+# Job-defining flags whose presence means the user wants non-interactive
+# (batch) mode — not just --partition. Output modes (--print/--dry-run) and
+# --no-save-script are deliberately excluded; --yes is handled separately.
+_BATCH_FLAGS = (
+    "job_name", "account", "partition", "qos", "cpus", "memory", "time", "nodes",
+    "ntasks_per_node", "gpus", "gpu_type", "gpu_format", "array", "modules", "env",
+    "env_type", "output_dir", "output_file", "command", "custom_sbatch",
+)
+
+
+def _is_batch_mode(args: argparse.Namespace) -> bool:
+    """Enter batch mode when any job-defining flag (or --yes) is supplied.
+
+    Previously only --partition switched modes, so flags like --cpus/--command
+    were silently dropped into the interactive TUI. A config-supplied partition
+    still satisfies the partition *requirement* once batch mode is active, but
+    by itself doesn't force batch mode (bare `slurmate` stays interactive).
+    """
+    if any(getattr(args, f, None) is not None for f in _BATCH_FLAGS):
+        return True
+    return bool(getattr(args, "yes", False))
 
 
 def main() -> None:
     console = Console()
     args = parse_args()
+    config = load_config()
+    batch = _is_batch_mode(args)
+    save_script = not args.no_save_script
 
     if not (args.print or args.dry_run):
-        print_banner(animate=sys.stdout.isatty())
-
-    config = load_config()
+        print_banner(interactive=not batch)
 
     answers_opt: dict[str, Any] | None = None
     wizard: Wizard | None = None
-    if args.partition is not None:
+    if batch:
+        # Keep --print's stdout to just the raw script; the mode banner is noise.
+        if not (args.print or args.dry_run):
+            print(f"  {c.CYAN}▸{c.RESET} {c.GRAY}Running in batch mode{c.RESET}\n")
         answers_opt = run_batch(args, console, config)
     else:
         wizard = Wizard()
@@ -482,15 +562,21 @@ def main() -> None:
         return
     answers: dict[str, Any] = answers_opt
 
-    if args.print or args.dry_run:
-        script = build_from_answers(answers)
-        print(script)
+    # --print: emit only the raw script, nothing else (clean for pipes/CI).
+    if args.print:
+        print(build_from_answers(answers))
         return
 
+    # build_and_show prints the summary panel, partition-limit warnings, SU/ETA,
+    # and missing-field reminders. --dry-run stops here without submitting.
     script, queue_info = build_and_show(answers, console)
 
+    if args.dry_run:
+        print(f"  {c.GRAY}Dry run — not submitted.{c.RESET}")
+        return
+
     if args.yes:
-        _submit_and_report(script, answers, console)
+        _submit_and_report(script, answers, console, save_script=save_script)
         return
 
     import questionary
@@ -502,7 +588,8 @@ def main() -> None:
 
     def _resummarize() -> None:
         _show_script_and_summary(console, script, answers, estimate_su(
-            answers.get("cpus", 1), answers.get("time_limit", "02:00:00"), answers.get("nodes", 1),
+            answers.get("cpus", 1), answers.get("time_limit", "02:00:00"),
+            answers.get("nodes", 1), answers.get("ntasks_per_node"),
         ), queue_info)
 
     # A navigable action menu instead of a one-way confirm chain: every action
@@ -537,7 +624,7 @@ def main() -> None:
             print(f"  {c.YELLOW}Not submitted.{c.RESET}")
             return
         if action.startswith("Submit"):
-            _submit_and_report(script, answers, console)
+            _submit_and_report(script, answers, console, save_script=save_script)
             return
         if action.startswith("Open"):
             script = _edit_script_in_editor(script)

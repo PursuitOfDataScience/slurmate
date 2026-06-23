@@ -32,7 +32,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import RadioList, TextArea
 
-from .builder import build_from_answers
+from .builder import build_from_answers, job_summary_rows
 from .system_utils import (
     fetch_available_modules,
     fetch_conda_envs,
@@ -61,11 +61,13 @@ _TUI_STYLE = PTStyle([
     ("status-bar", "bg:#0088ff fg:#ffffff bold"),
     ("sidebar-done", "fg:#00ff80 bold"),
     ("sidebar-current", "fg:#bf00ff bold"),
-    ("sidebar-pending", "fg:#555555"),
+    ("sidebar-pending", "fg:#8888aa"),
     ("title", "fg:#00ffff bold"),
-    ("subtitle", "fg:#888888"),
-    ("text-area", "fg:#ffffff bg:#333333"),
-    ("text-area focused", "fg:#ffffff bg:#333333"),
+    ("subtitle", "fg:#aaaaaa"),
+    ("text-area", "fg:#dddddd bg:#2a2a3a"),
+    # Distinct focused look (brighter text + a blue selection-style background)
+    # so the active input field is obvious — previously identical to unfocused.
+    ("text-area focused", "fg:#ffffff bg:#264f78 bold"),
     ("radio-list", "fg:#ffffff"),
     ("radio-list.selected", "fg:#00ff80 bold"),
     ("radio-list.pointer", "fg:#bf00ff bold"),
@@ -242,8 +244,7 @@ class Step:
 # directive-producing steps come first, then setup (modules/env), then command.
 STEPS: list[Step] = [
     Step("job_name", "Job name", "text", subtitle="A name for your Slurm job", required=True),
-    Step("partition", "Partition", "partition",
-         fetch=lambda: (fetch_public_partitions(), fetch_partitions())),
+    Step("partition", "Partition", "partition"),
     Step("account", "Account", "autocomplete",
          subtitle="Slurm account to charge (optional)",
          fetch=fetch_user_accounts),
@@ -258,7 +259,7 @@ STEPS: list[Step] = [
          validate=validate_memory, default="16G",
          choices=MEMORY_CHOICES),
     Step("time_limit", "Time limit", "autocomplete",
-         subtitle="Format: hh:mm:ss or d-hh:mm:ss",
+         subtitle="e.g. 30 (min), 5:00 (mm:ss), hh:mm:ss, d-hh:mm:ss, d-hh",
          validate=validate_time, default="02:00:00",
          choices=TIME_CHOICES),
     Step("nodes", "Nodes", "text", subtitle="Number of nodes", default="1",
@@ -277,7 +278,7 @@ STEPS: list[Step] = [
     Step("output_dir", "Output directory", "text",
          subtitle="Directory for stdout/stderr logs (optional)", default="logs", path=True),
     Step("output_file", "Output file", "text",
-         subtitle="Log file name, %j = job ID (optional, blank = <job>-%j.out). Bare name gets .out; .err derived", path=True),
+         subtitle="Log name: %j = job ID, %A/%a = array job/task (optional; blank = auto). Bare name gets .out; .err derived", path=True),
     Step("custom_sbatch", "Custom #SBATCH flags", "autocomplete",
          subtitle="e.g. --exclusive --reservation=abc  (space- or comma-separated, optional)",
          choices=SBATCH_FLAGS),
@@ -328,15 +329,17 @@ class Wizard:
                 self._config_defaults[step.key] = str(val)
         self.app: Application[Any]
         # Text input widget (shared across text/autocomplete/partition-text/gpu-text steps)
+        # Use the class style (not a literal) so the "text-area focused" pseudo
+        # state in _TUI_STYLE actually applies and the focused field stands out.
         self.text_area = TextArea(
             multiline=False,
-            style="bg:#333333 fg:#ffffff",
+            style="class:text-area",
             scrollbar=False,
         )
 
         self.multiline_text_area = TextArea(
             multiline=True,
-            style="bg:#333333 fg:#ffffff",
+            style="class:text-area",
             scrollbar=True,
         )
 
@@ -357,11 +360,11 @@ class Wizard:
         self._review_total_lines = 0
         self._review_config_window = Window(
             FormattedTextControl(self._render_review_config),
-            width=D(weight=2), wrap_lines=True,
+            width=D(weight=2), wrap_lines=True, style="bg:#1a1a2e",
         )
         self._review_script_window = Window(
             FormattedTextControl(self._render_review_script, focusable=True),
-            width=D(weight=3),
+            width=D(weight=3), style="bg:#1a1a2e",
         )
 
         self._build_app()
@@ -621,17 +624,33 @@ class Wizard:
         self._on_enter_step("backward")
         self._invalidate()
 
+    def _default_int(self, key: str, literal: int) -> int:
+        """Config-aware integer default — falls back to the configured value (if
+        any) when a field is cleared, not the bare hard-coded literal."""
+        raw = self._config_defaults.get(key)
+        if raw is None:
+            return literal
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return literal
+
     def _coerce(self, val: str, s: Step) -> Any:
+        if s.key == "job_name":
+            from .builder import sanitize_job_name
+            return sanitize_job_name(val)
         if s.key == "cpus":
-            return int(val) if val else 4
+            return int(val) if val else self._default_int("cpus", 4)
         if s.key == "gpus":
             return int(val) if val.strip().isdigit() else 0
         if s.key == "nodes":
-            return int(val) if val else 1
+            return int(val) if val else self._default_int("nodes", 1)
         if s.key == "ntasks_per_node":
             return int(val) if val else None
         if s.key == "memory":
-            return normalize_memory(val) if val else "16G"
+            if val:
+                return normalize_memory(val)
+            return normalize_memory(self._config_defaults.get("memory", "")) or "16G"
         if s.key == "modules":
             return [m.strip() for m in val.split(",") if m.strip()] if val else None
         if s.key == "custom_sbatch":
@@ -810,11 +829,20 @@ class Wizard:
 
     def _setup_partition(self) -> None:
         self.step_cache["partition_sub"] = "select"
-        try:
-            public, all_parts = fetch_public_partitions(), fetch_partitions()
-        except Exception as e:
-            logger.debug(f"Failed to fetch partitions: {e}")
-            public, all_parts = [], []
+        # Cache the partition query for the session: re-entering the step (or
+        # navigating back to it) reuses the result instead of re-running sinfo /
+        # scontrol. fetch_partitions() is fetched once and shared with
+        # fetch_public_partitions() so sinfo isn't run two or three times.
+        cached = self.transient.get("all_parts")
+        if cached is not None:
+            public, all_parts = self.transient.get("public_parts", []), cached
+        else:
+            try:
+                all_parts = fetch_partitions()
+                public = fetch_public_partitions(all_parts)
+            except Exception as e:
+                logger.debug(f"Failed to fetch partitions: {e}")
+                public, all_parts = [], []
         self.transient["public_parts"] = public
         self.transient["all_parts"] = all_parts
         choices = [CUSTOM]
@@ -930,7 +958,12 @@ class Wizard:
         choices = ["gres_type", "constraint", "gpus"]
         self.radio_list = RadioList([(c, c) for c in choices])
         prev = self.answers.get("gpu_format")
-        self._set_radio_default(prev if prev and prev in choices else "gres_type")
+        # Seed from SLURMATE_GPU_FORMAT (documented default) when there's no
+        # prior answer, so the env var actually influences the wizard default.
+        env_default = os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")
+        if env_default not in choices:
+            env_default = "gres_type"
+        self._set_radio_default(prev if prev and prev in choices else env_default)
 
     def _setup_ntasks_per_node(self, direction: str = "forward") -> None:
         nodes = self.answers.get("nodes", 1)
@@ -1039,15 +1072,16 @@ class Wizard:
         )
 
     def _header(self) -> VSplit:
-        bar_style = "bg:#0088ff fg:#ffffff bold"
+        # Reuse the status-bar class rather than re-declaring its colors inline,
+        # so the two definitions can't drift apart.
         return VSplit([
             Window(
                 FormattedTextControl(self._render_header_left),
-                height=1, style=bar_style, dont_extend_height=True,
+                height=1, style="class:status-bar", dont_extend_height=True,
             ),
             Window(
                 FormattedTextControl(self._render_header_right),
-                height=1, style=bar_style, align=WindowAlign.RIGHT,
+                height=1, style="class:status-bar", align=WindowAlign.RIGHT,
             ),
         ])
 
@@ -1061,24 +1095,30 @@ class Wizard:
         right = f"  {visible_done + 1}/{visible_total}  {s.title}"
         return [("class:status-bar", f"  {right}  ")]
 
+    _SIDEBAR_WIDTH = 26
+
     def _sidebar(self) -> Window:
         return Window(
             FormattedTextControl(self._render_sidebar),
-            width=24,
+            width=self._SIDEBAR_WIDTH,
             style="bg:#1a1a2e",
         )
 
     def _render_sidebar(self) -> list[tuple[str, str]]:
         lines: list[tuple[str, str]] = [("class:subtitle", "  Steps\n\n")]
+        # 4 columns of prefix ("  \u2713 "); ellipsize any title that would overflow
+        # the fixed width (e.g. "Environment name/path") rather than clipping it.
+        avail = self._SIDEBAR_WIDTH - 4
         for i, s in enumerate(STEPS):
             if i in self._skipped_indices:
                 continue
+            title = s.title if len(s.title) <= avail else s.title[: avail - 1] + "\u2026"
             if i < self.idx:
-                lines.append(("class:sidebar-done", f"  \u2713 {s.title}\n"))
+                lines.append(("class:sidebar-done", f"  \u2713 {title}\n"))
             elif i == self.idx:
-                lines.append(("class:sidebar-current", f"  \u25b6 {s.title}\n"))
+                lines.append(("class:sidebar-current", f"  \u25b6 {title}\n"))
             else:
-                lines.append(("class:sidebar-pending", f"    {s.title}\n"))
+                lines.append(("class:sidebar-pending", f"    {title}\n"))
         return lines
 
     def _content(self) -> HSplit:
@@ -1087,17 +1127,22 @@ class Wizard:
         title_text = f"\n  {s.title}\n"
         subtitle_text = f"  {s.subtitle}\n\n"
 
+        # One consistent content background (the same navy as the chrome) across
+        # the title / error / warning / review windows, so the central column
+        # isn't a patchwork of terminal-default and themed panels.
+        content_bg = "bg:#1a1a2e"
+
         error_control: list[Window] = []
         if self.step_cache.get("error"):
             error_control.append(Window(
                 FormattedTextControl([("class:error", f"  \u2717 {self.step_cache['error']}\n")]),
-                height=1, style="",
+                height=1, style=content_bg,
             ))
         warning_text = self._get_warning()
         if warning_text:
             error_control.append(Window(
                 FormattedTextControl([("class:warning", f"  \u26a0 {warning_text}\n")]),
-                height=1, style="",
+                height=1, style=content_bg,
             ))
 
         title_win = Window(
@@ -1107,6 +1152,7 @@ class Wizard:
             ]),
             height=2 + (1 if subtitle_text else 0),
             dont_extend_height=True,
+            style=content_bg,
         )
 
         text_active = self._is_text_active()
@@ -1118,10 +1164,10 @@ class Wizard:
                 title_win,
                 VSplit([
                     self._review_config_window,
-                    Window(width=1, char="│", style="class:subtitle"),
+                    Window(width=1, char="│", style="class:subtitle bg:#1a1a2e"),
                     self._review_script_window,
-                ], padding=1),
-            ])
+                ], padding=1, style=content_bg),
+            ], style=content_bg)
         if text_active:
             if getattr(s, "multiline", False):
                 children = [self.multiline_text_area]
@@ -1130,7 +1176,10 @@ class Wizard:
         elif select_active:
             children = [self.radio_list]
 
-        return HSplit([title_win] + error_control + children + [self._queue_panel(), self._preview_panel()])
+        return HSplit(
+            [title_win] + error_control + children + [self._queue_panel(), self._preview_panel()],
+            style=content_bg,
+        )
 
     def _past_hardware_config(self) -> bool:
         """True once every resource/hardware step is done (modules onward).
@@ -1175,24 +1224,11 @@ class Wizard:
             height=D(min=8),
         )
 
-    def _review_summary_items(self) -> list[tuple[str, str | None]]:
-        return [
-            ("Job name", self.answers.get("job_name", "")),
-            ("Partition", self.answers.get("partition", "")),
-            ("Account", self.answers.get("account")),
-            ("QoS", self.answers.get("qos")),
-            ("CPUs", str(self.answers.get("cpus", ""))),
-            ("Memory", self.answers.get("memory", "")),
-            ("Time limit", self.answers.get("time_limit", "")),
-            ("Nodes", str(self.answers.get("nodes", 1))),
-            ("GPUs", f"{self.answers.get('gpus', 0)} \u00d7 {self.answers.get('gpu_type') or 'any'}"
-                     if self.answers.get("gpus", 0) > 0 else None),
-            ("Array spec", self.answers.get("array_spec")),
-            ("Output dir", self.answers.get("output_dir")),
-            ("Output file", self.answers.get("output_file")),
-            ("Env", self.answers.get("env_name")),
-            ("Command", self.answers.get("command", "")),
-        ]
+    def _review_summary_items(self) -> list[tuple[str, str]]:
+        # Shared with the CLI summary panel (job_summary_rows) so both surfaces
+        # show the same fields \u2014 including Modules, Custom flags, GPU format, and
+        # Tasks/node, which the Review step previously omitted.
+        return job_summary_rows(self.answers)
 
     def _render_review_config(self) -> list[tuple[str, str]]:
         """Left column of the review step \u2014 the job configuration summary."""

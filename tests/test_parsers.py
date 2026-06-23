@@ -1,14 +1,13 @@
-import os
 from pathlib import Path
-from typing import Any
-import pytest
 from unittest.mock import MagicMock
 
+import pytest
+
 from slurmate.system_utils import (
+    fetch_gpu_types_for_partition,
     fetch_partitions,
     fetch_public_partitions,
     fetch_qos_for_partition,
-    fetch_gpu_types_for_partition,
     fetch_queue_eta,
     submit_sbatch,
 )
@@ -65,7 +64,7 @@ class TestRealParsers:
     def test_fetch_partitions_real(self):
         parts = fetch_partitions()
         assert len(parts) == 5
-        
+
         cpu_shared = next(p for p in parts if p["name"] == "cpu-shared")
         assert cpu_shared["nodes"] == 100
         assert cpu_shared["cpus_per_node"] == 32

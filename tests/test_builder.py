@@ -163,6 +163,99 @@ class TestEstimateSu:
         result = estimate_su(8, "02:00:00", 4)
         assert result == "64.0"
 
+    def test_factors_ntasks_per_node(self):
+        # P3-3: tasks-per-node multiplies the per-task core count.
+        assert estimate_su(8, "02:00:00", 2, ntasks_per_node=2) == "64.0"
+        # None / 0 ntasks behaves like a single task (back-compat).
+        assert estimate_su(8, "02:00:00", 2) == "32.0"
+        assert estimate_su(8, "02:00:00", 2, ntasks_per_node=0) == "32.0"
+
+
+class TestSanitizeJobName:
+    def test_whitespace_and_unsafe_chars(self):
+        from slurmate.builder import sanitize_job_name
+        assert sanitize_job_name("my training job") == "my_training_job"
+        assert sanitize_job_name("a/b;c") == "abc"
+        assert sanitize_job_name("  ok-name_1.2  ") == "ok-name_1.2"
+        assert sanitize_job_name("") == ""
+
+    def test_builder_emits_single_token_job_name(self):
+        # P1-8: spaces in the name must not split the directive.
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "my training job", "partition": "p"})
+        assert "#SBATCH --job-name=my_training_job" in s
+
+
+class TestErrorPathPreservesPattern:
+    """P0-5: a %j/%A/%a in the trailing segment must not be dropped from .err."""
+
+    def test_run_dot_j_keeps_pattern_in_error(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "output_file": "run.%j"})
+        assert "#SBATCH --output=run.%j.out" in s
+        assert "#SBATCH --error=run.%j.err" in s
+
+    def test_x_dot_j_keeps_pattern(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "output_file": "%x.%j"})
+        assert "#SBATCH --error=%x.%j.err" in s
+
+    def test_base_pattern_still_swaps_real_extension(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "output_file": "out_%j.log"})
+        assert "#SBATCH --output=out_%j.log" in s
+        assert "#SBATCH --error=out_%j.err" in s
+
+
+class TestArrayLogPattern:
+    """P1-10: array jobs default to %A_%a, not %j, when no explicit file given."""
+
+    def test_array_uses_A_a_with_output_dir(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "array_spec": "1-10", "output_dir": "logs"})
+        assert "#SBATCH --output=logs/j-%A_%a.out" in s
+        assert "#SBATCH --error=logs/j-%A_%a.err" in s
+
+    def test_array_uses_A_a_with_no_output_config(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "array_spec": "1-10", "command": "echo hi"})
+        assert "#SBATCH --output=j-%A_%a.out" in s
+        assert "#SBATCH --error=j-%A_%a.err" in s
+
+    def test_non_array_still_uses_j(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "output_dir": "logs"})
+        assert "#SBATCH --output=logs/j-%j.out" in s
+
+
+class TestJobSummaryRows:
+    def test_includes_all_common_fields(self):
+        # P3-9/P1-2: a single ordered field list shared by both summaries.
+        from slurmate.builder import job_summary_rows
+        rows = dict(job_summary_rows({
+            "job_name": "j", "partition": "p", "cpus": 8, "memory": "32G",
+            "time_limit": "01:00:00", "nodes": 2, "ntasks_per_node": 4,
+            "gpus": 2, "gpu_type": "a100", "gpu_format": "gres_type",
+            "array_spec": "1-5", "output_dir": "logs", "output_file": "o.out",
+            "modules": ["cuda/12.1"], "env_name": "ai",
+            "custom_sbatch": ["--exclusive"], "command": "python x.py",
+        }))
+        for key in ("Job name", "Partition", "Tasks/node", "GPUs", "GPU format",
+                    "Modules", "Custom flags", "Command", "Output dir", "Output file"):
+            assert key in rows, key
+        assert rows["GPUs"] == "2 × a100"
+        assert rows["Modules"] == "cuda/12.1"
+        assert rows["Custom flags"] == "--exclusive"
+
+    def test_omits_empty_and_gpu_when_zero(self):
+        from slurmate.builder import job_summary_rows
+        rows = dict(job_summary_rows({"job_name": "j", "partition": "p", "gpus": 0}))
+        assert "GPUs" not in rows
+        assert "GPU format" not in rows
+        assert "Account" not in rows
+
 
 class TestPartialPreview:
     def test_partial_omits_unentered_fields(self):

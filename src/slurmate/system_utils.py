@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from typing import Any
@@ -73,8 +74,12 @@ def _parse_mem_to_mb(raw: str) -> int:
         num = float(match.group(1))
         scale = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 ** 2, "P": 1024 ** 3}
         return int(num * scale[match.group(2)])
-    plain = _safe_int(value)
-    return plain if plain > 0 else 0
+    # A bare integer is megabytes. Anything else is malformed (e.g. "16GB",
+    # "16 G", "1.5.5G") — return 0 (unknown) rather than a misleading partial
+    # like "16", which would masquerade as a tiny valid value in limit checks.
+    if value.isdigit():
+        return int(value)
+    return 0
 
 
 def validate_memory(value: str) -> bool:
@@ -90,26 +95,38 @@ def validate_memory(value: str) -> bool:
     - Invalid formats
     """
     v = value.strip()
-    if not v or v == "0":
+    if not v:
         return False
-    # Accepts plain digits
+    # Accepts plain digits — reject a zero magnitude.
     if v.isdigit():
         return int(v) > 0
-    # Accepts with unit suffix (KMGTP) and optional Slurm N/C
-    if re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", v.upper()):
-        return True
+    # Accepts with unit suffix (KMGTP) and optional Slurm N/C — but reject a
+    # zero magnitude regardless of unit ("0G"/"0M" are not valid sizes).
+    m = re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", v.upper())
+    if m:
+        return float(m.group(1)) > 0
     return False
+
+
+# Slurm's accepted --time grammar, allowing 1–2 digit lead fields:
+#   minutes | minutes:seconds | hours:minutes:seconds |
+#   days-hours | days-hours:minutes | days-hours:minutes:seconds
+_TIME_PATTERNS = (
+    r"^\d+$",                       # minutes
+    r"^\d+:\d{2}$",                 # minutes:seconds
+    r"^\d+:\d{2}:\d{2}$",           # hours:minutes:seconds
+    r"^\d+-\d{1,2}$",               # days-hours
+    r"^\d+-\d{1,2}:\d{2}$",         # days-hours:minutes
+    r"^\d+-\d{1,2}:\d{2}:\d{2}$",   # days-hours:minutes:seconds
+)
 
 
 def validate_time(val: str) -> bool:
-    """Validate time limit string in Slurm format (hh:mm:ss or d-hh:mm:ss)."""
-    if not val.strip():
+    """Validate a time limit string against Slurm's accepted --time formats."""
+    v = val.strip()
+    if not v:
         return True
-    if re.match(r"^\d+-\d{2}:\d{2}:\d{2}$", val.strip()):
-        return True
-    if re.match(r"^\d{2}:\d{2}:\d{2}$", val.strip()):
-        return True
-    return False
+    return any(re.match(p, v) for p in _TIME_PATTERNS)
 
 
 def normalize_memory(value: str) -> str:
@@ -265,7 +282,12 @@ def fetch_partitions() -> list[dict[str, Any]]:
     return list(partitions.values())
 
 
-def fetch_public_partitions() -> list[dict[str, Any]]:
+def fetch_public_partitions(all_parts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Return only publicly-usable partitions.
+
+    Pass ``all_parts`` (a prior ``fetch_partitions()`` result) to avoid a
+    redundant ``sinfo`` call — the partition step fetches it once and shares it.
+    """
     if not is_tool_available("sinfo") or not is_tool_available("scontrol"):
         return [p for p in MOCK_PARTITIONS if p.get("is_public")]
 
@@ -279,7 +301,8 @@ def fetch_public_partitions() -> list[dict[str, Any]]:
         if name:
             partition_lines[name] = line
 
-    all_parts = fetch_partitions()
+    if all_parts is None:
+        all_parts = fetch_partitions()
     result: list[dict[str, Any]] = []
     for part in all_parts:
         name = part["name"]
@@ -387,8 +410,10 @@ def fetch_conda_envs(modules: list[str] | None = None) -> list[str]:
 
     prefix = ""
     if modules:
+        # Quote each module token so a name with shell metacharacters can't break
+        # out of (or inject into) the `bash -lc` string.
         names = " ".join(
-            (m[:-9] if m.endswith("(default)") else m).strip()
+            shlex.quote((m[:-9] if m.endswith("(default)") else m).strip())
             for m in modules
             if m and m.strip()
         )
@@ -456,13 +481,26 @@ def fetch_user_accounts() -> list[str]:
     return accounts or list(MOCK_ACCOUNTS)
 
 
+def _format_eta(seconds: int) -> str:
+    if seconds <= 0:
+        return "now"
+    if seconds < 120:
+        return f"~{seconds}s"
+    if seconds < 3600:
+        return f"~{seconds // 60}min"
+    if seconds < 86400:
+        return f"~{seconds // 3600}h"
+    return f"~{seconds // 86400}d"
+
+
+# Derive the mock label from _format_eta so the demo display matches the live
+# formatter exactly (e.g. "~1h", not a hand-written "~1 hour").
 MOCK_QUEUE_INFO = {
     "running": 12,
     "pending": 5,
     "eta_seconds": 3600,
-    "eta_label": "~1 hour",
+    "eta_label": _format_eta(3600),
 }
-
 
 
 def fetch_queue_eta(partition: str, req_nodes: int = 1) -> dict[str, Any]:
@@ -528,18 +566,6 @@ def fetch_queue_eta(partition: str, req_nodes: int = 1) -> dict[str, Any]:
     eta_label = _format_eta(eta_sec)
 
     return {"running": running, "pending": pending, "eta_seconds": eta_sec, "eta_label": eta_label}
-
-
-def _format_eta(seconds: int) -> str:
-    if seconds <= 0:
-        return "now"
-    if seconds < 120:
-        return f"~{seconds}s"
-    if seconds < 3600:
-        return f"~{seconds // 60}min"
-    if seconds < 86400:
-        return f"~{seconds // 3600}h"
-    return f"~{seconds // 86400}d"
 
 
 def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, str, str]:
@@ -609,19 +635,49 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
     return result.returncode, job_id, ""
 
 
-def _coerce_config_value(v: str) -> Any:
-    """Parse one scalar value for the naive key=value fallback parser."""
+def _strip_inline_comment(v: str) -> str:
+    """Drop a trailing ``# comment`` that sits outside any quotes."""
+    in_single = in_double = False
+    for i, ch in enumerate(v):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return v[:i].rstrip()
+    return v.rstrip()
+
+
+def _coerce_scalar(v: str) -> Any:
+    """Coerce a single bare scalar token (string/int/float/bool)."""
     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
         return v[1:-1]
-    if v.startswith("[") and v.endswith("]"):
-        return re.findall(r"['\"]([^'\"]*)['\"]", v)
-    if v.isdigit():
+    if re.match(r"^-?\d+$", v):
         return int(v)
-    if v.lower() == "true":
+    if re.match(r"^-?\d+\.\d+$", v):
+        return float(v)
+    low = v.lower()
+    if low == "true":
         return True
-    if v.lower() == "false":
+    if low == "false":
         return False
     return v
+
+
+def _coerce_config_value(v: str) -> Any:
+    """Parse one value for the naive key=value fallback parser.
+
+    Handles quoted strings, arrays (with quoted *or* bare numeric items), ints,
+    floats, negatives and booleans. Best-effort only — real TOML (tomllib/tomli)
+    is used whenever available; this is the last resort.
+    """
+    v = v.strip()
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
+    return _coerce_scalar(v)
 
 
 def _parse_config_naive(text: str) -> dict[str, Any]:
@@ -633,7 +689,7 @@ def _parse_config_naive(text: str) -> dict[str, Any]:
             continue
         if "=" in line:
             k, v = line.split("=", 1)
-            config[k.strip()] = _coerce_config_value(v.strip())
+            config[k.strip()] = _coerce_config_value(_strip_inline_comment(v.strip()))
     return config
 
 

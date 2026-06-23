@@ -1,0 +1,11 @@
+# Ship the changelog and license alongside the package.
+include CHANGELOG.md
+include LICENSE
+
+# Ship the full test suite so the sdist is testable end-to-end: the conftest
+# (mock-mode setup + src path) and the fixture files the parser tests read.
+recursive-include tests *.py
+recursive-include tests/fixtures *.txt
+
+# Keep build/cache artifacts out of the sdist.
+global-exclude __pycache__ *.py[cod]

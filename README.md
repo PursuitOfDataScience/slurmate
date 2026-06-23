@@ -18,7 +18,7 @@ on any cluster, as long as `sbatch` is on your `PATH`.
 [![PyPI](https://img.shields.io/pypi/v/slurmate.svg?cache=0)](https://pypi.org/project/slurmate/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](#-license)
-[![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#-status)
+[![Status: beta](https://img.shields.io/badge/status-beta-orange.svg)](#-status)
 [![Linter: ruff](https://img.shields.io/badge/lint-ruff-261230.svg)](https://github.com/astral-sh/ruff)
 
 </div>
@@ -97,11 +97,25 @@ Submit immediately, no prompts:
 slurmate --partition gpu --command "python train.py" --yes
 ```
 
-Just want the script? Print it (great for piping or CI):
+Just want the script? `--print` emits **only** the raw script (great for piping
+or CI):
 
 ```bash
 slurmate --partition gpu --command "python train.py" --print > job.sbatch
 ```
+
+Want a full preview without submitting? `--dry-run` shows the summary panel,
+partition-limit warnings, SU/ETA, and any missing-field reminders — everything
+except the actual submit:
+
+```bash
+slurmate --partition gpu --command "python train.py" --dry-run
+```
+
+Batch mode kicks in as soon as you pass any job-defining flag (or `--yes`); a
+bare `slurmate` still launches the wizard. Every submit also saves a
+`<job>-<id>.sh` copy next to where you ran it — pass `--no-save-script` (or set
+`SLURMATE_NO_SAVE=1`) to skip that.
 
 Run `slurmate --help` for the full flag list.
 
@@ -119,7 +133,7 @@ Run `slurmate --help` for the full flag list.
 | 📋 **Copy-friendly** | Mouse capture is off so you can select/copy the preview natively; navigation is fully keyboard-driven. |
 | 🧩 **Cluster-agnostic GPU syntax** | Choose `--gres=gpu:type:N`, `--gres` + `--constraint`, or `--gpus` to match your site. |
 | 🐍 **Env activation** | Conda, Mamba, virtualenv, or none — generated automatically. |
-| 🗂️ **Smart output paths** | Set a custom log name/pattern (`%j` = job ID); error path is derived and log dirs are auto-created. |
+| 🗂️ **Smart output paths** | Set a custom log name/pattern (`%j` = job ID, `%A`/`%a` = array job/task); error path is derived and log dirs are auto-created. Array jobs default to the `%A_%a` pattern. |
 | ♻️ **Reproducible** | Every submission is saved locally as `<job>-<job-id>.sh`; you can also save manually or edit in `$EDITOR` before submitting. |
 | 🧪 **Safe to explore** | No Slurm? It falls back to realistic mock data so you can try the whole flow anywhere. |
 
@@ -137,7 +151,7 @@ These prefill the wizard **and** act as fallbacks in batch mode. Explicit CLI
 flags always win.
 
 ```toml
-# .slurmate.toml — keys may be top-level or under a [defaults] table
+# .slurmate.toml — keys may be top-level or under a [defaults]/[slurmate] table
 account     = "my_lab"
 partition   = "gpu-shared"
 cpus        = 8
@@ -154,8 +168,14 @@ output_dir  = "logs"
 `array_spec`, `modules`, `env_type`, `env_name`, `output_dir`, `output_file`,
 `command`, `custom_sbatch`.
 
-> Real TOML is used when available (`tomllib` on 3.11+, `tomli` otherwise);
-> without either, a minimal flat `key = value` reader is used as a fallback.
+Keys may sit at the top level or under a `[defaults]` or `[slurmate]` table.
+When the same key appears in more than one place, the effective precedence is
+**`[slurmate]` > `[defaults]` > top-level** (a later table wins). Explicit CLI
+flags always override the file.
+
+> Real TOML is always used on supported Pythons (`tomllib` on 3.11+, the `tomli`
+> dependency on 3.10). A minimal flat `key = value` reader exists only as a
+> last-resort fallback.
 
 ---
 
@@ -165,7 +185,8 @@ output_dir  = "logs"
 |---|---|
 | `SLURMATE_MOCK=1` | Force mock mode even when Slurm is installed (great for demos/tests). |
 | `SLURMATE_GPU_FORMAT` | Default GPU syntax: `gres_type` (default) · `constraint` · `gpus`. |
-| `SLURMATE_LOG_DIR=…` | Save a copy of every submitted script there for reproducibility. |
+| `SLURMATE_LOG_DIR=…` | Save the submitted script there (instead of the working dir) for reproducibility. |
+| `SLURMATE_NO_SAVE=1` | Don't auto-save a `<job>-<id>.sh` copy on submit (same as `--no-save-script`). |
 | `SLURMATE_NO_BANNER=1` | Hide the startup banner. |
 | `SLURMATE_BANNER_ANIMATE=1` | Force the animated banner even when not a TTY. |
 | `SLURMATE_DEBUG=1` | Verbose debug logging. |
@@ -187,7 +208,7 @@ output_dir  = "logs"
 
 ## 🧪 Status
 
-Slurmate is **experimental** and pre-1.0 — the CLI, config keys, and defaults may
+Slurmate is **beta** and pre-1.0 — the CLI, config keys, and defaults may
 change between releases. It's already useful day-to-day; pin a version if you
 script around it. Bug reports and cluster-specific quirks are very welcome.
 
@@ -204,7 +225,7 @@ mypy src/              # types (strict)
 pytest                 # tests
 ```
 
-CI runs the same three checks on Python 3.10–3.12 for every push and PR.
+CI runs the same three checks on Python 3.10–3.13 for every push and PR.
 
 ---
 

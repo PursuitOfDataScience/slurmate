@@ -2,11 +2,78 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from .system_utils import _parse_slurm_time_to_minutes
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_job_name(name: str) -> str:
+    """Make a job name safe as a single ``sbatch`` token.
+
+    ``sbatch`` splits ``--job-name`` on whitespace, so ``my training job`` would
+    silently become just ``my``. Collapse internal whitespace to underscores and
+    drop characters outside a conservative safe set, so the emitted directive
+    (and the auto-saved ``<job>-<id>.sh`` filename) are always well-formed.
+    """
+    name = (name or "").strip()
+    if not name:
+        return name
+    name = re.sub(r"\s+", "_", name)
+    return re.sub(r"[^A-Za-z0-9._+-]", "", name)
+
+
+def _gpus_int(answers: dict[str, Any]) -> int:
+    g = answers.get("gpus", 0)
+    try:
+        return int(g) if g is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
+    """Ordered (label, value) rows for the job configuration summary.
+
+    Single source of truth shared by the CLI summary panel and the in-TUI
+    Review step, so both surfaces show the same fields in the same order.
+    Empty/absent fields are omitted.
+    """
+    rows: list[tuple[str, str]] = []
+
+    def add(label: str, val: Any) -> None:
+        if val is None:
+            return
+        text = ", ".join(str(x) for x in val) if isinstance(val, list) else str(val)
+        if text:
+            rows.append((label, text))
+
+    add("Job name", answers.get("job_name"))
+    add("Partition", answers.get("partition"))
+    add("Account", answers.get("account"))
+    qos = answers.get("qos")
+    if qos and qos != "Default (none)":
+        add("QoS", qos)
+    add("CPUs", answers.get("cpus"))
+    add("Memory", answers.get("memory"))
+    add("Time limit", answers.get("time_limit"))
+    nodes = answers.get("nodes")
+    if nodes is not None and str(nodes) != "":
+        add("Nodes", nodes)
+    if answers.get("ntasks_per_node"):
+        add("Tasks/node", answers.get("ntasks_per_node"))
+    if _gpus_int(answers) > 0:
+        add("GPUs", f"{answers.get('gpus')} × {answers.get('gpu_type') or 'any'}")
+        add("GPU format", answers.get("gpu_format"))
+    add("Array spec", answers.get("array_spec"))
+    add("Output dir", answers.get("output_dir"))
+    add("Output file", answers.get("output_file"))
+    add("Modules", answers.get("modules"))
+    add("Env", answers.get("env_name"))
+    add("Custom flags", answers.get("custom_sbatch"))
+    add("Command", answers.get("command"))
+    return rows
 
 
 def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
@@ -21,7 +88,7 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
     """
     output_dir = answers.get("output_dir")
     output_file = answers.get("output_file")
-    job_name = answers.get("job_name", "")
+    job_name = sanitize_job_name(answers.get("job_name", ""))
     prefix = job_name if job_name else "slurm"
 
     def _in_dir(name: str) -> str:
@@ -30,12 +97,22 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
             return f"{output_dir.strip().rstrip('/')}/{name}"
         return name
 
+    # Array jobs conventionally log per task with %A (array job id) + %a (task
+    # id); a single %j would collide across tasks. Plain jobs keep %j.
+    array_spec = answers.get("array_spec")
+    tag = "%A_%a" if array_spec else "%j"
+
     output_path: str | None
     error_path: str | None
     if output_file:
         of = output_file.strip()
         base, ext = os.path.splitext(of)
-        if ext:
+        # `os.path.splitext("run.%j")` returns ("run", ".%j") — but a suffix that
+        # carries a Slurm pattern character (%) is part of the log *pattern*, not
+        # a real extension. Treating it as one dropped %j from the derived error
+        # path (every task then overwrote the same file). So: only swap a literal
+        # extension; otherwise keep the whole name and append .out/.err.
+        if ext and "%" not in ext:
             output_path = _in_dir(of)
             error_path = _in_dir(base + ".err")
         else:
@@ -43,8 +120,8 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
             error_path = _in_dir(of + ".err")
     elif output_dir:
         out_dir = output_dir.strip().rstrip("/")
-        output_path = f"{out_dir}/{prefix}-%j.out"
-        error_path = f"{out_dir}/{prefix}-%j.err"
+        output_path = f"{out_dir}/{prefix}-{tag}.out"
+        error_path = f"{out_dir}/{prefix}-{tag}.err"
     else:
         output_path = None
         error_path = None
@@ -105,6 +182,11 @@ def build_sbatch_script(
 ) -> str:
     lines = ["#!/bin/bash", ""]
 
+    # Defensive: a raw job name with whitespace would split the directive
+    # (`--job-name=my training job` → name becomes `my`). Sanitize here too so
+    # direct callers of build_sbatch_script are covered, not just the wizard.
+    job_name = sanitize_job_name(job_name)
+
     # One contiguous #SBATCH block, emitted in the same order the wizard asks
     # the questions, so the live preview grows top-to-bottom without reshuffling.
     if job_name or not partial:
@@ -150,8 +232,9 @@ def build_sbatch_script(
     # the user has actually configured an output dir/file (output_path is set).
     if not partial or output_path:
         prefix = job_name if job_name else "slurm"
-        out = output_path or f"{prefix}-%j.out"
-        err = error_path or f"{prefix}-%j.err"
+        tag = "%A_%a" if array_spec else "%j"
+        out = output_path or f"{prefix}-{tag}.out"
+        err = error_path or f"{prefix}-{tag}.err"
         lines.append(f"#SBATCH --output={out}")
         lines.append(f"#SBATCH --error={err}")
 
@@ -208,15 +291,18 @@ def build_sbatch_script(
     return "\n".join(lines)
 
 
-def estimate_su(cpus: int, time_limit: str, nodes: int = 1) -> str:
+def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
+                ntasks_per_node: int | None = None) -> str:
     """Estimate Service Units (SU) cost for a job.
 
-    Service Units are typically core-hours (CPUs * hours * nodes).
+    Service Units are typically core-hours: CPUs-per-task × tasks-per-node ×
+    nodes × hours. When ``ntasks_per_node`` is unset it defaults to 1 task.
 
     Args:
         cpus: Number of CPU cores per task.
         time_limit: Time limit string in Slurm format (e.g. "hh:mm:ss" or "d-hh:mm:ss").
         nodes: Number of nodes requested.
+        ntasks_per_node: Tasks per node (multiplies the per-task core count).
 
     Returns:
         Formatted string representation of estimated SUs.
@@ -225,7 +311,8 @@ def estimate_su(cpus: int, time_limit: str, nodes: int = 1) -> str:
     if minutes <= 0:
         minutes = 120.0
     hours = minutes / 60.0
-    su = cpus * hours * nodes
+    tasks = ntasks_per_node if (ntasks_per_node and ntasks_per_node > 0) else 1
+    su = cpus * tasks * hours * nodes
     if su < 1:
         return f"{su:.2f}"
     if su < 100:

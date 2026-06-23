@@ -123,14 +123,14 @@ class TestSubmitSbatch:
         err_dir = tmp_path / "test_err_dir"
         assert not out_dir.exists()
         assert not err_dir.exists()
-        
+
         script = f"""#!/bin/bash
 #SBATCH --output={out_dir}/job-%j.out
 #SBATCH --error={err_dir}/job-%j.err
 echo hello
 """
         submit_sbatch(script)
-        
+
         assert out_dir.exists()
         assert err_dir.exists()
 
@@ -145,11 +145,86 @@ class TestHelpers:
         assert validate_memory("0") is False
         assert validate_memory("abc") is False
 
+    def test_validate_memory_rejects_zero_magnitude(self):
+        # P3-11: a zero magnitude is invalid regardless of unit; "0G"/"0M" used
+        # to slip through because the zero check only fired for the unitless "0".
+        from slurmate.system_utils import validate_memory
+        assert validate_memory("0G") is False
+        assert validate_memory("0M") is False
+        assert validate_memory("0.0G") is False
+        assert validate_memory("0.5G") is True
+
     def test_parse_mem_to_mb(self):
         from slurmate.system_utils import _parse_mem_to_mb
         assert _parse_mem_to_mb("16G") == 16384
         assert _parse_mem_to_mb("1T") == 1048576
         assert _parse_mem_to_mb("64000M") == 64000
+        assert _parse_mem_to_mb("64000") == 64000  # bare int is MB
+
+    def test_parse_mem_to_mb_malformed_returns_zero(self):
+        # P3-12: malformed forms must return 0 (unknown), not a misleading
+        # partial like 16 that would masquerade as a tiny valid value.
+        from slurmate.system_utils import _parse_mem_to_mb
+        assert _parse_mem_to_mb("16GB") == 0
+        assert _parse_mem_to_mb("16 G") == 0
+        assert _parse_mem_to_mb("1.5.5G") == 0
+        assert _parse_mem_to_mb("abc") == 0
+
+    def test_validate_time_broad_formats(self):
+        # P0-4: accept the full Slurm --time grammar, 1–2 digit lead fields.
+        from slurmate.system_utils import validate_time
+        for ok in ("30", "5:00", "2:30:00", "1-12", "1-0:00", "1-12:30:00",
+                   "01:00:00", "7-00:00:00", ""):
+            assert validate_time(ok) is True, ok
+        for bad in ("abc", "1:2:3:4", "-5", "1-"):
+            assert validate_time(bad) is False, bad
+
+    def test_mock_queue_eta_label_matches_formatter(self):
+        # P3-7: the mock label is derived from _format_eta, not hand-written.
+        from slurmate.system_utils import MOCK_QUEUE_INFO, _format_eta
+        assert MOCK_QUEUE_INFO["eta_label"] == _format_eta(MOCK_QUEUE_INFO["eta_seconds"])
+        assert MOCK_QUEUE_INFO["eta_label"] == "~1h"
+
+
+class TestNaiveConfigParser:
+    """P3-13: the no-tomllib/tomli fallback must not corrupt common config."""
+
+    def test_inline_comment_stripped(self):
+        from slurmate.system_utils import _parse_config_naive
+        cfg = _parse_config_naive('partition = "gpu"  # fav\n')
+        assert cfg["partition"] == "gpu"
+
+    def test_unquoted_numeric_array(self):
+        from slurmate.system_utils import _parse_config_naive
+        cfg = _parse_config_naive("vals = [1, 2, 3]\n")
+        assert cfg["vals"] == [1, 2, 3]
+
+    def test_quoted_array_and_scalars(self):
+        from slurmate.system_utils import _parse_config_naive
+        cfg = _parse_config_naive('mods = ["a", "b"]\ncpus = 8\nratio = 1.5\noff = -2\n')
+        assert cfg["mods"] == ["a", "b"]
+        assert cfg["cpus"] == 8
+        assert cfg["ratio"] == 1.5
+        assert cfg["off"] == -2
+
+    def test_hash_inside_quotes_preserved(self):
+        from slurmate.system_utils import _parse_config_naive
+        cfg = _parse_config_naive('name = "a#b"\n')
+        assert cfg["name"] == "a#b"
+
+
+class TestFetchPublicPartitionsReuse:
+    def test_accepts_prefetched_all_parts(self, mocker):
+        # P3-5: passing all_parts avoids the internal fetch_partitions() call.
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=(
+            "PartitionName=p AllowAccounts=ALL Hidden=NO\n", "", 0))
+        spy = mocker.patch.object(su, "fetch_partitions")
+        pre = [{"name": "p", "nodes": 1, "cpus_per_node": 1, "mem_per_node_mb": 1, "gpu_types": []}]
+        out = su.fetch_public_partitions(pre)
+        assert spy.call_count == 0  # did not re-fetch
+        assert [p["name"] for p in out] == ["p"]
 
     def test_parse_slurm_time(self):
         from slurmate.system_utils import _parse_slurm_time_to_minutes

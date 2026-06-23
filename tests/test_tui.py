@@ -1,7 +1,7 @@
 """Tests for the TUI wizard step definitions and logic."""
 
 from slurmate.system_utils import normalize_memory
-from slurmate.tui import STEPS, Step, Wizard, _parse_custom_flags
+from slurmate.tui import STEPS, Wizard, _parse_custom_flags
 
 
 def _idx(key):
@@ -24,8 +24,6 @@ class TestStepDefinitions:
 
     def test_required_keys_have_validation(self):
         """job_name and command have inline required-field checks."""
-        from slurmate.tui import Wizard
-        w = Wizard()
         for s in STEPS:
             if s.key in ("job_name", "command"):
                 assert s.validate is None
@@ -341,6 +339,7 @@ class TestQosCoerceAndPathCompleter:
         from prompt_toolkit.completion import CompleteEvent
         from prompt_toolkit.document import Document
         from prompt_toolkit.formatted_text import fragment_list_to_text
+
         from slurmate.tui import LastTokenPathCompleter
         (tmp_path / "alpha.txt").write_text("x")
         (tmp_path / "beta.txt").write_text("x")
@@ -356,6 +355,99 @@ class TestQosCoerceAndPathCompleter:
         from slurmate.tui import STEPS
         path_keys = {s.key for s in STEPS if getattr(s, "path", False)}
         assert {"output_dir", "output_file", "command"} <= path_keys
+
+
+class TestCoerceConfigDefaults:
+    def test_cleared_field_falls_back_to_config(self, tmp_path, monkeypatch):
+        # P3-10: clearing a config-defaulted field returns the configured value,
+        # not the bare hard-coded literal.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("SLURMATE_MOCK", raising=False)
+        (tmp_path / ".slurmate.toml").write_text('cpus = 8\nnodes = 3\nmemory = "32G"\n')
+        from slurmate.tui import STEPS, Wizard
+        w = Wizard()
+        assert w._coerce("", STEPS[_idx("cpus")]) == 8
+        assert w._coerce("", STEPS[_idx("nodes")]) == 3
+        assert w._coerce("", STEPS[_idx("memory")]) == "32G"
+
+    def test_cleared_field_without_config_uses_literal(self):
+        from slurmate.tui import STEPS, Wizard
+        w = Wizard()
+        assert w._coerce("", STEPS[_idx("cpus")]) == 4
+        assert w._coerce("", STEPS[_idx("nodes")]) == 1
+        assert w._coerce("", STEPS[_idx("memory")]) == "16G"
+
+
+class TestCoerceJobNameSanitized:
+    def test_job_name_coerced_safe(self):
+        from slurmate.tui import STEPS, Wizard
+        w = Wizard()
+        s = STEPS[_idx("job_name")]
+        assert w._coerce("my training job", s) == "my_training_job"
+
+
+class TestGpuFormatEnvDefault:
+    def test_env_seeds_wizard_default(self, monkeypatch):
+        # P0-2: SLURMATE_GPU_FORMAT seeds the wizard's GPU-format default.
+        monkeypatch.setenv("SLURMATE_GPU_FORMAT", "gpus")
+        from slurmate.tui import Wizard
+        w = Wizard()
+        w.idx = _idx("gpu_format")
+        w.answers["gpus"] = 2
+        w._setup_gpu_format("forward")
+        assert w._radio_value() == "gpus"
+
+    def test_invalid_env_falls_back(self, monkeypatch):
+        monkeypatch.setenv("SLURMATE_GPU_FORMAT", "bogus")
+        from slurmate.tui import Wizard
+        w = Wizard()
+        w.idx = _idx("gpu_format")
+        w.answers["gpus"] = 2
+        w._setup_gpu_format("forward")
+        assert w._radio_value() == "gres_type"
+
+
+class TestPartitionCaching:
+    def test_reentry_reuses_cached_partitions(self, mocker):
+        # P3-5: re-entering the partition step reuses the cached result instead
+        # of re-running the cluster queries.
+        import slurmate.tui as t
+        from slurmate.tui import Wizard
+        fp = mocker.patch.object(t, "fetch_partitions", return_value=[
+            {"name": "p", "nodes": 1, "cpus_per_node": 1, "mem_per_node_mb": 1, "gpu_types": []}])
+        mocker.patch.object(t, "fetch_public_partitions", return_value=[])
+        w = Wizard()
+        w._setup_partition()
+        w._setup_partition()  # second entry
+        assert fp.call_count == 1
+
+
+class TestWizardSelectionSmoke:
+    def test_walk_select_steps_and_build(self, mocker):
+        # P3-1: construct the wizard and exercise selection across a few steps,
+        # so a prompt_toolkit change that breaks the private-attr reads we rely
+        # on (RadioList._selected_index etc.) fails here rather than in users'
+        # terminals.
+        from slurmate.builder import build_from_answers
+        from slurmate.tui import STEPS, Wizard
+        w = Wizard()
+        # job name (text)
+        w.idx = _idx("job_name")
+        w.text_area.text = "smoke"
+        w._confirm_and_next()
+        # env_type (select via radio) — arrow to a value and confirm. Use venv
+        # so the follow-on env_name step doesn't pop a conda completion menu
+        # (which would warn about an unawaited coroutine with no event loop).
+        w.idx = _idx("env_type")
+        s = STEPS[w.idx]
+        w._setup_select(s, None)
+        target = ("Virtualenv (venv)", "Virtualenv (venv)")
+        w.radio_list._selected_index = w.radio_list.values.index(target)
+        assert w._radio_value() == "Virtualenv (venv)"
+        w._confirm_and_next()
+        assert w.answers["env_type"] == "Virtualenv (venv)"
+        # the collected answers still build a valid script
+        assert "#SBATCH --job-name=smoke" in build_from_answers(w.answers)
 
 
 class TestNoneTextAreaGuards:
