@@ -27,7 +27,8 @@ jobs:
       - name: Verify tag matches package version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          PKG=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          # Avoid tomllib (absent on the 3.10 runner) — read the version directly.
+          PKG=$(python -c "import re; print(re.search(r'^version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read(), re.M).group(1))")
           echo "tag=$TAG  pyproject=$PKG"
           if [ "$TAG" != "$PKG" ]; then
             echo "::error::Tag v$TAG does not match pyproject version $PKG"
