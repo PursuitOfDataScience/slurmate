@@ -1,0 +1,17 @@
+# Prefill config used only by the demo recording (assets/demo.tape), so the
+# wizard's live preview fills with a realistic GPU job while the tape just walks
+# through with Enter. Mirrors the mock cluster in SLURMATE_MOCK=1.
+account     = "my_lab"
+partition   = "gpu-highend"
+cpus        = 8
+memory      = "64G"
+time_limit  = "08:00:00"
+nodes       = 1
+gpus        = 1
+gpu_type    = "h100"
+gpu_format  = "gres_type"
+env_type    = "conda"
+env_name    = "pytorch"
+modules     = ["cuda/12.1"]
+output_dir  = "logs"
+command     = "python train.py --epochs 50 --amp --batch-size 256"

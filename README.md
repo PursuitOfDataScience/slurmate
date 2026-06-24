@@ -25,6 +25,12 @@ on any cluster, as long as `sbatch` is on your `PATH`.
 
 ---
 
+<p align="center">
+  <img src="assets/demo.gif" width="840" alt="slurmate building a GPU sbatch job in the TUI wizard, with a live #SBATCH preview">
+</p>
+
+---
+
 ## ✨ Why Slurmate?
 
 Writing `#SBATCH` headers by hand is fiddly and error-prone: which partition has
