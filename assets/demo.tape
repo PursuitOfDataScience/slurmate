@@ -5,7 +5,8 @@
 # to its built-in mock cluster (safe: no real sinfo/sbatch), while a throwaway
 # .slurmate.toml (the base64 below — same as assets/demo.slurmate.toml) prefills
 # the wizard with a GPU job. The tape types the job name + partition and walks
-# the wizard with Enter while the live #SBATCH preview grows, ending on Review.
+# the wizard one Enter at a time while the live #SBATCH preview grows, then
+# submits on the Review step (mock cluster, so nothing is actually queued).
 
 Output assets/demo.gif
 
@@ -28,20 +29,65 @@ Show
 
 Type "slurmate"
 Enter
-Sleep 3s
+Sleep 2500ms
 
+# Step 1 — Job name
 Type "diffusion-train"
-Sleep 600ms
+Sleep 800ms
 Enter
-Sleep 900ms
-Enter
-Sleep 700ms
-Type "gpu-highend"
-Sleep 500ms
-Enter
-Sleep 900ms
-Enter@520ms 18
+Sleep 800ms
 
-Sleep 4s
+# Step 2 — Partition: pick "enter manually", then type the name
+Enter
+Sleep 600ms
+Type "gpu-highend"
+Sleep 700ms
+Enter
+Sleep 900ms
+
+# Steps 3–20 — walk the config‑prefilled answers one Enter at a time,
+# pausing on each so the live #SBATCH preview stays readable as it grows.
+# Paced individually (NOT a bulk Enter@…repeat, which VHS buffers and
+# flashes the GPU steps past in a single frame).
+Enter
+Sleep 550ms   # Account
+Enter
+Sleep 550ms   # QoS
+Enter
+Sleep 550ms   # CPU cores
+Enter
+Sleep 550ms   # Memory
+Enter
+Sleep 550ms   # Time limit
+Enter
+Sleep 550ms   # Nodes
+Enter
+Sleep 550ms   # Tasks per node
+Enter
+Sleep 900ms   # GPUs
+Enter
+Sleep 900ms   # GPU type
+Enter
+Sleep 900ms   # GPU format
+Enter
+Sleep 600ms   # Array spec
+Enter
+Sleep 650ms   # Output directory
+Enter
+Sleep 650ms   # Output file
+Enter
+Sleep 650ms   # Custom #SBATCH flags
+Enter
+Sleep 800ms   # Modules
+Enter
+Sleep 1000ms  # Environment type
+Enter
+Sleep 800ms   # Environment name/path
+Enter
+Sleep 1000ms  # Command to run
+
+# Step 21 — Review & Submit: hold on the full script, then submit
+# (mock cluster, so nothing is actually queued).
+Sleep 2500ms
 Enter
 Sleep 3s
