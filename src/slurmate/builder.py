@@ -211,7 +211,7 @@ def build_sbatch_script(
         lines.append("#SBATCH --ntasks-per-node=1")
 
     if gpus > 0:
-        gpu_fmt = gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type").lower()
+        gpu_fmt = (gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")).lower()
         gpu_any = gpu_type is not None and gpu_type.lower() == "any"
         if gpu_fmt == "gres_type" and gpu_type and not gpu_any:
             lines.append(f"#SBATCH --gres=gpu:{gpu_type}:{gpus}")
@@ -243,7 +243,8 @@ def build_sbatch_script(
         # (#SBATCH m, #SBATCH i, …). Callers should pass a list; coerce just in
         # case by splitting on commas.
         if isinstance(custom_sbatch, str):
-            custom_sbatch = [f.strip() for f in custom_sbatch.split(",") if f.strip()]
+            from .tui import _parse_custom_flags
+            custom_sbatch = _parse_custom_flags(custom_sbatch)
         for flag in custom_sbatch:
             if gpus > 0:
                 parts = flag.strip().split('=', 1)

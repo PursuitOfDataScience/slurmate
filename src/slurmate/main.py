@@ -84,6 +84,8 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
 
     args_gpu_type = getattr(args, "gpu_type", None)
     gpu_type = args_gpu_type if args_gpu_type is not None else config.get("gpu_type")
+    if gpu_type is not None:
+        gpu_type = str(gpu_type)
 
     args_gpu_format = getattr(args, "gpu_format", None)
     gpu_format = args_gpu_format if args_gpu_format is not None else config.get("gpu_format")
@@ -97,7 +99,7 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     # Seed the GPU format from SLURMATE_GPU_FORMAT (default gres_type) so the
     # env var documented in the README actually takes effect in batch mode.
     if gpus > 0 and not gpu_format:
-        gpu_format = os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")
+        gpu_format = os.environ.get("SLURMATE_GPU_FORMAT", "gres_type").lower()
 
     # Hard-validate numeric flags so batch mode rejects the same bad input the
     # wizard does (positive cpus/nodes, non-negative gpus/ntasks), instead of
@@ -175,7 +177,7 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
         "qos": args_qos if args_qos is not None else config.get("qos"),
         "cpus": cpus,
         "memory": normalize_memory(str(memory_val)),
-        "time_limit": time_val,
+        "time_limit": str(time_val),
         "nodes": nodes,
         "ntasks_per_node": ntasks_per_node,
         "gpus": gpus,
