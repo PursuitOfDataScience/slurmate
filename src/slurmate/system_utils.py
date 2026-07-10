@@ -224,7 +224,11 @@ def _parse_slurm_time_to_minutes(time_str: str) -> float:
         return 0.0
     if "-" in value:
         day_part, rest = value.split("-", 1)
-        return _safe_int(day_part) * 1440 + _parse_slurm_time_to_minutes(rest)
+        parts = rest.split(":")
+        hours = _safe_int(parts[0])
+        minutes = _safe_int(parts[1]) if len(parts) > 1 else 0
+        seconds = _safe_int(parts[2]) if len(parts) > 2 else 0
+        return _safe_int(day_part) * 1440 + hours * 60 + minutes + seconds / 60.0
     parts = value.split(":")
     if len(parts) == 3:
         return _safe_int(parts[0]) * 60 + _safe_int(parts[1]) + _safe_int(parts[2]) / 60.0

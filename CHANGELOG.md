@@ -14,6 +14,21 @@ Slurm, and the wizard's visuals are cleaner.
 
 ### Fixed
 
+- **Day-hours time parsing** — `_parse_slurm_time_to_minutes()` now reads the
+  `D-HH` and `D-HH:MM` Slurm formats correctly (the field after the dash is
+  hours, not minutes), fixing SU estimates and partition time-limit warnings
+  (e.g. `0-23` is now 1380 min, not 23). (#2)
+- **Numeric config values crashed the CLI** — an integer `time_limit` or
+  `gpu_type` in `.slurmate.toml` no longer raises `AttributeError`; both are
+  coerced to strings in batch mode. (#3)
+- **`gpu_format` case-sensitivity** — a non-lowercase `gpu_format` (from the
+  `SLURMATE_GPU_FORMAT` env var, a config file, or a programmatic call) is now
+  normalised, so it no longer silently emits the constraint directive instead
+  of the requested format. (#4)
+- **Comma-valued custom flags** — a bare-string `custom_sbatch` with a
+  comma-bearing value (e.g. `--nodelist=node1,node2`) is parsed with the
+  flag-aware splitter instead of being mangled into an invalid `#SBATCH`
+  directive. (#5)
 - **Version drift** — `slurmate --version` is now single-sourced from the
   installed package metadata (`importlib.metadata`), so it can never disagree
   with the published version again. (P0-1)
