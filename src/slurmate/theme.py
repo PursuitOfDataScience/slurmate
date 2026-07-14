@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 import time
 from typing import Any
+
+
+def _env_flag(name: str) -> bool:
+    """True when an env var is set to an affirmative value (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _should_use_color() -> bool:
@@ -102,11 +108,22 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
         interactive: When False (batch/non-interactive mode), the "ESC to go
                  back" hint is suppressed \u2014 there's no wizard to go back in.
     """
-    if os.environ.get("SLURMATE_NO_BANNER"):
+    if _env_flag("SLURMATE_NO_BANNER"):
         return
 
     use_color = _should_use_color()
-    use_animation = animate or os.environ.get("SLURMATE_BANNER_ANIMATE") == "1"
+    use_animation = bool(animate) or _env_flag("SLURMATE_BANNER_ANIMATE")
+
+    # The animation drives the cursor with absolute save/restore over the banner
+    # region; on a terminal too short to hold it, that garbles the screen. Fall
+    # back to the static banner when there isn't enough vertical room.
+    if use_animation:
+        try:
+            rows = shutil.get_terminal_size().lines
+        except OSError:
+            rows = 24
+        if rows < len(BANNER_LINES) + 4:
+            use_animation = False
 
     print()
     if use_color:

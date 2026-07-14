@@ -58,3 +58,11 @@ class TestBanner:
         monkeypatch.setenv("SLURMATE_NO_BANNER", "1")
         print_banner()
         assert capsys.readouterr().out == ""
+
+    def test_no_banner_falsey_value_still_shows(self, capsys, monkeypatch):
+        # Bare truthiness meant SLURMATE_NO_BANNER=0 wrongly suppressed the
+        # banner; only affirmative values (1/true/yes/on) should hide it.
+        monkeypatch.setenv("SLURMATE_NO_BANNER", "0")
+        monkeypatch.delenv("SLURMATE_BANNER_ANIMATE", raising=False)
+        print_banner(interactive=False)
+        assert "Slurmate" in capsys.readouterr().out

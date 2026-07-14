@@ -450,6 +450,53 @@ class TestWizardSelectionSmoke:
         assert "#SBATCH --job-name=smoke" in build_from_answers(w.answers)
 
 
+class TestPreviewDirtyOnBack:
+    def test_go_back_marks_preview_dirty(self):
+        from slurmate.tui import Wizard
+        w = Wizard()
+        w.idx = 5
+        w.transient["preview_dirty"] = False
+        w._go_back()
+        assert w.transient.get("preview_dirty") is True
+
+
+class TestSkippedStepNoStaleSave:
+    def test_skipped_env_name_not_saved_with_stale_text(self):
+        from slurmate.tui import STEPS, Wizard
+        w = Wizard()
+        env_idx = next(i for i, s in enumerate(STEPS) if s.key == "env_name")
+        w.idx = env_idx
+        w._skipped_indices.add(env_idx)
+        # The shared text widget still holds the modules step's text.
+        w.text_area.text = "cuda, python"
+        w._go_back()
+        # env_name must not be clobbered with the leftover modules string.
+        assert w.answers.get("env_name") is None
+
+
+class TestQosCachePartitionAware:
+    def test_qos_refetched_when_partition_changes(self, mocker):
+        import slurmate.tui as t
+        from slurmate.tui import STEPS, Wizard
+        calls: list[str] = []
+
+        def fake_qos(part):
+            calls.append(part)
+            return ["qos_" + part]
+
+        mocker.patch.object(t, "fetch_qos_for_partition", side_effect=fake_qos)
+        mocker.patch.object(t, "fetch_known_qos", return_value=["qos_A", "qos_B"])
+        w = Wizard()
+        qos_step = next(s for s in STEPS if s.key == "qos")
+        w.answers["partition"] = "A"
+        r1 = w._resolve_choices(qos_step)
+        w.answers["partition"] = "B"
+        r2 = w._resolve_choices(qos_step)
+        assert r1 == ["Default (none)", "qos_A"]
+        assert r2 == ["Default (none)", "qos_B"]
+        assert calls == ["A", "B"]
+
+
 class TestNoneTextAreaGuards:
     def test_gpu_type_text_branch_with_none(self, monkeypatch):
         # Regression: answers["gpu_type"] == None must not crash TextArea.

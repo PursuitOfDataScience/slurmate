@@ -5,6 +5,74 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+Another correctness-focused pass: real-cluster account discovery, more robust
+Slurm-output parsing, safer script generation, and clearer CLI behavior.
+
+### Fixed
+
+- **Empty account list on real clusters** — `fetch_user_accounts()` now queries
+  the current user's associations (`sacctmgr show assoc user=<you>`) instead of
+  `show user`, which returns unscoped, account-less rows and made the picker
+  silently fall back to mock accounts you can't submit under.
+- **Memory-limit warning silently disabled on heterogeneous partitions** — a
+  `sinfo %m` value like `515000+` now parses to the minimum value instead of `0`,
+  so the "memory exceeds partition limit" warning fires again.
+- **False "partition does not support GPUs" warning** — partitions advertising a
+  count-only (`gpu:4`) or typed-without-count (`gpu:a100`) GRES are now detected
+  as GPU partitions via a new `has_gpu` flag, so the warning no longer misfires.
+- **Partition node counts undercounted** — node totals are summed across
+  per-state `sinfo` rows instead of taking the max of a single state group.
+- **Multiple GPU models per node dropped** — a node advertising
+  `gpu:a100:2,gpu:v100:2` now surfaces both models.
+- **`sinfo` node-state flags dropped nodes** — flag-suffixed states (`idle~`,
+  `mix*`, …) are normalized, so queue-ETA node tallies aren't undercounted.
+- **conda env names** — discovery uses `conda info --json`, so the base env is
+  labelled `base` (not its install-dir name) and a `--prefix` env stays an
+  activatable path; a login-shell banner containing braces no longer breaks JSON
+  parsing.
+- **`module avail` pollution** — the module list no longer includes the
+  `command -v module` probe output or filesystem path headers, and it honours
+  mock mode like every other fetcher.
+- **Crash under a non-UTF-8 locale** — subprocess output is decoded as UTF-8 with
+  a lossy fallback, and a present-but-unrunnable Slurm binary falls back to mock
+  data instead of raising.
+- **Malformed config silently dropped every default** — an unreadable/invalid
+  `.slurmate.toml` now warns on stderr; the naive fallback reader is section- and
+  multi-line-array-aware; a non-integer numeric config value (e.g.
+  `cpus = "8cores"`) is reported instead of silently reverting to the default.
+- **Script-generation edge cases** — an empty partition/job-name no longer emits
+  a malformed `#SBATCH --partition=` / `--job-name=`; a name that sanitizes away
+  (all-symbol or non-Latin) falls back to `slurm`; an explicit `output_file` on
+  an array job gets a per-task `%A_%a` tag (no more clobbering); output/error
+  paths with spaces are quoted; a leading `~` in a log path is expanded;
+  `env_name` is shell-quoted; a newline in a `custom_sbatch` entry can no longer
+  inject a script-body line; the GPU custom-flag de-dup is space-form- and
+  format-aware; and an unrecognized `gpu_format` from config/env is clamped to
+  `gres_type` with a warning.
+- **`$EDITOR` with arguments/empty/missing crashed** — "Open script in editor"
+  now splits `$EDITOR` into words (so `code --wait` works), treats an empty value
+  as unset, and reports a failed launch instead of raising; editing answers after
+  a manual edit confirms before discarding it.
+- **"Script saved" reported even when the write failed** — the
+  `SLURMATE_LOG_DIR` copy is written by the CLI and reported only on real success.
+- **Federated job IDs** — a `jobid;cluster` from `sbatch --parsable` is split so
+  the hints, log path, and saved filename use the numeric id.
+- **TUI** — the live preview refreshes after backward navigation; a skipped
+  `env_name` no longer captures another step's leftover text; QoS choices are
+  re-fetched when the partition changes.
+
+### Changed
+
+- **`--print` / `--dry-run` read your config** — with a `.slurmate.toml` present
+  they render the script non-interactively from it instead of launching the
+  wizard (a bare `slurmate --print` with no config still opens the wizard).
+- **`--yes` requires a command** — an unattended submit with no command is now a
+  hard error rather than silently submitting a no-op job.
+- **`SLURMATE_NO_BANNER`** — honours affirmative values (`1`/`true`/`yes`/`on`)
+  only, so `SLURMATE_NO_BANNER=0` no longer suppresses the banner.
+
 ## [0.3.0] — 2026-06-23
 
 A correctness- and polish-focused release that works through the v0.3.0

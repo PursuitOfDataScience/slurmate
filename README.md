@@ -119,9 +119,13 @@ slurmate --partition gpu --command "python train.py" --dry-run
 ```
 
 Batch mode kicks in as soon as you pass any job-defining flag (or `--yes`); a
-bare `slurmate` still launches the wizard. Every submit also saves a
-`<job>-<id>.sh` copy next to where you ran it — pass `--no-save-script` (or set
-`SLURMATE_NO_SAVE=1`) to skip that.
+bare `slurmate` still launches the wizard. If a config file supplies the job,
+`--print` and `--dry-run` also render non-interactively from it — so
+`slurmate --print` with a `.slurmate.toml` present emits the script straight to
+stdout without opening the wizard. `--yes` requires a command to run (it refuses
+to submit an empty, no-op job). Every submit also saves a `<job>-<id>.sh` copy
+next to where you ran it — pass `--no-save-script` (or set `SLURMATE_NO_SAVE=1`)
+to skip that.
 
 Run `slurmate --help` for the full flag list.
 

@@ -42,17 +42,27 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
             "gpu_types": [], "timelimit": None, "is_public": True}
 
 
-def _coerce_int(value: Any, default: int) -> int:
+def _coerce_int(value: Any, default: int, *, field: str | None = None,
+                err_console: Console | None = None) -> int:
     """Coerce a CLI/config value to int, falling back to ``default``.
 
     Config values can be stringy (e.g. ``gpus = "2"`` in TOML), which used to
-    crash batch mode on the later ``gpus > 0`` comparison.
+    crash batch mode on the later ``gpus > 0`` comparison. A value that is
+    present but not an integer (e.g. ``cpus = "8cores"``) is reported to
+    ``err_console`` when ``field`` is given, rather than silently reverting to
+    the default (which would run the job with the wrong resources, or produce a
+    misleading "got 0" error downstream).
     """
     if value is None:
         return default
     try:
         return int(value)
     except (TypeError, ValueError):
+        if field and err_console is not None:
+            err_console.print(
+                f"  {c.YELLOW}⚠ {field} value {value!r} is not an integer; "
+                f"using {default}{c.RESET}"
+            )
         return default
 
 
@@ -64,7 +74,8 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     partition = args_partition if args_partition is not None else config.get("partition", "")
 
     args_cpus = getattr(args, "cpus", None)
-    cpus = _coerce_int(args_cpus if args_cpus is not None else config.get("cpus", 4), 4)
+    cpus = _coerce_int(args_cpus if args_cpus is not None else config.get("cpus", 4), 4,
+                       field="cpus", err_console=err_console)
 
     args_memory = getattr(args, "memory", None)
     memory_val = args_memory if args_memory is not None else config.get("memory", "16G")
@@ -73,14 +84,19 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     time_val = args_time if args_time is not None else config.get("time_limit", "02:00:00")
 
     args_nodes = getattr(args, "nodes", None)
-    nodes = _coerce_int(args_nodes if args_nodes is not None else config.get("nodes", 1), 1)
+    nodes = _coerce_int(args_nodes if args_nodes is not None else config.get("nodes", 1), 1,
+                        field="nodes", err_console=err_console)
 
     args_gpus = getattr(args, "gpus", None)
-    gpus = _coerce_int(args_gpus if args_gpus is not None else config.get("gpus", 0), 0)
+    gpus = _coerce_int(args_gpus if args_gpus is not None else config.get("gpus", 0), 0,
+                       field="gpus", err_console=err_console)
 
     args_ntasks_per_node = getattr(args, "ntasks_per_node", None)
     raw_ntasks = args_ntasks_per_node if args_ntasks_per_node is not None else config.get("ntasks_per_node")
-    ntasks_per_node = _coerce_int(raw_ntasks, 0) if raw_ntasks is not None else None
+    ntasks_per_node = (
+        _coerce_int(raw_ntasks, 0, field="ntasks_per_node", err_console=err_console)
+        if raw_ntasks is not None else None
+    )
 
     args_gpu_type = getattr(args, "gpu_type", None)
     gpu_type = args_gpu_type if args_gpu_type is not None else config.get("gpu_type")
@@ -100,6 +116,20 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     # env var documented in the README actually takes effect in batch mode.
     if gpus > 0 and not gpu_format:
         gpu_format = os.environ.get("SLURMATE_GPU_FORMAT", "gres_type").lower()
+
+    # Validate the resolved GPU format from config/env (the --gpu-format flag is
+    # already constrained by argparse choices, but config/env values are not):
+    # clamp an unrecognized value to gres_type instead of silently falling
+    # through to the constraint-style directives, matching the TUI's behavior.
+    _GPU_FORMATS = ("gres_type", "constraint", "gpus")
+    if gpu_format is not None:
+        gpu_format = str(gpu_format).lower()
+        if gpu_format not in _GPU_FORMATS:
+            err_console.print(
+                f"  {c.YELLOW}⚠ Unknown gpu_format {gpu_format!r}; "
+                f"using 'gres_type'{c.RESET}"
+            )
+            gpu_format = "gres_type"
 
     # Hard-validate numeric flags so batch mode rejects the same bad input the
     # wizard does (positive cpus/nodes, non-negative gpus/ntasks), instead of
@@ -245,7 +275,10 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
         gpus_val = 0
 
     gpu_types = part.get("gpu_types", [])
-    if gpus_val > 0 and not gpu_types:
+    # `has_gpu` is set whenever the partition advertises any GRES gpu \u2014 including
+    # count-only ("gpu:4") and typed-without-count ("gpu:a100") forms that don't
+    # populate gpu_types \u2014 so a real GPU partition isn't flagged as CPU-only.
+    if gpus_val > 0 and not gpu_types and not part.get("has_gpu"):
         console.print(f"  [yellow]\u26a0 Warning: Partition '{part.get('name')}' does not support GPUs[/]")
 
     gpu_type = answers.get("gpu_type")
@@ -365,15 +398,38 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         console.print(summary_panel)
 
 
+def _editor_command() -> list[str]:
+    """Resolve $EDITOR/$VISUAL into an argv list.
+
+    Split on shell words so a command with flags (``code --wait``, ``emacs -nw``)
+    works, treat an empty/whitespace value as unset, and fall back to vim.
+    """
+    import shlex
+    raw = (os.environ.get("EDITOR") or os.environ.get("VISUAL") or "").strip()
+    if not raw:
+        return ["vim"]
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        argv = [raw]
+    return argv or ["vim"]
+
+
 def _edit_script_in_editor(script: str) -> str:
-    editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vim"))
+    argv = _editor_command()
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         f.write(script)
         tmp_path = f.name
     try:
-        subprocess.run([editor, tmp_path], check=False)
+        subprocess.run([*argv, tmp_path], check=False)
         with open(tmp_path) as f:
             return f.read()
+    except OSError as e:
+        # exec failure (editor not found / not executable) — check=False only
+        # suppresses non-zero exit codes, not the exec error. Keep the current
+        # script instead of crashing the whole wizard with a traceback.
+        print(f"  {c.YELLOW}⚠ Could not open editor {' '.join(argv)!r}: {e}{c.RESET}")
+        return script
     finally:
         os.unlink(tmp_path)
 
@@ -400,11 +456,19 @@ def _save_script(script: str, default_name: str) -> None:
         print(f"  {c.RED}✗ Could not save: {e}{c.RESET}")
 
 
-def _save_submitted_script(script: str, job_name: str, job_id: str) -> str | None:
-    """Write the exact submitted script to the working dir for reproducibility."""
+def _save_submitted_script(script: str, job_name: str, job_id: str,
+                           directory: str | None = None) -> str | None:
+    """Write the exact submitted script for reproducibility; return the path.
+
+    Writes into ``directory`` (e.g. ``SLURMATE_LOG_DIR``) or the working dir, and
+    returns ``None`` if the write actually failed — so the caller only reports
+    "Script saved" when a file was really written.
+    """
     safe = sanitize_job_name(job_name) or "slurm"
-    path = os.path.join(os.getcwd(), f"{safe}-{job_id}.sh")
+    directory = directory or os.getcwd()
+    path = os.path.join(directory, f"{safe}-{job_id}.sh")
     try:
+        os.makedirs(directory, exist_ok=True)
         with open(path, "w") as f:
             f.write(script)
         return path
@@ -433,27 +497,28 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
             print(f"  {c.RED}{stderr}{c.RESET}", file=sys.stderr)
         sys.exit(1)
 
-    job_id = stdout.strip()
     # An empty job ID with rc 0 means mock mode (sbatch unavailable) — say so
     # plainly instead of printing a blank ID and broken `squeue -j`/`scancel` hints.
-    if not job_id:
+    raw_out = stdout.strip()
+    if not raw_out:
         print(f"  {c.YELLOW}(mock mode — not actually submitted){c.RESET}")
         if stderr:
             print(f"  {c.GRAY}{stderr}{c.RESET}")
         return
 
+    # `sbatch --parsable` returns "jobid" or, on a federated/multi-cluster setup,
+    # "jobid;cluster". Use just the numeric id for hints, the log path, and the
+    # saved filename so none of them carry a stray ";cluster".
+    job_id = raw_out.split(";")[0]
+
     print(f"  {c.GREEN}✓ Submitted!{c.RESET} Job ID: {c.CYAN}{job_id}{c.RESET}")
 
-    # Save a copy of the exact submitted script for reproducibility. Routed
-    # through SLURMATE_LOG_DIR when set (submit_sbatch already wrote it there —
-    # report that single path instead of double-saving into the CWD), and
-    # skippable via --no-save-script / SLURMATE_NO_SAVE=1.
+    # Save a copy of the exact submitted script for reproducibility — into
+    # SLURMATE_LOG_DIR when set, else the CWD — and only report success when the
+    # write actually happened. Skippable via --no-save-script / SLURMATE_NO_SAVE=1.
     if not _no_save_requested(save_script):
         log_dir = os.environ.get("SLURMATE_LOG_DIR")
-        if log_dir:
-            saved: str | None = os.path.join(log_dir, f"{sanitize_job_name(job_name) or 'slurm'}-{job_id}.sh")
-        else:
-            saved = _save_submitted_script(script, job_name, job_id)
+        saved = _save_submitted_script(script, job_name, job_id, directory=log_dir)
         if saved:
             print(f"  {c.GRAY}Script saved: {saved}{c.RESET}")
 
@@ -461,9 +526,11 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
     log_path = f"{answers.get('job_name', '') or 'slurm'}-%j.out"
     for line in script.splitlines():
         if line.startswith("#SBATCH --output="):
-            log_path = line.split("=", 1)[1].strip()
+            log_path = line.split("=", 1)[1].strip().strip('"').strip("'")
             break
-    resolved_log = log_path.replace("%j", job_id)
+    # Resolve the job-id patterns we can (%j and %A → this job id); leave the
+    # per-task %a literal for array jobs since there's no single task to point at.
+    resolved_log = log_path.replace("%A", job_id).replace("%j", job_id)
     print(f"  {c.GRAY}Log path: {resolved_log}{c.RESET}")
     print(f"  {c.GRAY}Hints:{c.RESET}")
     print(f"    squeue -j {job_id}")
@@ -522,24 +589,33 @@ _BATCH_FLAGS = (
 )
 
 
-def _is_batch_mode(args: argparse.Namespace) -> bool:
+def _is_batch_mode(args: argparse.Namespace, config: dict[str, Any] | None = None) -> bool:
     """Enter batch mode when any job-defining flag (or --yes) is supplied.
 
     Previously only --partition switched modes, so flags like --cpus/--command
     were silently dropped into the interactive TUI. A config-supplied partition
     still satisfies the partition *requirement* once batch mode is active, but
     by itself doesn't force batch mode (bare `slurmate` stays interactive).
+
+    ``--print``/``--dry-run`` are output modes, not job-defining flags, so on
+    their own they stay interactive (a bare ``slurmate --print`` opens the
+    wizard). But when a config file already supplies the job, they render from
+    it non-interactively instead of launching the full-screen wizard into a pipe.
     """
     if any(getattr(args, f, None) is not None for f in _BATCH_FLAGS):
         return True
-    return bool(getattr(args, "yes", False))
+    if getattr(args, "yes", False):
+        return True
+    if (getattr(args, "print", False) or getattr(args, "dry_run", False)) and config:
+        return True
+    return False
 
 
 def main() -> None:
     console = Console()
     args = parse_args()
     config = load_config()
-    batch = _is_batch_mode(args)
+    batch = _is_batch_mode(args, config)
     save_script = not args.no_save_script
 
     if not (args.print or args.dry_run):
@@ -578,6 +654,13 @@ def main() -> None:
         return
 
     if args.yes:
+        # Unattended submit: a missing command would submit a no-op job, so make
+        # it a hard error here rather than only an advisory warning. (Partition
+        # and job name stay advisory — sbatch supplies sensible defaults.)
+        if not answers.get("command"):
+            print(f"  {c.RED}✗ Nothing to run — refusing to submit with --yes "
+                  f"(pass --command){c.RESET}", file=sys.stderr)
+            sys.exit(1)
         _submit_and_report(script, answers, console, save_script=save_script)
         return
 
@@ -598,6 +681,7 @@ def main() -> None:
     # returns here. Esc (or the explicit option) re-opens the wizard to edit
     # answers; Ctrl-C/Quit cancels cleanly.
     can_edit = wizard is not None
+    manually_edited = False  # set once the user hand-edits the script in $EDITOR
     while True:
         choices = ["Submit to Slurm"]
         if can_edit:
@@ -618,7 +702,15 @@ def main() -> None:
 
         if action == _GO_BACK or (action is not None and action.startswith("Go back")):
             assert wizard is not None
+            # Editing answers regenerates the script from scratch, discarding any
+            # manual $EDITOR changes — confirm before throwing them away.
+            if manually_edited and not questionary.confirm(
+                "Editing answers regenerates the script and discards your manual "
+                "edits. Continue?", default=False, qmark="", style=QS,
+            ).ask():
+                continue
             answers = wizard.edit()
+            manually_edited = False
             default_name = f"{answers.get('job_name', '') or 'slurm'}.sh"
             script, queue_info = build_and_show(answers, console)
             continue
@@ -630,6 +722,7 @@ def main() -> None:
             return
         if action.startswith("Open"):
             script = _edit_script_in_editor(script)
+            manually_edited = True
             _resummarize()
         elif action.startswith("Save"):
             _save_script(script, default_name)

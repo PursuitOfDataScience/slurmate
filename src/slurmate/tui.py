@@ -607,19 +607,30 @@ class Wizard:
                 self.step_cache.pop("gpu_types", None)
                 self._invalidate()
                 return
+        # Whether the step we're leaving was auto-skipped. Its value isn't the
+        # user's, and the shared text widget may still hold another step's text —
+        # capture this before the pruning below drops the index.
+        was_skipped = self.idx in self._skipped_indices
         self._skipped_indices = {i for i in self._skipped_indices if i < self.idx - 1}
         self.step_cache.pop("partition_sub", None)
         self.step_cache.pop("gpu_sub", None)
         self.step_cache.pop("error", None)
-        # Save current text so it's preserved when returning to this step
-        if s.kind in ("text", "autocomplete", "ntasks_per_node"):
-            val = self._text_val()
-            if val:
-                self.answers[s.key] = self._coerce(val, s)
-        elif s.kind in ("select", "gpu_format"):
-            val = self._radio_value()
-            if val:
-                self.answers[s.key] = self._coerce(val, s)
+        # Save current text so it's preserved when returning to this step — but
+        # never for a skipped step, whose shared widget holds a different step's
+        # leftover text (e.g. the modules string would otherwise be saved into a
+        # skipped env_name when navigating back through it).
+        if not was_skipped:
+            if s.kind in ("text", "autocomplete", "ntasks_per_node"):
+                val = self._text_val()
+                if val:
+                    self.answers[s.key] = self._coerce(val, s)
+            elif s.kind in ("select", "gpu_format"):
+                val = self._radio_value()
+                if val:
+                    self.answers[s.key] = self._coerce(val, s)
+        # The live preview is cached; going backward changes which steps feed it,
+        # so mark it dirty (forward navigation already does this in _advance).
+        self.transient["preview_dirty"] = True
         self.idx = max(0, self.idx - 1)
         self._on_enter_step("backward")
         self._invalidate()
@@ -703,7 +714,10 @@ class Wizard:
             if val and val.isdigit():
                 gpus = int(val)
                 gpu_types = part.get("gpu_types", [])
-                if gpus > 0 and not gpu_types:
+                # `has_gpu` covers count-only ("gpu:4") / typed-without-count
+                # GRES that don't populate gpu_types, so a real GPU partition
+                # isn't wrongly flagged as CPU-only.
+                if gpus > 0 and not gpu_types and not part.get("has_gpu"):
                     return f"Partition '{part.get('name')}' does not support GPUs"
         elif s.key == "gpu_type":
             val = self._radio_value() if self._is_select_active() else self._text_val()
@@ -802,6 +816,11 @@ class Wizard:
 
     def _resolve_choices(self, s: Step) -> list[str]:
         key = f"choices_{s.key}"
+        # QoS is partition-specific (AllowQos differs per partition), so key the
+        # cache on the partition too; otherwise changing partition after the QoS
+        # step was visited would keep serving the first partition's QoS list.
+        if s.key == "qos":
+            key = f"choices_qos_{self.answers.get('partition', '')}"
         if key in self.step_cache:
             from typing import cast
             return cast(list[str], self.step_cache[key])

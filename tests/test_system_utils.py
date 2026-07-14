@@ -276,6 +276,155 @@ class TestFetchPublicPartitionsReuse:
         assert _detect_gpu_type("rack5,gpfs", "gpu:a40:4", known_models={"h100"}) == "a40"
 
 
+class TestMemHeterogeneous:
+    def test_plus_suffix_parses_to_min_value(self):
+        # sinfo %m emits "515000+" for heterogeneous partitions; it must parse to
+        # the min value (not 0, which silently disables the memory-limit check).
+        from slurmate.system_utils import _parse_mem_to_mb
+        assert _parse_mem_to_mb("515000+") == 515000
+        assert _parse_mem_to_mb("250000+") == 250000
+        assert _parse_mem_to_mb("256G+") == 256 * 1024
+
+    def test_still_rejects_malformed(self):
+        from slurmate.system_utils import _parse_mem_to_mb
+        assert _parse_mem_to_mb("16GB") == 0
+        assert _parse_mem_to_mb("abc") == 0
+
+
+class TestNormalizeMemoryNC:
+    def test_strips_slurm_nc_suffix(self):
+        # `sbatch --mem` accepts only a K/M/G/T unit; the N/C suffix would be
+        # rejected, so it must be dropped from the emitted value.
+        from slurmate.system_utils import normalize_memory
+        assert normalize_memory("16GN") == "16G"
+        assert normalize_memory("16GC") == "16G"
+        assert normalize_memory("32G") == "32G"
+
+
+class TestFetchUserAccountsAssoc:
+    def test_uses_assoc_scoped_to_current_user(self, mocker, monkeypatch):
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        monkeypatch.setattr(su.getpass, "getuser", lambda: "alice")
+        captured: dict = {}
+
+        def fake_run(cmd, timeout=30):
+            captured["cmd"] = cmd
+            return "acct1\nacct2\nacct1\n", "", 0
+
+        mocker.patch.object(su, "_run_command", side_effect=fake_run)
+        accounts = su.fetch_user_accounts()
+        assert "assoc" in captured["cmd"]
+        assert "user=alice" in captured["cmd"]
+        # de-duped, order preserved
+        assert accounts == ["acct1", "acct2"]
+
+
+class TestExtractFirstJson:
+    def test_skips_brace_containing_banner(self):
+        from slurmate.system_utils import _extract_first_json
+        text = 'Welcome {user}!\n{"envs": ["/opt/conda"], "root_prefix": "/opt/conda"}\n'
+        data = _extract_first_json(text)
+        assert data is not None and data["envs"] == ["/opt/conda"]
+
+    def test_none_when_no_json(self):
+        from slurmate.system_utils import _extract_first_json
+        assert _extract_first_json("no json here") is None
+
+
+class TestFetchModulesMockGuard:
+    def test_returns_mock_under_mock_mode(self):
+        # conftest forces SLURMATE_MOCK=1: must not shell out.
+        from slurmate.system_utils import MOCK_MODULES, fetch_available_modules
+        assert fetch_available_modules() == MOCK_MODULES
+
+
+class TestFetchGpuTypesMock:
+    def test_known_partition_returns_specific_types(self):
+        from slurmate.system_utils import fetch_gpu_types_for_partition
+        assert fetch_gpu_types_for_partition("gpu-shared") == ["a100", "v100"]
+        assert fetch_gpu_types_for_partition("cpu-shared") == []
+
+    def test_unknown_partition_returns_full_list(self):
+        from slurmate.system_utils import MOCK_GPU_TYPES, fetch_gpu_types_for_partition
+        assert fetch_gpu_types_for_partition("mystery") == list(MOCK_GPU_TYPES)
+
+
+class TestNaiveConfigSections:
+    def test_section_precedence(self):
+        from slurmate.system_utils import _parse_config_naive
+        cfg = _parse_config_naive(
+            'partition = "top"\n[defaults]\npartition = "def"\ncpus = 4\n'
+            '[slurmate]\npartition = "sm"\n'
+        )
+        assert cfg["partition"] == "sm"  # [slurmate] > [defaults] > top-level
+        assert cfg["cpus"] == 4
+
+    def test_multiline_array(self):
+        from slurmate.system_utils import _parse_config_naive
+        cfg = _parse_config_naive('mods = [\n  "a",\n  "b",\n]\n')
+        assert cfg["mods"] == ["a", "b"]
+
+
+class TestParsingRobustness:
+    def test_node_count_sums_across_state_rows(self, mocker):
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=(
+            "big|infinite|10|up|32|100000|(null)\n"
+            "big|infinite|5|up|32|100000|(null)\n", "", 0))
+        parts = su.fetch_partitions()
+        big = next(p for p in parts if p["name"] == "big")
+        assert big["nodes"] == 15  # summed, not max(10, 5)
+
+    def test_mem_plus_suffix_sets_real_limit(self, mocker):
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=(
+            "het|infinite|4|up|32+|515000+|(null)\n", "", 0))
+        parts = su.fetch_partitions()
+        assert parts[0]["mem_per_node_mb"] == 515000
+        assert parts[0]["cpus_per_node"] == 32
+
+    def test_partition_has_gpu_flag_for_count_only_gres(self, mocker):
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=(
+            "g|infinite|4|up|32|100000|gpu:4\n", "", 0))
+        parts = su.fetch_partitions()
+        assert parts[0]["gpu_types"] == []  # count-only GRES has no model
+        assert parts[0]["has_gpu"] is True  # but is still a GPU partition
+
+    def test_gpu_types_multiple_models_per_node(self, mocker):
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=(
+            "nvlink|gpu:a100:2,gpu:v100:2\n", "", 0))
+        assert su.fetch_gpu_types_for_partition("p") == ["a100", "v100"]
+
+    def test_queue_eta_tolerates_state_flags(self, mocker):
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+
+        def run(cmd, timeout=30):
+            if "squeue" in cmd:
+                return "", "", 0
+            return "5|up|idle~\n3|up|mix*\n", "", 0
+
+        mocker.patch.object(su, "_run_command", side_effect=run)
+        info = su.fetch_queue_eta("p", req_nodes=2)
+        assert info["eta_seconds"] == 0  # idle~ still counts as 5 idle nodes
+
+
+class TestRunCommandOSError:
+    def test_oserror_returns_nonzero(self, mocker):
+        import slurmate.system_utils as su
+        mocker.patch("subprocess.run", side_effect=OSError("exec format error"))
+        out, err, rc = su._run_command(["sinfo"])
+        assert rc == -1
+        assert "exec format error" in err
+
+
 class TestLoadConfig:
     def test_mock_mode_is_hermetic(self, tmp_path, monkeypatch):
         # Even with a real config present, mock mode must ignore it.

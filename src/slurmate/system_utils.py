@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import json
 import logging
 import os
@@ -11,12 +12,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-MOCK_PARTITIONS = [
-    {"name": "cpu-shared", "nodes": 100, "state": "up", "cpus_per_node": 32, "mem_per_node_mb": 131072, "gpu_types": [], "timelimit": "02:00:00", "is_public": True},
-    {"name": "cpu-highmem", "nodes": 20, "state": "up", "cpus_per_node": 48, "mem_per_node_mb": 524288, "gpu_types": [], "timelimit": "12:00:00", "is_public": True},
-    {"name": "gpu-shared", "nodes": 10, "state": "up", "cpus_per_node": 16, "mem_per_node_mb": 196608, "gpu_types": ["a100", "v100"], "timelimit": "04:00:00", "is_public": True},
-    {"name": "gpu-highend", "nodes": 4, "state": "up", "cpus_per_node": 32, "mem_per_node_mb": 262144, "gpu_types": ["h100"], "timelimit": "24:00:00", "is_public": True},
-    {"name": "debug", "nodes": 2, "state": "up", "cpus_per_node": 8, "mem_per_node_mb": 32768, "gpu_types": [], "timelimit": "01:00:00", "is_public": True},
+MOCK_PARTITIONS: list[dict[str, Any]] = [
+    {"name": "cpu-shared", "nodes": 100, "state": "up", "cpus_per_node": 32, "mem_per_node_mb": 131072, "gpu_types": [], "has_gpu": False, "timelimit": "02:00:00", "is_public": True},
+    {"name": "cpu-highmem", "nodes": 20, "state": "up", "cpus_per_node": 48, "mem_per_node_mb": 524288, "gpu_types": [], "has_gpu": False, "timelimit": "12:00:00", "is_public": True},
+    {"name": "gpu-shared", "nodes": 10, "state": "up", "cpus_per_node": 16, "mem_per_node_mb": 196608, "gpu_types": ["a100", "v100"], "has_gpu": True, "timelimit": "04:00:00", "is_public": True},
+    {"name": "gpu-highend", "nodes": 4, "state": "up", "cpus_per_node": 32, "mem_per_node_mb": 262144, "gpu_types": ["h100"], "has_gpu": True, "timelimit": "24:00:00", "is_public": True},
+    {"name": "debug", "nodes": 2, "state": "up", "cpus_per_node": 8, "mem_per_node_mb": 32768, "gpu_types": [], "has_gpu": False, "timelimit": "01:00:00", "is_public": True},
 ]
 
 MOCK_CONDA_ENVS = ["base", "pytorch", "tensorflow", "jax", "my_project"]
@@ -33,10 +34,22 @@ _RUN_TIMEOUT = 30
 
 def _run_command(cmd: list[str], timeout: int = _RUN_TIMEOUT) -> tuple[str, str, int]:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        # Force UTF-8 decoding with a lossy fallback: under a C/POSIX locale
+        # `text=True` would otherwise decode with ASCII and raise on any
+        # non-ASCII byte in the command output (crashing the wizard/batch run).
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=timeout,
+            encoding="utf-8", errors="replace",
+        )
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
         return "", f"Command timed out after {timeout}s", -1
+    except OSError as e:
+        # A Slurm binary that is present but not runnable (bad arch, permission,
+        # missing loader) raises here rather than being caught by shutil.which;
+        # return a non-zero rc so callers fall back to mock data instead of
+        # crashing with a traceback.
+        return "", str(e), -1
 
 
 def _force_mock() -> bool:
@@ -66,14 +79,22 @@ def _split_csv(raw: str | None) -> list[str]:
 
 
 def _parse_mem_to_mb(raw: str) -> int:
-    value = raw.strip().upper()
+    # `sinfo %m` (without -e) reports the minimum node memory with a trailing
+    # "+" when a partition's nodes differ (e.g. "515000+"). Strip it so the
+    # min value is used, mirroring how _safe_int already tolerates "+" for %c —
+    # otherwise the memory-over-limit warning is silently disabled for every
+    # heterogeneous partition.
+    value = raw.strip().upper().rstrip("+")
     if not value or value == "0":
         return 0
     match = re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", value)
     if match:
         num = float(match.group(1))
         scale = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 ** 2, "P": 1024 ** 3}
-        return int(num * scale[match.group(2)])
+        mb = int(num * scale[match.group(2)])
+        # A positive size below 1 MB (e.g. "1K") would truncate to 0 and read as
+        # "unknown"; clamp to 1 MB so it stays a real, if tiny, value.
+        return mb if mb > 0 or num == 0 else 1
     # A bare integer is megabytes. Anything else is malformed (e.g. "16GB",
     # "16 G", "1.5.5G") — return 0 (unknown) rather than a misleading partial
     # like "16", which would masquerade as a tiny valid value in limit checks.
@@ -143,9 +164,11 @@ def normalize_memory(value: str) -> str:
     # Plain digits: append M
     if v.isdigit():
         return f"{v}M"
-    # Already has unit: return as-is
-    if re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", v):
-        return v
+    # Already has unit: return as-is, but drop any trailing Slurm N/C suffix —
+    # `sbatch --mem` accepts only a K/M/G/T unit, so "16GN" would be rejected.
+    m = re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", v)
+    if m:
+        return f"{m.group(1)}{m.group(2)}"
     # Invalid but return it anyway (validation should catch this)
     return v
 
@@ -261,27 +284,38 @@ def fetch_partitions() -> list[dict[str, Any]]:
         gres_raw = parts[6].strip() if len(parts) > 6 else ""
 
         gpu_types: list[str] = []
+        has_gpu = False
         if gres_raw and gres_raw != "(null)":
             for match in re.finditer(r"gpu:([a-zA-Z0-9._-]+):\d+", gres_raw, re.IGNORECASE):
                 gpu_types.append(match.group(1).replace("_", "-"))
+            # Detect GPU presence even for count-only ("gpu:4") or typed-without-
+            # count ("gpu:a100") GRES that the model regex above doesn't capture,
+            # so a real GPU partition isn't misreported as CPU-only downstream.
+            has_gpu = bool(re.search(r"gpu[:\d]", gres_raw, re.IGNORECASE))
 
         if name not in partitions:
             partitions[name] = {
                 "name": name,
+                # Sum node counts: sinfo emits one row per partition+state group,
+                # so a partition with idle/mix/alloc nodes spans several rows;
+                # max() would report only the largest single group's count.
                 "nodes": nodes,
                 "state": state,
                 "cpus_per_node": cpus,
                 "mem_per_node_mb": _parse_mem_to_mb(mem_raw) if mem_raw else 0,
                 "gpu_types": gpu_types,
+                "has_gpu": has_gpu,
                 "timelimit": timelimit if timelimit != "infinite" else None,
             }
         else:
             p = partitions[name]
-            p["nodes"] = max(p["nodes"], nodes)
+            p["nodes"] += nodes
+            # cpus/mem are per-node capacities — keep the max across configs.
             p["cpus_per_node"] = max(p["cpus_per_node"], cpus)
             mem_mb = _parse_mem_to_mb(mem_raw) if mem_raw else 0
             p["mem_per_node_mb"] = max(p["mem_per_node_mb"], mem_mb)
             p["gpu_types"] = list(set(p["gpu_types"] + gpu_types))
+            p["has_gpu"] = p["has_gpu"] or has_gpu
 
     return list(partitions.values())
 
@@ -362,6 +396,12 @@ def fetch_known_qos() -> list[str]:
 
 def fetch_gpu_types_for_partition(partition: str) -> list[str]:
     if not is_tool_available("sinfo"):
+        # In mock mode, prefer the specific partition's GPU types so a demo
+        # doesn't claim every partition offers all GPU models; fall back to the
+        # full list only for an unknown/manually-typed partition name.
+        for p in MOCK_PARTITIONS:
+            if p["name"] == partition:
+                return [str(g) for g in p["gpu_types"]]
         return list(MOCK_GPU_TYPES)
 
     stdout, _, rc = _run_command(
@@ -388,26 +428,57 @@ def fetch_gpu_types_for_partition(partition: str) -> list[str]:
             if candidate.lower() not in {"gpu", "mps", "shard"}:
                 typed_models.add(candidate)
 
-    # Pass 2: detect a type per node, *preferring* corroboration against the
-    # typed models (to disambiguate nodes that list non-GPU labels first) but
-    # still falling back to feature scanning, so count-only GPU nodes whose
-    # model lives only in features are never lost.
+    # Pass 2: collect every typed model on each node (a node can advertise more
+    # than one, e.g. "gpu:a100:2,gpu:v100:2" — a single re.search would drop the
+    # second). Only when a node has no typed model do we fall back to feature
+    # scanning, preferring corroboration against the typed models seen elsewhere.
     types: set[str] = set()
     for features, gres in lines_data:
+        text = f"{features},{gres}"
+        typed_here = [
+            m.group(1).replace("_", "-")
+            for m in re.finditer(r"gpu:([a-z0-9._-]+):\d+", text, re.IGNORECASE)
+            if m.group(1).lower() not in {"gpu", "mps", "shard"}
+        ]
+        if typed_here:
+            types.update(typed_here)
+            continue
         gpu_type = _detect_gpu_type(features, gres, known_models=typed_models)
         if gpu_type and gpu_type != "gpu":
             types.add(gpu_type)
     return sorted(types)
 
 
+def _extract_first_json(text: str) -> Any:
+    """Return the first parseable JSON object in ``text``, or None.
+
+    A login shell may print a banner before the JSON, and that banner can itself
+    contain braces — so a naive first-``{``/last-``}`` slice can capture garbage.
+    Walk each ``{`` and try to decode from there, tolerating trailing output.
+    """
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = text.find("{", idx)
+        if start == -1:
+            return None
+        try:
+            obj, _ = decoder.raw_decode(text[start:])
+            return obj
+        except json.JSONDecodeError:
+            idx = start + 1
+
+
 def fetch_conda_envs(modules: list[str] | None = None) -> list[str]:
-    """List conda environment names.
+    """List conda environment names/paths usable with ``conda activate``.
 
     Conda is frequently provided by a module (e.g. ``module load anaconda``)
     rather than being on ``PATH`` directly, so when ``modules`` are given we load
     them first — inside a login shell where ``module`` is defined — and then run
-    ``conda env list``. This surfaces every env that becomes visible under the
-    user's chosen module stack. With no modules we still try a bare ``conda``.
+    ``conda info --json``. Using ``info`` (not ``env list``) gives the authoritative
+    ``root_prefix`` and ``envs_dirs``, so the base env is labelled ``base`` (not by
+    its install-dir basename) and a ``--prefix`` env outside the envs dirs is kept
+    as a full path (activatable), instead of a bare basename that can't activate.
     """
     if _force_mock():
         return list(MOCK_CONDA_ENVS)
@@ -425,28 +496,42 @@ def fetch_conda_envs(modules: list[str] | None = None) -> list[str]:
             prefix = f"module load {names} >/dev/null 2>&1; "
 
     stdout, _, rc = _run_command(
-        ["bash", "-lc", f"{prefix}conda env list --json 2>/dev/null"]
+        ["bash", "-lc", f"{prefix}conda info --json 2>/dev/null"]
     )
     if rc != 0:
         # Real failure (conda/module not found): return nothing rather than
         # misleading mock names so the user can just type their env/path.
         return []
 
-    try:
-        # A login shell may emit banner text before the JSON; slice it out.
-        start, end = stdout.find("{"), stdout.rfind("}")
-        if start == -1 or end == -1:
-            return []
-        data = json.loads(stdout[start:end + 1])
-        envs = [env.rstrip("/").split("/")[-1] for env in data.get("envs", []) if env]
-        # De-dup while preserving order.
-        return list(dict.fromkeys(envs))
-    except (json.JSONDecodeError, KeyError):
+    data = _extract_first_json(stdout)
+    if not isinstance(data, dict):
         return []
+    root = str(data.get("root_prefix", "")).rstrip("/")
+    envs_dirs = {str(d).rstrip("/") for d in data.get("envs_dirs", []) if d}
+    env_names: list[str] = []
+    for raw_env in data.get("envs", []):
+        p = str(raw_env).rstrip("/")
+        if not p:
+            continue
+        if root and p == root:
+            env_names.append("base")
+        elif os.path.dirname(p) in envs_dirs:
+            # A named env under an envs dir — activatable by its basename.
+            env_names.append(os.path.basename(p))
+        else:
+            # A --prefix env elsewhere — only the full path activates it.
+            env_names.append(p)
+    # De-dup while preserving order.
+    return list(dict.fromkeys(env_names))
 
 
 def fetch_available_modules() -> list[str]:
     """Parse `module avail` output into a sorted unique list of module names."""
+    # Mirror every other fetcher: never shell out (into a login shell that
+    # sources the user's profile) when mock mode is forced.
+    if _force_mock():
+        return list(MOCK_MODULES)
+
     stdout, stderr, rc = _run_command(["bash", "-lc", "command -v module && module -t avail 2>&1"])
     output = stdout + stderr
     if rc != 0:
@@ -457,22 +542,48 @@ def fetch_available_modules() -> list[str]:
         stripped = line.strip()
         if not stripped or stripped.startswith("-"):
             continue
+        # `module -t avail` prints filesystem headers ("/opt/apps/modulefiles:")
+        # on their own lines; skip them so they don't pollute the module list.
+        if stripped.endswith(":"):
+            continue
         for mod in stripped.split():
             # Strip "(default)" annotation that the module system appends
             if mod.endswith("(default)"):
-                mod = mod[:-9]
-            if mod:
-                modules.add(mod)
+                mod = mod[:-9].strip()
+            # Drop the leading `command -v module` probe output — either the
+            # bare "module" function name or its resolved path (/usr/bin/module).
+            if not mod or mod == "module" or mod.endswith("/module"):
+                continue
+            modules.add(mod)
     return sorted(modules)
 
 
+def _current_username() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+
+
 def fetch_user_accounts() -> list[str]:
-    """Fetch Slurm accounts for the current user via sacctmgr."""
+    """Fetch the Slurm accounts the current user may submit under.
+
+    Uses ``sacctmgr show assoc user=<me>`` (associations), NOT ``show user``:
+    the bare ``user`` entity doesn't populate ``Account`` and isn't scoped to
+    the caller (it lists every visible user), so it returns thousands of blank
+    lines on a real cluster and the picker silently falls back to mock accounts
+    the user can't actually charge to.
+    """
     if not is_tool_available("sacctmgr"):
         return list(MOCK_ACCOUNTS)
 
+    user = _current_username()
+    if not user:
+        return list(MOCK_ACCOUNTS)
+
     stdout, _, rc = _run_command(
-        ["sacctmgr", "show", "user", "-P", "format=Account", "--noheader"]
+        ["sacctmgr", "show", "assoc", f"user={user}", "-P",
+         "format=Account", "--noheader"]
     )
     if rc != 0:
         return list(MOCK_ACCOUNTS)
@@ -482,6 +593,9 @@ def fetch_user_accounts() -> list[str]:
         a = line.strip()
         if a:
             accounts.append(a)
+    # De-dupe while preserving order; a user is often associated to the same
+    # account through several partitions/QoS, yielding duplicate rows.
+    accounts = list(dict.fromkeys(accounts))
     return accounts or list(MOCK_ACCOUNTS)
 
 
@@ -544,7 +658,10 @@ def fetch_queue_eta(partition: str, req_nodes: int = 1) -> dict[str, Any]:
             except ValueError:
                 nnodes = 0
             total_nodes += nnodes
-            state_flag = parts[2].strip()
+            # sinfo %t can append status flags to the base state (idle*, idle~,
+            # mix#, …: not-responding / power-save / powering-up / maintenance
+            # etc.); strip them so nodes aren't dropped from the idle/mix tally.
+            state_flag = parts[2].strip().rstrip("*~#!%$@+")
             if state_flag == "idle":
                 idle_nodes += nnodes
             elif state_flag == "mix":
@@ -585,24 +702,21 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
         - job_id_or_stdout: Job ID (integer as string) on success, stdout on failure
         - stderr: Error message on failure, empty string on success
     """
-    # Parse output/error paths to create directories if they don't exist
+    # Create the log directories the script's #SBATCH --output/--error point at,
+    # so Slurm doesn't fail the job on a missing directory.
     for line in script_content.splitlines():
-        if line.startswith("#SBATCH --output=") or line.startswith("#SBATCH -o "):
-            val = line.split("=", 1)[1].strip() if "=" in line else line.split(None, 2)[2].strip()
-            dir_name = os.path.dirname(val)
-            if dir_name:
-                try:
-                    os.makedirs(dir_name, exist_ok=True)
-                except OSError as e:
-                    logger.debug(f"Failed to create output directory {dir_name}: {e}")
-        elif line.startswith("#SBATCH --error=") or line.startswith("#SBATCH -e "):
-            val = line.split("=", 1)[1].strip() if "=" in line else line.split(None, 2)[2].strip()
-            dir_name = os.path.dirname(val)
-            if dir_name:
-                try:
-                    os.makedirs(dir_name, exist_ok=True)
-                except OSError as e:
-                    logger.debug(f"Failed to create error directory {dir_name}: {e}")
+        val = _sbatch_log_path(line)
+        if not val:
+            continue
+        dir_name = os.path.dirname(os.path.expanduser(val))
+        # Skip a directory component that carries a Slurm filename pattern
+        # (%j/%A/%a/%x): those are expanded per-job by Slurm, so creating a
+        # literal "%j" directory here would be wrong.
+        if dir_name and "%" not in dir_name:
+            try:
+                os.makedirs(dir_name, exist_ok=True)
+            except OSError as e:
+                logger.debug(f"Failed to create log directory {dir_name}: {e}")
 
     if not is_tool_available("sbatch"):
         return 0, "", "sbatch not available (mock mode) — no job submitted"
@@ -616,27 +730,37 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
             text=True,
             check=False,
             timeout=30,
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.TimeoutExpired:
         return -1, "", "Submission timed out after 30s"
+    except OSError as e:
+        return -1, "", f"Could not run sbatch: {e}"
 
     if result.returncode != 0:
         return result.returncode, result.stdout.strip(), result.stderr.strip()
 
-    job_id = result.stdout.strip()
+    return result.returncode, result.stdout.strip(), ""
 
-    # Optionally save script to disk for reproducibility
-    log_dir = os.environ.get("SLURMATE_LOG_DIR")
-    if log_dir:
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            script_path = os.path.join(log_dir, f"{job_name}-{job_id}.sh")
-            with open(script_path, "w") as f:
-                f.write(script_content)
-        except OSError as e:
-            logger.debug(f"Failed to save script copy to SLURMATE_LOG_DIR: {e}")
 
-    return result.returncode, job_id, ""
+def _sbatch_log_path(line: str) -> str:
+    """Extract the path from a ``#SBATCH --output=/-o`` or ``--error=/-e`` line.
+
+    Handles both the long ``--output=PATH`` form and the short ``-o PATH`` form,
+    strips surrounding quotes, and returns "" for anything else (or a blank
+    short-form directive, which must not raise).
+    """
+    s = line.strip()
+    val = ""
+    if s.startswith("#SBATCH --output=") or s.startswith("#SBATCH --error="):
+        val = s.split("=", 1)[1].strip()
+    elif s.startswith("#SBATCH -o ") or s.startswith("#SBATCH -e "):
+        parts = s.split(None, 2)
+        val = parts[2].strip() if len(parts) > 2 else ""
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        val = val[1:-1]
+    return val
 
 
 def _strip_inline_comment(v: str) -> str:
@@ -685,15 +809,50 @@ def _coerce_config_value(v: str) -> Any:
 
 
 def _parse_config_naive(text: str) -> dict[str, Any]:
-    """Minimal flat key=value parser used only when no TOML library is available."""
-    config: dict[str, Any] = {}
+    """Minimal key=value parser used only when no TOML library is available.
+
+    Best-effort, but section- and array-aware so it doesn't silently disagree
+    with the real TOML reader: it tracks ``[section]`` headers, applies the same
+    ``[slurmate] > [defaults] > top-level`` precedence as :func:`_flatten_config`,
+    and accumulates a multi-line ``key = [`` array until its closing ``]``.
+    """
+    top: dict[str, Any] = {}
+    sections: dict[str, dict[str, Any]] = {}
+    current: str | None = None
+    pending_key: str | None = None
+    pending_parts: list[str] = []
+
+    def store(key: str, raw_value: str) -> None:
+        target = sections.setdefault(current, {}) if current else top
+        target[key] = _coerce_config_value(raw_value)
+
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("["):
+        if pending_key is not None:
+            pending_parts.append(line)
+            if "]" in line:
+                store(pending_key, _strip_inline_comment(" ".join(pending_parts)))
+                pending_key, pending_parts = None, []
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
             continue
         if "=" in line:
             k, v = line.split("=", 1)
-            config[k.strip()] = _coerce_config_value(_strip_inline_comment(v.strip()))
+            k = k.strip()
+            v = _strip_inline_comment(v.strip())
+            # A multi-line array (`key = [` with no closing `]` on this line).
+            if v.startswith("[") and "]" not in v:
+                pending_key, pending_parts = k, [v]
+                continue
+            store(k, v)
+
+    config: dict[str, Any] = dict(top)
+    for section in ("defaults", "slurmate"):
+        if section in sections:
+            config.update(sections[section])
     return config
 
 
@@ -749,6 +908,14 @@ def load_config() -> dict[str, Any]:
             with open(p) as f:
                 return _parse_config_naive(f.read())
         except Exception as e:
+            # The file exists but couldn't be parsed/read (e.g. a TOML syntax
+            # error or a permission problem). Surface it: otherwise every
+            # configured default is silently dropped with no hint to the user.
+            import sys
+            print(
+                f"slurmate: warning: ignoring config {p} — {e}",
+                file=sys.stderr,
+            )
             logger.debug(f"Failed to load config from {p}: {e}")
             return {}
     return {}
