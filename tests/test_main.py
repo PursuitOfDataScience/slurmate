@@ -337,6 +337,110 @@ class TestPartitionLimitNtasks:
         assert "exceeds partition limit" in cap.get()  # 4×8=32 > 16
 
 
+class TestBatchModeOutputModesWithConfig:
+    def test_print_alone_is_interactive(self):
+        from slurmate.main import _is_batch_mode, parse_args
+        assert _is_batch_mode(parse_args(["--print"]), {}) is False
+        assert _is_batch_mode(parse_args(["--dry-run"]), {}) is False
+
+    def test_print_with_config_is_batch(self):
+        from slurmate.main import _is_batch_mode, parse_args
+        assert _is_batch_mode(parse_args(["--print"]), {"partition": "gpu"}) is True
+        assert _is_batch_mode(parse_args(["--dry-run"]), {"command": "x"}) is True
+
+
+class TestBatchGpuFormatValidation:
+    def test_invalid_config_gpu_format_clamped(self):
+        import argparse
+
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        ns = argparse.Namespace(partition="gpu-shared", gpus=2,
+                                gpu_format="bogus", command="x")
+        ans = run_batch(ns, Console(), {})
+        assert ans["gpu_format"] == "gres_type"
+
+
+class TestFederatedJobId:
+    def test_federated_id_split_for_hints(self, capsys, mocker):
+        from rich.console import Console
+
+        from slurmate.main import _submit_and_report
+        mocker.patch("slurmate.main.submit_sbatch", return_value=(0, "98765;clusterA", ""))
+        _submit_and_report("#SBATCH --output=j-%j.out",
+                           {"job_name": "j", "command": "x"}, Console(), save_script=False)
+        out = capsys.readouterr().out
+        assert "98765" in out
+        assert "clusterA" not in out
+
+
+class TestEditorCommand:
+    def test_editor_with_flags_is_split(self, monkeypatch):
+        from slurmate.main import _editor_command
+        monkeypatch.setenv("EDITOR", "code --wait")
+        assert _editor_command() == ["code", "--wait"]
+
+    def test_empty_editor_falls_back_to_vim(self, monkeypatch):
+        from slurmate.main import _editor_command
+        monkeypatch.setenv("EDITOR", "  ")
+        monkeypatch.delenv("VISUAL", raising=False)
+        assert _editor_command() == ["vim"]
+
+    def test_bad_editor_does_not_crash(self, monkeypatch, capsys):
+        from slurmate.main import _edit_script_in_editor
+        monkeypatch.setenv("EDITOR", "definitely-not-a-real-editor-xyz --flag")
+        monkeypatch.delenv("VISUAL", raising=False)
+        # Returns the original script instead of raising FileNotFoundError.
+        assert _edit_script_in_editor("KEEP ME") == "KEEP ME"
+        assert "Could not open editor" in capsys.readouterr().out
+
+
+class TestSaveSubmittedScriptDir:
+    def test_saves_into_directory(self, tmp_path):
+        from slurmate.main import _save_submitted_script
+        d = tmp_path / "logdir"
+        path = _save_submitted_script("script-body", "job", "123", directory=str(d))
+        assert path == str(d / "job-123.sh")
+        assert (d / "job-123.sh").read_text() == "script-body"
+
+    def test_returns_none_on_write_failure(self, tmp_path):
+        from slurmate.main import _save_submitted_script
+        blocker = tmp_path / "afile"
+        blocker.write_text("x")  # a file where a directory is expected
+        path = _save_submitted_script("s", "j", "1", directory=str(blocker / "sub"))
+        assert path is None
+
+
+class TestCoerceIntReports:
+    def test_bad_config_int_warns_not_silent(self):
+        from rich.console import Console
+
+        from slurmate.main import _coerce_int
+        console = Console()
+        with console.capture() as cap:
+            value = _coerce_int("8cores", 4, field="cpus", err_console=console)
+        assert value == 4
+        assert "cpus" in cap.get()
+
+    def test_none_returns_default_silently(self):
+        from slurmate.main import _coerce_int
+        assert _coerce_int(None, 7) == 7
+
+
+class TestGpuWarningHasGpu:
+    def test_count_only_gres_no_false_warning(self):
+        from rich.console import Console
+
+        from slurmate.main import _validate_partition_limits
+        part = {"name": "gpu1", "cpus_per_node": 16, "mem_per_node_mb": 0,
+                "timelimit": None, "gpu_types": [], "has_gpu": True}
+        console = Console(width=100)
+        with console.capture() as cap:
+            _validate_partition_limits({"_partition_obj": part, "gpus": 2}, console)
+        assert "does not support GPUs" not in cap.get()
+
+
 class TestColorSuppression:
     def test_no_color_env_var(self, monkeypatch):
         from slurmate.theme import C

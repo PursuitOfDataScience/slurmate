@@ -76,6 +76,13 @@ class TestRealParsers:
         assert gpu_shared["nodes"] == 10
         assert sorted(gpu_shared["gpu_types"]) == ["a100", "v100"]
 
+    def test_partitions_expose_has_gpu(self):
+        parts = fetch_partitions()
+        gpu_shared = next(p for p in parts if p["name"] == "gpu-shared")
+        cpu_shared = next(p for p in parts if p["name"] == "cpu-shared")
+        assert gpu_shared["has_gpu"] is True
+        assert cpu_shared["has_gpu"] is False
+
     def test_fetch_public_partitions_real(self):
         public_parts = fetch_public_partitions()
         # debug has Hidden=YES and AllowAccounts=restricted, so it should be filtered out

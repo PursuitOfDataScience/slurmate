@@ -374,6 +374,140 @@ class TestPartialOutputTiming:
         assert "#SBATCH --output=logs/train-%j.out" in s
 
 
+class TestArrayOutputFileTag:
+    """Array jobs with an explicit output_file must still differentiate per task."""
+
+    def test_array_output_file_gets_per_task_tag(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "array_spec": "0-9", "output_file": "train.log"})
+        assert "#SBATCH --output=train-%A_%a.log" in s
+        assert "#SBATCH --error=train-%A_%a.err" in s
+
+    def test_array_output_file_no_extension(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "array_spec": "0-9", "output_file": "run"})
+        assert "#SBATCH --output=run-%A_%a.out" in s
+        assert "#SBATCH --error=run-%A_%a.err" in s
+
+    def test_array_output_file_with_pattern_untouched(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "array_spec": "0-9", "output_file": "run-%A_%a.out"})
+        assert "#SBATCH --output=run-%A_%a.out" in s
+
+    def test_non_array_output_file_unchanged(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "logs", "output_file": "train.log"})
+        assert "#SBATCH --output=logs/train.log" in s
+
+
+class TestEmptyDirectivesOmitted:
+    def test_empty_partition_not_emitted(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "command": "echo hi"})
+        assert "--partition=" not in s
+        assert "#SBATCH --job-name=j" in s
+
+    def test_empty_job_name_not_emitted(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"partition": "p", "command": "echo hi"})
+        assert "--job-name=" not in s
+        assert "#SBATCH --partition=p" in s
+
+
+class TestJobNameFallback:
+    def test_all_symbol_or_nonlatin_falls_back(self):
+        from slurmate.builder import sanitize_job_name
+        assert sanitize_job_name("###") == "slurm"
+        assert sanitize_job_name("训练任务") == "slurm"
+        assert sanitize_job_name("") == ""  # truly empty stays empty
+
+    def test_builder_emits_fallback_not_empty_directive(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "@#%", "partition": "p", "command": "x"})
+        assert "#SBATCH --job-name=slurm" in s
+        assert "#SBATCH --job-name=\n" not in s
+
+
+class TestOutputPathQuoting:
+    def test_whitespace_path_quoted(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "/scratch/My Group/logs"})
+        assert '#SBATCH --output="/scratch/My Group/logs/j-%j.out"' in s
+        assert '#SBATCH --error="/scratch/My Group/logs/j-%j.err"' in s
+
+    def test_spaceless_path_unquoted(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "output_dir": "logs"})
+        assert "#SBATCH --output=logs/j-%j.out" in s
+
+
+class TestCustomFlagGpuDedup:
+    def _base(self, **kw):
+        from slurmate.builder import build_sbatch_script
+        args = dict(job_name="j", partition="p", cpus=1, memory="1G",
+                    time_limit="01:00:00", gpus=2, gpu_type="v100",
+                    gpu_format="gres_type", command="x")
+        args.update(kw)
+        return build_sbatch_script(**args)
+
+    def test_space_form_gres_deduped(self):
+        s = self._base(custom_sbatch=["--gres gpu:a100:8"])
+        assert "--gres gpu:a100:8" not in s  # dropped as a duplicate GPU request
+        assert "#SBATCH --gres=gpu:v100:2" in s
+
+    def test_gpus_equals_kept_under_gres_type(self):
+        # Under gres_type the builder emits no --gpus, so a custom --gpus must
+        # survive (it was over-stripped before).
+        s = self._base(custom_sbatch=["--gpus=8"])
+        assert "#SBATCH --gpus=8" in s
+
+    def test_newline_in_flag_not_injected_into_body(self):
+        s = self._base(custom_sbatch=["--comment=a\necho pwned"])
+        assert not any(ln.strip() == "echo pwned" for ln in s.splitlines())
+
+
+class TestEnvNameQuoting:
+    def test_venv_path_with_space_quoted(self):
+        from slurmate.builder import build_sbatch_script
+        s = build_sbatch_script(job_name="j", partition="p", cpus=1, memory="1G",
+                                time_limit="01:00:00", env_name="/my envs/ai",
+                                env_type="venv", command="x")
+        assert "source '/my envs/ai/bin/activate'" in s
+
+    def test_venv_path_no_space_unquoted(self):
+        from slurmate.builder import build_sbatch_script
+        s = build_sbatch_script(job_name="j", partition="p", cpus=1, memory="1G",
+                                time_limit="01:00:00", env_name="/path/to/venv",
+                                env_type="venv", command="x")
+        assert "source /path/to/venv/bin/activate" in s
+
+
+class TestTildeExpansion:
+    def test_output_dir_tilde_expanded(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p", "output_dir": "~/logs"})
+        assert f"#SBATCH --output={tmp_path}/logs/j-%j.out" in s
+        assert "~/logs" not in s
+
+
+class TestStringyNumericCoercion:
+    def test_stringy_values_do_not_crash(self):
+        from slurmate.builder import build_from_answers, build_sbatch_script
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "gpus": "2", "nodes": "2", "gpu_type": "a100"})
+        assert "#SBATCH --gres=gpu:a100:2" in s
+        assert "#SBATCH --nodes=2" in s
+        s2 = build_sbatch_script(job_name="j", partition="p", cpus=1, memory="1G",
+                                 time_limit="01:00:00", gpus="3", nodes="2", command="x")
+        assert "#SBATCH --gres=gpu:3" in s2
+
+
 class TestDirectiveOrdering:
     def test_sbatch_directives_in_wizard_order(self):
         from slurmate.builder import build_from_answers
