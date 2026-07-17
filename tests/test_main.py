@@ -154,13 +154,15 @@ class TestPartitionLimitsValidation:
         warnings = capture.get()
         assert "GPU type 'b200' not in partition list" in warnings
 
-        # Case 4: Partition with no GPUs but GPUs requested
+        # Case 4: Partition KNOWN to have no GPUs (has_gpu: False, as
+        # fetch_partitions emits) but GPUs requested — a hard error.
         part_no_gpu = {
             "name": "cpu-test",
             "cpus_per_node": 8,
             "mem_per_node_mb": 32768,
             "timelimit": "02:00:00",
             "gpu_types": [],
+            "has_gpu": False,
         }
         answers_gpu = {
             "_partition_obj": part_no_gpu,
@@ -170,6 +172,17 @@ class TestPartitionLimitsValidation:
             _validate_partition_limits(answers_gpu, console)
         warnings = capture.get()
         assert "Partition 'cpu-test' does not support GPUs" in warnings
+
+        # Case 5: Partition of UNKNOWN capability (manually-typed / unrecognized
+        # → synthetic fallback with no has_gpu key). We must NOT overclaim a hard
+        # "does not support GPUs" error when we have no capability information.
+        part_unknown = {
+            "name": "typo-part", "cpus_per_node": 0, "mem_per_node_mb": 0,
+            "gpu_types": [], "timelimit": None, "is_public": True,
+        }
+        with console.capture() as capture:
+            _validate_partition_limits({"_partition_obj": part_unknown, "gpus": 1}, console)
+        assert "does not support GPUs" not in capture.get()
 
 
 class TestVersionConsistency:

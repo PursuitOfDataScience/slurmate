@@ -17,14 +17,13 @@ from rich.text import Text
 
 from .builder import build_from_answers, estimate_su, job_summary_rows, sanitize_job_name
 from .system_utils import (
-    _parse_mem_to_mb,
-    _parse_slurm_time_to_minutes,
     fetch_gpu_types_for_partition,
     fetch_partitions,
     fetch_queue_eta,
     load_config,
     normalize_memory,
     submit_sbatch,
+    validate_job_config,
     validate_memory,
     validate_time,
 )
@@ -231,68 +230,33 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
     if not part:
         return
 
-    # Check CPUs \u2014 compare the per-node total (ntasks-per-node \u00d7 cpus-per-task)
-    # against the node's core count, so multi-task over-allocation is caught.
-    cpus = answers.get("cpus")
-    if cpus is not None:
-        try:
-            cores = int(cpus)
-            ntpn_raw = answers.get("ntasks_per_node")
-            ntpn = int(ntpn_raw) if ntpn_raw else 1
-            total = cores * max(1, ntpn)
-            limit = part.get("cpus_per_node", 0)
-            if limit and total > limit:
-                detail = f"{ntpn}\u00d7{cores}={total}" if ntpn > 1 else str(total)
-                console.print(f"  [yellow]\u26a0 Warning: CPUs ({detail}) exceeds partition limit ({limit} per node)[/]")
-        except (ValueError, TypeError):
-            pass
-
-    # Check Memory
-    memory = answers.get("memory")
-    if memory:
-        if validate_memory(str(memory)):
-            mb = _parse_mem_to_mb(str(memory))
-            limit = part.get("mem_per_node_mb", 0)
-            if limit and mb > limit:
-                console.print(f"  [yellow]\u26a0 Warning: Memory ({escape(str(memory))}) exceeds partition limit ({limit} MB per node)[/]")
-
-    # Check Time Limit
-    time_limit = answers.get("time_limit")
-    if time_limit:
-        try:
-            req_mins = _parse_slurm_time_to_minutes(str(time_limit))
-            limit_str = part.get("timelimit")
-            if limit_str:
-                limit_mins = _parse_slurm_time_to_minutes(limit_str)
-                if limit_mins > 0 and req_mins > limit_mins:
-                    console.print(f"  [yellow]\u26a0 Warning: Time limit ({escape(str(time_limit))}) exceeds partition limit ({escape(str(limit_str))})[/]")
-        except Exception:
-            pass
-
-    # Check GPUs
-    gpus = answers.get("gpus", 0)
-    try:
-        gpus_val = int(gpus) if gpus is not None else 0
-    except ValueError:
-        gpus_val = 0
-
-    gpu_types = part.get("gpu_types", [])
-    # `has_gpu` is set whenever the partition advertises any GRES gpu \u2014 including
-    # count-only ("gpu:4") and typed-without-count ("gpu:a100") forms that don't
-    # populate gpu_types \u2014 so a real GPU partition isn't flagged as CPU-only.
-    if gpus_val > 0 and not gpu_types and not part.get("has_gpu"):
-        console.print(f"  [yellow]\u26a0 Warning: Partition '{escape(str(part.get('name')))}' does not support GPUs[/]")
-
+    # A GPU model the partition doesn't statically list may still be valid \u2014 a
+    # live sinfo lookup can surface types the cached partition object missed. The
+    # final CLI summary can afford that one-shot query (the live TUI check can't),
+    # so resolve it here and hand the widened list to the shared validator. Only
+    # query when there's an unrecognized type to check, to avoid a needless call.
+    extra_gpu_types: list[str] = []
     gpu_type = answers.get("gpu_type")
-    if gpu_type and gpu_type.lower() != "any" and gpu_type.lower() not in {g.lower() for g in gpu_types}:
-        part_name = part.get("name", "")
-        if part_name:
-            dyn_types = fetch_gpu_types_for_partition(part_name)
-            all_types = gpu_types + [t for t in dyn_types if t not in gpu_types]
+    if gpu_type and str(gpu_type).lower() != "any":
+        static = {str(g).lower() for g in part.get("gpu_types", [])}
+        if str(gpu_type).lower() not in static:
+            part_name = part.get("name", "")
+            if part_name:
+                try:
+                    extra_gpu_types = fetch_gpu_types_for_partition(part_name)
+                except Exception:
+                    extra_gpu_types = []
+
+    # Single source of truth, shared with the live TUI check (see
+    # system_utils.validate_job_config). escape() the whole message: only
+    # user-supplied values can carry Rich-markup metacharacters ('[', ']'), and
+    # the static text never does, so escaping the lot is equivalent to escaping
+    # each interpolated value and can't accidentally miss one.
+    for level, msg in validate_job_config(answers, extra_gpu_types=extra_gpu_types):
+        if level == "error":
+            console.print(f"  [red]\u2717 Error: {escape(msg)}[/]")
         else:
-            all_types = gpu_types
-        if gpu_type.lower() not in {g.lower() for g in all_types}:
-            console.print(f"  [yellow]\u26a0 Warning: GPU type '{escape(str(gpu_type))}' not in partition list ({escape(', '.join(all_types))})[/]")
+            console.print(f"  [yellow]\u26a0 Warning: {escape(msg)}[/]")
 
 
 _REQUIRED_FIELDS = [("job_name", "Job name"), ("partition", "Partition"), ("command", "Command to run")]

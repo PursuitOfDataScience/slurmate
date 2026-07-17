@@ -538,3 +538,108 @@ class TestNaiveConfigParserParity:
         result = _parse_config_naive('modules = [\n  "cuda",\n  "gcc"\n')
         assert "modules" not in result
         assert "unclosed array" in capsys.readouterr().err
+
+
+class TestValidateJobConfig:
+    """The pure, side-effect-free validator shared by the CLI summary and the
+    live TUI check."""
+
+    GPU_PART = {"name": "gpu", "cpus_per_node": 16, "mem_per_node_mb": 65536,
+                "gpu_types": ["a100"], "has_gpu": True, "timelimit": "04:00:00"}
+    CPU_PART = {"name": "caslake", "cpus_per_node": 48, "mem_per_node_mb": 196608,
+                "gpu_types": [], "has_gpu": False, "timelimit": "36:00:00"}
+
+    def test_no_partition_object_is_silent(self):
+        from slurmate.system_utils import validate_job_config
+        assert validate_job_config({"gpus": 4}) == []
+        assert validate_job_config({"_partition_obj": None, "gpus": 4}) == []
+
+    def test_within_limits_no_issues(self):
+        from slurmate.system_utils import validate_job_config
+        assert validate_job_config({
+            "_partition_obj": self.GPU_PART, "cpus": 4, "memory": "16G",
+            "time_limit": "01:00:00", "gpus": 1, "gpu_type": "a100",
+        }) == []
+
+    def test_gpus_on_cpu_only_partition_is_error(self):
+        from slurmate.system_utils import validate_job_config
+        issues = validate_job_config({"_partition_obj": self.CPU_PART, "gpus": 1})
+        assert ("error", "Partition 'caslake' does not support GPUs") in issues
+
+    def test_has_gpu_suppresses_count_only_false_error(self):
+        from slurmate.system_utils import validate_job_config
+        part = {"name": "gpu1", "cpus_per_node": 16, "mem_per_node_mb": 0,
+                "gpu_types": [], "has_gpu": True, "timelimit": None}
+        issues = validate_job_config({"_partition_obj": part, "gpus": 2})
+        assert all("does not support GPUs" not in m for _, m in issues)
+
+    def test_unknown_partition_capability_no_gpu_error(self):
+        from slurmate.system_utils import validate_job_config
+        # Synthetic fallback for a manually-typed / unrecognized partition: no
+        # has_gpu key means capability is unknown, so requesting GPUs must not
+        # produce a hard "does not support GPUs" error (an overclaim).
+        part = {"name": "typo", "cpus_per_node": 0, "mem_per_node_mb": 0,
+                "gpu_types": [], "timelimit": None}
+        assert validate_job_config({"_partition_obj": part, "gpus": 2}) == []
+
+    def test_cpu_mem_time_over_limit_are_warnings(self):
+        from slurmate.system_utils import validate_job_config
+        issues = validate_job_config({
+            "_partition_obj": self.GPU_PART, "cpus": 64, "memory": "128G",
+            "time_limit": "08:00:00", "gpus": 0,
+        })
+        levels = {m.split()[0]: lvl for lvl, m in issues}
+        assert levels.get("CPUs") == "warning"
+        assert levels.get("Memory") == "warning"
+        assert levels.get("Time") == "warning"
+
+    def test_cpu_total_accounts_for_ntasks(self):
+        from slurmate.system_utils import validate_job_config
+        # 4 tasks x 8 cpus = 32 > 16 per node.
+        issues = validate_job_config({
+            "_partition_obj": self.GPU_PART, "cpus": 8, "ntasks_per_node": 4,
+        })
+        assert any("CPUs (4×8=32) exceeds" in m for _, m in issues)
+
+    def test_gpu_type_not_in_list_is_error(self):
+        from slurmate.system_utils import validate_job_config
+        issues = validate_job_config(
+            {"_partition_obj": self.GPU_PART, "gpus": 1, "gpu_type": "h100"})
+        assert ("error", "GPU type 'h100' not in partition list (a100)") in issues
+
+    def test_gpu_type_valid_via_extra_types(self):
+        from slurmate.system_utils import validate_job_config
+        # A model absent from the static list but confirmed by a live lookup
+        # must not warn.
+        issues = validate_job_config(
+            {"_partition_obj": self.GPU_PART, "gpus": 1, "gpu_type": "h100"},
+            extra_gpu_types=["h100"])
+        assert all("not in partition list" not in m for _, m in issues)
+
+    def test_gpu_type_any_never_warns(self):
+        from slurmate.system_utils import validate_job_config
+        issues = validate_job_config(
+            {"_partition_obj": self.GPU_PART, "gpus": 1, "gpu_type": "Any"})
+        assert all("not in partition list" not in m for _, m in issues)
+
+    def test_no_known_types_suppresses_empty_list_warning(self):
+        from slurmate.system_utils import validate_job_config
+        # Partition advertises GPUs (has_gpu) but no parseable model; requesting a
+        # specific type must not produce a "not in partition list ()" against an
+        # empty list — the count-only signal, not this one, is authoritative.
+        part = {"name": "gpu2", "cpus_per_node": 16, "mem_per_node_mb": 0,
+                "gpu_types": [], "has_gpu": True, "timelimit": None}
+        issues = validate_job_config(
+            {"_partition_obj": part, "gpus": 1, "gpu_type": "a100"})
+        assert all("not in partition list" not in m for _, m in issues)
+
+    def test_stringy_and_blank_values_do_not_raise(self):
+        from slurmate.system_utils import validate_job_config
+        # Live TUI values arrive as raw strings, possibly blank mid-edit.
+        assert validate_job_config({
+            "_partition_obj": self.CPU_PART, "cpus": "", "memory": "",
+            "time_limit": "", "gpus": "", "gpu_type": "",
+        }) == []
+        # A non-numeric gpus string must not crash and must not warn.
+        assert validate_job_config(
+            {"_partition_obj": self.CPU_PART, "gpus": "abc"}) == []

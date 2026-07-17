@@ -299,6 +299,108 @@ def _parse_slurm_time_to_minutes(time_str: str) -> float:
     return float(_safe_int(parts[0])) if parts else 0.0
 
 
+def validate_job_config(
+    answers: dict[str, Any],
+    extra_gpu_types: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Validate a (possibly incomplete) answers dict against the selected
+    partition's advertised capabilities.
+
+    Returns a list of ``(level, message)`` tuples, where ``level`` is:
+
+    - ``"error"``   — a configuration Slurm will reject outright (e.g. GPUs on a
+      CPU-only partition, or a GPU model the partition doesn't have).
+    - ``"warning"`` — a request that exceeds a node's advertised capacity and may
+      be rejected or left pending (CPU/memory/time over the per-node limit; the
+      advertised value can undercount a heterogeneous partition, so it isn't a
+      guaranteed failure).
+
+    An empty list means nothing is known to be wrong. Both the live TUI check
+    (every redraw) and the final CLI summary share this single source of truth,
+    so the two surfaces can't drift apart.
+
+    This function is pure and side-effect free — it makes **no** subprocess
+    calls — so the TUI can safely call it on every keystroke/redraw. Callers
+    that can afford a live ``sinfo`` lookup (e.g. the one-shot CLI summary) may
+    pass ``extra_gpu_types`` to widen the set of GPU models considered valid
+    beyond what ``_partition_obj`` statically lists.
+    """
+    part = answers.get("_partition_obj")
+    if not part:
+        return []
+    out: list[tuple[str, str]] = []
+
+    # CPUs — compare the per-node total (cpus-per-task x tasks-per-node) against
+    # the node's core count, so multi-task over-allocation is caught.
+    cpus = answers.get("cpus")
+    if cpus is not None and str(cpus).strip() != "":
+        try:
+            cores = int(cpus)
+            ntpn_raw = answers.get("ntasks_per_node")
+            ntpn = int(ntpn_raw) if ntpn_raw else 1
+            total = cores * max(1, ntpn)
+            limit = part.get("cpus_per_node", 0)
+            if limit and total > limit:
+                detail = f"{ntpn}×{cores}={total}" if ntpn > 1 else str(total)
+                out.append(("warning", f"CPUs ({detail}) exceeds partition limit ({limit} per node)"))
+        except (ValueError, TypeError):
+            pass
+
+    # Memory vs the node's advertised memory.
+    memory = answers.get("memory")
+    if memory and validate_memory(str(memory)):
+        mb = _parse_mem_to_mb(str(memory))
+        limit = part.get("mem_per_node_mb", 0)
+        if limit and mb > limit:
+            out.append(("warning", f"Memory ({memory}) exceeds partition limit ({limit} MB per node)"))
+
+    # Time vs the partition's max time.
+    time_limit = answers.get("time_limit")
+    if time_limit:
+        try:
+            req_mins = _parse_slurm_time_to_minutes(str(time_limit))
+            limit_str = part.get("timelimit")
+            if limit_str:
+                limit_mins = _parse_slurm_time_to_minutes(limit_str)
+                if limit_mins > 0 and req_mins > limit_mins:
+                    out.append(("warning", f"Time limit ({time_limit}) exceeds partition limit ({limit_str})"))
+        except Exception:
+            pass
+
+    # GPUs requested on a partition *known* to advertise none. Only assert this
+    # when ``has_gpu`` is explicitly False: real partition objects (from
+    # fetch_partitions / MOCK) always carry it as a bool, so ``is False`` means
+    # "we looked and there's no gpu GRES" — a config Slurm will reject. A
+    # manually-typed or unrecognized partition falls back to a synthetic object
+    # with no ``has_gpu`` key (capability unknown, like the 0/None cpu/mem/time
+    # limits the checks above stay silent on), so we must not overclaim a hard
+    # "no GPUs" error there. ``has_gpu`` also stays True for count-only
+    # ("gpu:4") / typed-without-count GRES that don't populate gpu_types, so a
+    # real GPU partition is never flagged as CPU-only.
+    gpus = answers.get("gpus", 0)
+    try:
+        gpus_val = int(gpus) if (gpus is not None and str(gpus).strip() != "") else 0
+    except (ValueError, TypeError):
+        gpus_val = 0
+    gpu_types = list(part.get("gpu_types", []))
+    if gpus_val > 0 and not gpu_types and part.get("has_gpu") is False:
+        out.append(("error", f"Partition '{part.get('name')}' does not support GPUs"))
+
+    # A specific GPU model the partition doesn't offer. Only meaningful when we
+    # actually know which models the partition has (static list plus any
+    # caller-supplied dynamic types); with no type info at all, the count-only
+    # "does not support GPUs" check above is the right signal, and warning
+    # "not in partition list ()" against an empty list would be noise.
+    gpu_type = answers.get("gpu_type")
+    if gpu_type and str(gpu_type).lower() != "any":
+        all_types = gpu_types + [t for t in (extra_gpu_types or []) if t not in gpu_types]
+        known = {str(g).lower() for g in all_types}
+        if known and str(gpu_type).lower() not in known:
+            out.append(("error", f"GPU type '{gpu_type}' not in partition list ({', '.join(all_types)})"))
+
+    return out
+
+
 def fetch_partitions() -> list[dict[str, Any]]:
     if not is_tool_available("sinfo"):
         return list(MOCK_PARTITIONS)

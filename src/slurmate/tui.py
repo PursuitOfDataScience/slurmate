@@ -674,57 +674,37 @@ class Wizard:
             return val or None
         return val
 
-    def _get_warning(self) -> str | None:
-        part = self.answers.get("_partition_obj")
-        if not part:
-            return None
+    # Steps whose in-progress value affects the partition-compatibility check.
+    # For the active one of these, the field's live (not-yet-committed) value is
+    # overlaid before validating, so the current field gives feedback as it's
+    # edited — while every *other* field's already-committed value is still
+    # checked, so a problem introduced earlier (e.g. GPUs on a CPU-only
+    # partition) keeps showing after you move past that step.
+    _VALIDATED_KEYS = frozenset(
+        {"cpus", "memory", "time_limit", "nodes", "ntasks_per_node", "gpus", "gpu_type"}
+    )
 
+    def _config_warnings(self) -> list[tuple[str, str]]:
+        """(level, message) issues for the whole work-in-progress config.
+
+        Delegates to the shared, side-effect-free ``validate_job_config`` (the
+        same check the final CLI summary runs), so the live preview flags a
+        script that's already in a failure mode even while it's unfinished —
+        rather than only warning about the step you happen to be on. Safe to
+        call on every redraw: no subprocess calls, and the partition's GPU-type
+        list is reused from the cache populated when the GPU-type step loaded.
+        """
+        if not self.answers.get("_partition_obj"):
+            return []
+        live = dict(self.answers)
         s = self.current_step
-        if s.key == "cpus":
-            val = self._text_val()
-            if val.isdigit():
-                cores = int(val)
-                limit = part.get("cpus_per_node", 0)
-                if limit and cores > limit:
-                    return f"CPUs ({cores}) exceeds partition limit ({limit} per node)"
-        elif s.key == "memory":
-            val = self._text_val()
-            if validate_memory(val):
-                from .system_utils import _parse_mem_to_mb
-                mb = _parse_mem_to_mb(val)
-                limit = part.get("mem_per_node_mb", 0)
-                if limit and mb > limit:
-                    return f"Memory exceeds partition limit ({limit} MB per node)"
-        elif s.key == "time_limit":
-            val = self._text_val()
-            if val:
-                from .system_utils import _parse_slurm_time_to_minutes
-                try:
-                    req_mins = _parse_slurm_time_to_minutes(val)
-                    limit_str = part.get("timelimit")
-                    if limit_str:
-                        limit_mins = _parse_slurm_time_to_minutes(limit_str)
-                        if limit_mins > 0 and req_mins > limit_mins:
-                            return f"Time limit exceeds partition limit ({limit_str})"
-                except Exception:
-                    pass
-        elif s.key == "gpus":
-            val = self._text_val()
-            if val and val.isdigit():
-                gpus = int(val)
-                gpu_types = part.get("gpu_types", [])
-                # `has_gpu` covers count-only ("gpu:4") / typed-without-count
-                # GRES that don't populate gpu_types, so a real GPU partition
-                # isn't wrongly flagged as CPU-only.
-                if gpus > 0 and not gpu_types and not part.get("has_gpu"):
-                    return f"Partition '{part.get('name')}' does not support GPUs"
-        elif s.key == "gpu_type":
-            val = self._radio_value() if self._is_select_active() else self._text_val()
-            gpu_types = self.transient.get("gpu_types", [])
-            if val and val.lower() != "any" and gpu_types and val.lower() not in {g.lower() for g in gpu_types}:
-                return f"GPU type '{val}' not in partition list ({', '.join(gpu_types)})"
-
-        return None
+        if s.key in self._VALIDATED_KEYS:
+            if self._is_text_active():
+                live[s.key] = self._text_val()
+            elif self._is_select_active():
+                live[s.key] = self._radio_value()
+        from .system_utils import validate_job_config
+        return validate_job_config(live, extra_gpu_types=self.transient.get("gpu_types"))
 
     def _step_default(self, s: Step) -> str:
         """Default value for a step, preferring a per-instance config override."""
@@ -1158,10 +1138,15 @@ class Wizard:
                 FormattedTextControl([("class:error", f"  \u2717 {self.step_cache['error']}\n")]),
                 height=1, style=content_bg,
             ))
-        warning_text = self._get_warning()
-        if warning_text:
+        # Persistent whole-config validation: every issue in the work-in-progress
+        # script stays visible on every step, not just the one that introduced it.
+        # Errors (a config Slurm will reject \u2014 e.g. GPUs on a CPU-only partition)
+        # render red; capacity warnings render orange.
+        for level, msg in self._config_warnings():
+            cls = "class:error" if level == "error" else "class:warning"
+            icon = "\u2717" if level == "error" else "\u26a0"
             error_control.append(Window(
-                FormattedTextControl([("class:warning", f"  \u26a0 {warning_text}\n")]),
+                FormattedTextControl([(cls, f"  {icon} {msg}\n")]),
                 height=1, style=content_bg,
             ))
 

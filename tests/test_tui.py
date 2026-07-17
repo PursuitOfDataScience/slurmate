@@ -575,3 +575,62 @@ class TestPartitionAndGpuNavigation:
         w._set_partition_from_select(label)
         assert w.answers["partition"] == "restricted-gpu"
         assert w.answers["_partition_obj"]["name"] == "restricted-gpu"
+
+
+class TestLivePartitionValidation:
+    """The work-in-progress script is validated on every step, so a config
+    already in a failure mode (e.g. GPUs on a CPU-only partition) keeps warning
+    after the user moves past the step that introduced it."""
+
+    CPU_PART = {"name": "caslake", "cpus_per_node": 48, "mem_per_node_mb": 196608,
+                "gpu_types": [], "has_gpu": False, "timelimit": "36:00:00"}
+
+    def _wizard_on_caslake(self, gpus=1):
+        w = Wizard()
+        w.answers.update({"partition": "caslake", "_partition_obj": self.CPU_PART,
+                          "gpus": gpus, "cpus": 4, "memory": "16G",
+                          "time_limit": "02:00:00"})
+        w.transient["gpu_types"] = []
+        return w
+
+    def test_no_warning_without_partition_object(self):
+        w = Wizard()
+        w.answers["gpus"] = 4
+        assert w._config_warnings() == []
+
+    def test_gpu_on_cpu_partition_persists_past_gpus_step(self):
+        # The reported bug: choosing 1 GPU on caslake (no GPU) must keep warning
+        # on the *later* GPU-type step, not just while on the GPUs step.
+        w = self._wizard_on_caslake(gpus=1)
+        for key in ("gpu_type", "gpu_format", "output_dir", "command", "review"):
+            w.idx = _idx(key)
+            issues = w._config_warnings()
+            assert ("error", "Partition 'caslake' does not support GPUs") in issues, key
+
+    def test_zero_gpus_no_warning(self):
+        w = self._wizard_on_caslake(gpus=0)
+        w.idx = _idx("gpu_type")
+        assert w._config_warnings() == []
+
+    def test_current_field_live_value_overlaid(self):
+        # While on the GPUs step, the not-yet-committed typed value drives the
+        # check (feedback before Enter), overriding the committed answer.
+        w = self._wizard_on_caslake(gpus=0)
+        w.idx = _idx("gpus")
+        w.text_area.text = "2"
+        assert any(lvl == "error" and "does not support GPUs" in m
+                   for lvl, m in w._config_warnings())
+        w.text_area.text = "0"
+        assert w._config_warnings() == []
+
+    def test_manually_typed_unknown_partition_no_false_error(self):
+        from slurmate.tui import _get_partition
+        # A partition name not in the fetched list resolves to the synthetic
+        # fallback (no has_gpu key). Requesting GPUs must not raise a false
+        # "does not support GPUs" error, since capability is unknown.
+        w = Wizard()
+        w.answers["partition"] = "typo-partition"
+        w.answers["_partition_obj"] = _get_partition([], "typo-partition")
+        w.answers["gpus"] = 2
+        w.idx = _idx("gpu_type")
+        assert all("does not support GPUs" not in m for _, m in w._config_warnings())
