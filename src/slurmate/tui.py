@@ -57,62 +57,30 @@ if os.environ.get("SLURMATE_DEBUG"):
     )
 
 
-# ── Palette ──────────────────────────────────────────────────────────────
-# A muted, harmonious dark palette (Tokyo-Night lineage). Every tone is drawn
-# just off the pure-channel corners and from one family, so the UI reads as
-# *designed* rather than as saturated "neon toy" primaries. One accent
-# (periwinkle) carries focus / the current step; green / amber / rosé are
-# reserved strictly for validation state, not decoration. Two background tones
-# (base stage + raised surface) give panels a subtle card-like depth.
-_BASE = "#16161e"      # app stage — the deepest background
-_SURFACE = "#1f2335"   # panels / inputs — one step up, reads as a raised card
-_SURFACE2 = "#2a2f45"  # focused input / selected row
-_OVERLAY = "#3b4261"   # dividers, faint rules, scrollbar thumb
-_TEXT = "#c0caf5"       # primary text (soft lavender-white, not pure #fff)
-_MUTED = "#8189ad"      # secondary text
-_FAINT = "#565f89"      # tertiary — pending steps, comments
-_ACCENT = "#7aa2f7"     # periwinkle — focus, headers, current step
-_ACCENT2 = "#bb9af7"    # soft violet — list pointer / secondary accent
-_GREEN = "#9ece6a"      # done / success (sage, not neon)
-_AMBER = "#e0af68"      # warning (gold, not pure orange)
-_ROSE = "#f7768e"       # error (rosé, not fire-truck red)
-_CYAN = "#7dcfff"       # info — string / variable literals
-
-_BG_BASE = f"bg:{_BASE}"
-_BG_SURFACE = f"bg:{_SURFACE}"
-
-
 _TUI_STYLE = PTStyle([
-    ("status-bar", f"bg:{_SURFACE} fg:{_MUTED}"),
-    ("status-bar.brand", f"bg:{_SURFACE} fg:{_ACCENT} bold"),
-    ("status-bar.meter", f"bg:{_SURFACE} fg:{_ACCENT}"),
-    ("status-bar.meter-empty", f"bg:{_SURFACE} fg:{_OVERLAY}"),
-    ("sidebar-done", f"fg:{_GREEN}"),
-    ("sidebar-current", f"fg:{_ACCENT} bold"),
-    ("sidebar-pending", f"fg:{_FAINT}"),
-    ("sidebar-gutter", f"fg:{_ACCENT}"),
-    ("title", f"fg:{_TEXT} bold"),
-    ("subtitle", f"fg:{_MUTED}"),
-    ("text-area", f"fg:{_TEXT} {_BG_SURFACE}"),
-    # Distinct focused look (a raised selection background) so the active input
-    # field is obvious — previously identical to unfocused.
-    ("text-area focused", f"fg:{_TEXT} bg:{_SURFACE2} bold"),
-    ("radio-list", f"fg:{_TEXT}"),
-    ("radio-list.selected", f"fg:{_ACCENT} bold"),
-    ("radio-list.pointer", f"fg:{_ACCENT2} bold"),
-    ("checkbox", f"fg:{_MUTED}"),
-    ("checkbox.selected", f"fg:{_GREEN}"),
-    ("preview-header", f"fg:{_ACCENT} bold"),
-    ("preview-text", f"fg:{_MUTED}"),
-    ("error", f"fg:{_ROSE} bold"),
-    ("warning", f"fg:{_AMBER} bold"),
-    ("info", f"fg:{_FAINT}"),
-    ("rule", f"fg:{_OVERLAY}"),
-    ("completion-menu", f"bg:{_SURFACE} fg:{_MUTED}"),
-    ("completion-menu.completion", f"bg:{_SURFACE} fg:{_MUTED}"),
-    ("completion-menu.completion.current", f"bg:{_ACCENT} fg:{_BASE} bold"),
-    ("scrollbar.background", f"bg:{_SURFACE}"),
-    ("scrollbar.button", f"bg:{_OVERLAY}"),
+    ("status-bar", "bg:#0088ff fg:#ffffff bold"),
+    ("sidebar-done", "fg:#00ff80 bold"),
+    ("sidebar-current", "fg:#bf00ff bold"),
+    ("sidebar-pending", "fg:#8888aa"),
+    ("title", "fg:#00ffff bold"),
+    ("subtitle", "fg:#aaaaaa"),
+    ("text-area", "fg:#dddddd bg:#2a2a3a"),
+    # Distinct focused look (brighter text + a blue selection-style background)
+    # so the active input field is obvious — previously identical to unfocused.
+    ("text-area focused", "fg:#ffffff bg:#264f78 bold"),
+    ("radio-list", "fg:#ffffff"),
+    ("radio-list.selected", "fg:#00ff80 bold"),
+    ("radio-list.pointer", "fg:#bf00ff bold"),
+    ("checkbox", "fg:#888888"),
+    ("checkbox.selected", "fg:#00ff80"),
+    ("preview-header", "fg:#00ffff bold"),
+    ("preview-text", "fg:#aaaaaa"),
+    ("error", "fg:#ff4444 bold"),
+    ("warning", "fg:#ffaa00 bold"),
+    ("info", "fg:#888888"),
+    ("completion-menu", "bg:#222222 fg:#cccccc"),
+    ("completion-menu.completion", "bg:#222222 fg:#cccccc"),
+    ("completion-menu.completion.current", "bg:#0088ff fg:#ffffff bold"),
 ])
 
 
@@ -392,11 +360,11 @@ class Wizard:
         self._review_total_lines = 0
         self._review_config_window = Window(
             FormattedTextControl(self._render_review_config),
-            width=D(weight=2), wrap_lines=True, style=_BG_SURFACE,
+            width=D(weight=2), wrap_lines=True, style="bg:#1a1a2e",
         )
         self._review_script_window = Window(
             FormattedTextControl(self._render_review_script, focusable=True),
-            width=D(weight=3), style=_BG_SURFACE,
+            width=D(weight=3), style="bg:#1a1a2e",
         )
 
         self._build_app()
@@ -1118,32 +1086,14 @@ class Wizard:
         ])
 
     def _render_header_left(self) -> list[tuple[str, str]]:
-        # Brand mark in the accent; the descriptor stays muted so the header
-        # reads as calm chrome, not a loud banner bar.
-        return [
-            ("class:status-bar.brand", "  \u26a1 Slurmate"),
-            ("class:status-bar", "  \u2014  sbatch wizard"),
-        ]
-
-    _METER_SEGMENTS = 14
+        return [("class:status-bar", "  \u26a1  Slurmate \u2014 sbatch wizard")]
 
     def _render_header_right(self) -> list[tuple[str, str]]:
         s = self.current_step
         visible_total = len(STEPS) - len(self._skipped_indices)
         visible_done = sum(1 for i in range(self.idx) if i not in self._skipped_indices)
-        pos = visible_done + 1
-        # A segmented progress meter (\u25b0\u25b1) reads at a glance far better than a bare
-        # "3/21"; keep the count and the step title alongside it.
-        n = self._METER_SEGMENTS
-        filled = max(0, min(n, round(pos / max(1, visible_total) * n)))
-        filled_bar = "\u25b0" * filled
-        empty_bar = "\u25b1" * (n - filled)
-        return [
-            ("class:status-bar.meter", f"  {filled_bar}"),
-            ("class:status-bar.meter-empty", empty_bar),
-            ("class:status-bar", f"  {pos}/{visible_total}  "),
-            ("class:status-bar.brand", f"{s.title}  "),
-        ]
+        right = f"  {visible_done + 1}/{visible_total}  {s.title}"
+        return [("class:status-bar", f"  {right}  ")]
 
     _SIDEBAR_WIDTH = 26
 
@@ -1151,14 +1101,13 @@ class Wizard:
         return Window(
             FormattedTextControl(self._render_sidebar),
             width=self._SIDEBAR_WIDTH,
-            style=_BG_SURFACE,
+            style="bg:#1a1a2e",
         )
 
     def _render_sidebar(self) -> list[tuple[str, str]]:
         lines: list[tuple[str, str]] = [("class:subtitle", "  Steps\n\n")]
-        # A fixed 4-column prefix keeps every title aligned: done "  \u2713 ", current
-        # "  \u258e " (an accent gutter bar), pending "    ". Ellipsize any title that
-        # would overflow the fixed width (e.g. "Environment name/path").
+        # 4 columns of prefix ("  \u2713 "); ellipsize any title that would overflow
+        # the fixed width (e.g. "Environment name/path") rather than clipping it.
         avail = self._SIDEBAR_WIDTH - 4
         for i, s in enumerate(STEPS):
             if i in self._skipped_indices:
@@ -1167,10 +1116,7 @@ class Wizard:
             if i < self.idx:
                 lines.append(("class:sidebar-done", f"  \u2713 {title}\n"))
             elif i == self.idx:
-                # A left accent gutter (like an editor's active-line marker) reads
-                # as more deliberate than a chevron.
-                lines.append(("class:sidebar-gutter", "  \u258e "))
-                lines.append(("class:sidebar-current", f"{title}\n"))
+                lines.append(("class:sidebar-current", f"  \u25b6 {title}\n"))
             else:
                 lines.append(("class:sidebar-pending", f"    {title}\n"))
         return lines
@@ -1181,9 +1127,10 @@ class Wizard:
         title_text = f"\n  {s.title}\n"
         subtitle_text = f"  {s.subtitle}\n\n"
 
-        # The central column sits on the base stage; raised surface panels
-        # (inputs, preview, review columns) float on top of it for depth.
-        content_bg = _BG_BASE
+        # One consistent content background (the same navy as the chrome) across
+        # the title / error / warning / review windows, so the central column
+        # isn't a patchwork of terminal-default and themed panels.
+        content_bg = "bg:#1a1a2e"
 
         error_control: list[Window] = []
         if self.step_cache.get("error"):
@@ -1222,7 +1169,7 @@ class Wizard:
                 title_win,
                 VSplit([
                     self._review_config_window,
-                    Window(width=1, char="│", style=f"class:rule {_BG_BASE}"),
+                    Window(width=1, char="│", style="class:subtitle bg:#1a1a2e"),
                     self._review_script_window,
                 ], padding=1, style=content_bg),
             ], style=content_bg)
@@ -1255,7 +1202,7 @@ class Wizard:
         show = bool(self.transient.get("queue_info")) and self._past_hardware_config()
         return Window(
             FormattedTextControl(self._render_queue_text),
-            style=_BG_BASE,
+            style="bg:#1a1a2e",
             dont_extend_height=True,
             height=2 if show else 0,
         )
@@ -1266,7 +1213,7 @@ class Wizard:
             return []
         part = self.transient.get("queue_info_part", "")
         eta_sec = qinfo.get("eta_seconds", 0)
-        eta_color = f"fg:{_GREEN} bold" if eta_sec < 3600 else f"fg:{_AMBER} bold"
+        eta_color = "fg:#00ff80 bold" if eta_sec < 3600 else "fg:#ffaa00 bold"
         return [
             ("", "\n  "),
             ("class:preview-header", f"Queue status ({part}): "),
@@ -1278,7 +1225,7 @@ class Wizard:
     def _preview_panel(self) -> Window:
         return Window(
             FormattedTextControl(self._render_preview_text),
-            style=_BG_SURFACE,
+            style="bg:#1a1a2e",
             height=D(min=8),
         )
 
@@ -1341,27 +1288,25 @@ class Wizard:
             if line.strip().startswith("#SBATCH"):
                 parts = line.split("=", 1)
                 if len(parts) == 2:
-                    # Directive name in the accent, value in primary text — two
-                    # tones instead of the old green-on-white shout.
                     return [
-                        (f"fg:{_ACCENT}", f"  {parts[0]}="),
-                        (f"fg:{_TEXT}", f"{parts[1]}\n"),
+                        ("fg:#00ff80 bold", f"  {parts[0]}="),
+                        ("fg:#ffffff", f"{parts[1]}\n"),
                     ]
                 else:
-                    return [(f"fg:{_ACCENT}", f"  {line}\n")]
+                    return [("fg:#00ff80 bold", f"  {line}\n")]
             else:
-                return [(f"fg:{_FAINT} italic", f"  {line}\n")]
+                return [("fg:#555555 italic", f"  {line}\n")]
 
         tokens = []
         words = line.split(" ")
         for idx, word in enumerate(words):
             space = " " if idx < len(words) - 1 else ""
             if word in ("source", "conda", "activate", "mamba", "module", "load"):
-                tokens.append((f"fg:{_ACCENT}", word + space))
+                tokens.append(("fg:#00ffff bold", word + space))
             elif word.startswith("$") or "$(" in word:
-                tokens.append((f"fg:{_CYAN}", word + space))
+                tokens.append(("fg:#ff0080", word + space))
             else:
-                tokens.append((f"fg:{_TEXT}", word + space))
+                tokens.append(("", word + space))
 
         return [("", "  ")] + tokens + [("", "\n")]
 
@@ -1395,7 +1340,7 @@ class Wizard:
         return Window(
             FormattedTextControl(self._render_footer),
             height=1,
-            style=_BG_SURFACE,
+            style="bg:#1a1a2e",
         )
 
     def _render_footer(self) -> list[tuple[str, str]]:
