@@ -516,3 +516,62 @@ class TestNoneTextAreaGuards:
         w.answers.update({"env_type": "Virtualenv (venv)", "env_name": None})
         w._setup_env_name("forward")
         assert w.text_area.text == ""
+
+
+class TestPartitionAndGpuNavigation:
+    """State-machine regressions in partition/gpu_type navigation."""
+
+    def _wizard(self):
+        w = Wizard()
+        w._invalidate = lambda: None
+        w._advance = lambda: None
+        return w
+
+    def test_gpu_type_back_returns_to_gpus_step(self):
+        from prompt_toolkit.widgets import RadioList
+        w = self._wizard()
+        # Stale radio left over from an earlier select step (e.g. QoS).
+        w.radio_list = RadioList([("Default (none)", "Default (none)"),
+                                  ("high", "high"), ("gpu", "gpu")])
+        w.radio_list._selected_index = 1
+        w.answers["gpus"] = 1
+        w.answers["partition"] = "debug"  # mock 'debug' advertises no typed GPUs
+        w.idx = _idx("gpu_type")
+        w._setup_gpu_type("forward")
+        assert w.step_cache.get("gpu_sub") == "text"
+        w._go_back()
+        # Back must move to the gpus step, not trap the user on gpu_type.
+        assert w.idx == _idx("gpus")
+
+    def test_partition_back_from_private_resolves_correctly(self):
+        from slurmate.tui import PRIVATE
+        w = self._wizard()
+        w.idx = _idx("partition")
+        w._setup_partition()
+        vals = [v for v, _ in w.radio_list.values]
+        w.radio_list._selected_index = vals.index(PRIVATE)
+        w._handle_partition_confirm()
+        assert w.step_cache.get("partition_sub") == "all"
+        w._go_back()
+        assert w.step_cache.get("partition_sub") == "select"
+        vals2 = [v for v, _ in w.radio_list.values]
+        target = next(v for v in vals2 if v.startswith("cpu-highmem"))
+        w.radio_list._selected_index = vals2.index(target)
+        w._handle_partition_confirm()
+        assert w.answers["partition"] == "cpu-highmem"
+
+    def test_all_restricted_cluster_resolves_real_name(self):
+        from prompt_toolkit.widgets import RadioList
+
+        from slurmate.tui import CUSTOM, _fmt_partition
+        w = self._wizard()
+        allp = [{"name": "restricted-gpu", "nodes": 4, "cpus_per_node": 32,
+                 "mem_per_node_mb": 262144, "gpu_types": ["h100"], "timelimit": None}]
+        w.transient["all_parts"] = allp
+        w.transient["public_parts"] = []
+        label = _fmt_partition(allp[0])
+        w.radio_list = RadioList([(CUSTOM, CUSTOM), (label, label)])
+        w.step_cache["partition_sub"] = "select"
+        w._set_partition_from_select(label)
+        assert w.answers["partition"] == "restricted-gpu"
+        assert w.answers["_partition_obj"]["name"] == "restricted-gpu"

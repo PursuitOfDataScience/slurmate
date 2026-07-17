@@ -592,21 +592,20 @@ class Wizard:
         s = self.current_step
         if s.kind == "partition":
             sub = self.step_cache.get("partition_sub", "select")
-            if sub == "all":
-                self.step_cache["partition_sub"] = "select"
+            if sub in ("all", "text"):
+                # Return to the initial partition chooser. Rebuild it via
+                # _setup_partition() (which resets partition_sub to "select" AND
+                # restores the correct select radio); merely flipping the sub back
+                # left the private/text radio on screen, so the next confirm
+                # resolved to the wrong partition.
+                self._setup_partition()
                 self._invalidate()
                 return
-            if sub == "text":
-                self.step_cache["partition_sub"] = "select"
-                self._invalidate()
-                return
-        if s.kind == "gpu_type":
-            sub = self.step_cache.get("gpu_sub", "select")
-            if sub == "text":
-                self.step_cache["gpu_sub"] = "select"
-                self.step_cache.pop("gpu_types", None)
-                self._invalidate()
-                return
+        # NB: gpu_type has no select<-text transition to unwind (unlike partition):
+        # the text sub is entered only when the partition lists no typed GPUs, and
+        # no radio is built for it. So gpu_type Back must fall through to the
+        # general logic below (decrement idx, return to the gpus step) — handling
+        # it like partition here trapped the user and confirmed a stale radio value.
         # Whether the step we're leaving was auto-skipped. Its value isn't the
         # user's, and the shared text widget may still hold another step's text —
         # capture this before the pruning below drops the index.
@@ -906,19 +905,21 @@ class Wizard:
             return
 
     def _set_partition_from_select(self, raw: str) -> None:
-        choices = self.radio_list.values
-        idx = next((i for i, (v, _) in enumerate(choices) if v == raw), -1)
+        # Resolve the picked row by matching its formatted label against the real
+        # partition objects, not by fragile index arithmetic. The old index math
+        # assumed the CUSTOM/PRIVATE header rows were always present, so it
+        # resolved to the wrong partition after "back" from the private list, and
+        # to the raw formatted label (a broken --partition=) on an all-restricted
+        # cluster where no partition is public.
         public = self.transient.get("public_parts", [])
-        has_private = PRIVATE in [v for v, _ in choices]
-        public_idx = idx - (2 if has_private else 1)
-        if 0 <= public_idx < len(public):
-            part = public[public_idx]
-            self.answers["partition"] = part["name"]
-            self.answers["_partition_obj"] = part
-        else:
-            self.answers["partition"] = raw
-            self.answers["_partition_obj"] = _get_partition(
-                self.transient.get("all_parts", []), raw)
+        all_parts = self.transient.get("all_parts", [])
+        for part in list(public) + list(all_parts):
+            if _fmt_partition(part) == raw:
+                self.answers["partition"] = part["name"]
+                self.answers["_partition_obj"] = part
+                return
+        self.answers["partition"] = raw
+        self.answers["_partition_obj"] = _get_partition(all_parts, raw)
 
     def _set_partition_from_fmt(self, raw: str) -> None:
         all_parts = self.transient.get("all_parts", [])

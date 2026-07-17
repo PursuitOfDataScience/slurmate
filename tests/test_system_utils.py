@@ -452,3 +452,89 @@ class TestLoadConfig:
         monkeypatch.setenv("HOME", str(tmp_path))
         from slurmate.system_utils import load_config
         assert load_config() == {}
+
+
+class TestDetectGpuType:
+    """_detect_gpu_type must return the GPU model, not a CPU vendor/codename,
+    when a partition advertises only count-only GRES (gpu:N)."""
+
+    def test_cpu_vendor_before_model_not_returned(self):
+        from slurmate.system_utils import _detect_gpu_type
+        assert _detect_gpu_type("intel,avx512,a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("amd,rome,a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("rome,a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("milan,h100", "gpu:4") == "h100"
+        assert _detect_gpu_type("genoa,a40", "gpu:4") == "a40"
+        assert _detect_gpu_type("cascade,v100", "gpu:4") == "v100"
+
+    def test_positive_model_shapes(self):
+        from slurmate.system_utils import _detect_gpu_type
+        assert _detect_gpu_type("l40s", "gpu:2") == "l40s"
+        assert _detect_gpu_type("rack1,t4", "gpu:1") == "t4"
+        assert _detect_gpu_type("rtx6000", "gpu:1") == "rtx6000"
+
+    def test_typed_gres_still_wins(self):
+        from slurmate.system_utils import _detect_gpu_type
+        assert _detect_gpu_type("rack5,gpfs,a40", "gpu:a40:2") == "a40"
+
+    def test_cpu_generation_tags_not_returned(self):
+        # Xeon "vN" / POWER "pN" share a GPU-family letter prefix but are CPUs.
+        from slurmate.system_utils import _detect_gpu_type
+        assert _detect_gpu_type("intel,v4,a100", "gpu:2") == "a100"
+        assert _detect_gpu_type("p9,v100", "gpu:2") == "v100"
+        assert _detect_gpu_type("amd,v5,h100", "gpu:8") == "h100"
+
+    def test_real_single_digit_gpus_still_detected(self):
+        from slurmate.system_utils import _detect_gpu_type
+        assert _detect_gpu_type("rack,t4", "gpu:1") == "t4"
+        assert _detect_gpu_type("l4", "gpu:1") == "l4"
+
+    def test_no_gpu_returns_empty(self):
+        from slurmate.system_utils import _detect_gpu_type
+        assert _detect_gpu_type("intel,avx512", "(null)") == ""
+
+
+class TestFractionalMemory:
+    def test_fractional_normalizes_to_integer_megabytes(self):
+        from slurmate.system_utils import normalize_memory, validate_memory
+        assert validate_memory("1.5G") is True
+        assert normalize_memory("1.5G") == "1536M"
+        assert normalize_memory("2.5T") == "2621440M"
+        # An integer magnitude is untouched.
+        assert normalize_memory("16G") == "16G"
+
+    def test_normalized_fractional_is_integer_only(self):
+        from slurmate.system_utils import normalize_memory
+        out = normalize_memory("0.5G")
+        assert "." not in out and out.endswith("M")
+
+
+class TestNaiveConfigParserParity:
+    """The naive fallback parser must agree with tomllib on realistic input."""
+
+    def _both(self, text):
+        try:
+            import tomllib  # Python 3.11+
+        except ModuleNotFoundError:
+            import tomli as tomllib  # 3.10 (declared dependency)
+
+        from slurmate.system_utils import _parse_config_naive
+        return _parse_config_naive(text), tomllib.loads(text)
+
+    def test_quoted_comma_in_array_element(self):
+        naive, toml = self._both('custom = ["--foo=a,b", "--bar"]\n')
+        assert naive == toml == {"custom": ["--foo=a,b", "--bar"]}
+
+    def test_interior_inline_comment_in_multiline_array(self):
+        naive, toml = self._both('modules = [\n  "cuda", # the cuda module\n  "gcc",\n]\n')
+        assert naive == toml == {"modules": ["cuda", "gcc"]}
+
+    def test_bracket_inside_string_element(self):
+        naive, toml = self._both('x = [\n  "a]b",\n  "c",\n]\n')
+        assert naive == toml == {"x": ["a]b", "c"]}
+
+    def test_unclosed_array_warns_not_silent(self, capsys):
+        from slurmate.system_utils import _parse_config_naive
+        result = _parse_config_naive('modules = [\n  "cuda",\n  "gcc"\n')
+        assert "modules" not in result
+        assert "unclosed array" in capsys.readouterr().err

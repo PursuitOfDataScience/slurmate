@@ -8,7 +8,9 @@ import tempfile
 from typing import Any
 
 from prompt_toolkit.key_binding import KeyBindings
+from rich.cells import cell_len
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -252,7 +254,7 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
             mb = _parse_mem_to_mb(str(memory))
             limit = part.get("mem_per_node_mb", 0)
             if limit and mb > limit:
-                console.print(f"  [yellow]\u26a0 Warning: Memory ({memory}) exceeds partition limit ({limit} MB per node)[/]")
+                console.print(f"  [yellow]\u26a0 Warning: Memory ({escape(str(memory))}) exceeds partition limit ({limit} MB per node)[/]")
 
     # Check Time Limit
     time_limit = answers.get("time_limit")
@@ -263,7 +265,7 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
             if limit_str:
                 limit_mins = _parse_slurm_time_to_minutes(limit_str)
                 if limit_mins > 0 and req_mins > limit_mins:
-                    console.print(f"  [yellow]\u26a0 Warning: Time limit ({time_limit}) exceeds partition limit ({limit_str})[/]")
+                    console.print(f"  [yellow]\u26a0 Warning: Time limit ({escape(str(time_limit))}) exceeds partition limit ({escape(str(limit_str))})[/]")
         except Exception:
             pass
 
@@ -279,7 +281,7 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
     # count-only ("gpu:4") and typed-without-count ("gpu:a100") forms that don't
     # populate gpu_types \u2014 so a real GPU partition isn't flagged as CPU-only.
     if gpus_val > 0 and not gpu_types and not part.get("has_gpu"):
-        console.print(f"  [yellow]\u26a0 Warning: Partition '{part.get('name')}' does not support GPUs[/]")
+        console.print(f"  [yellow]\u26a0 Warning: Partition '{escape(str(part.get('name')))}' does not support GPUs[/]")
 
     gpu_type = answers.get("gpu_type")
     if gpu_type and gpu_type.lower() != "any" and gpu_type.lower() not in {g.lower() for g in gpu_types}:
@@ -290,7 +292,7 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
         else:
             all_types = gpu_types
         if gpu_type.lower() not in {g.lower() for g in all_types}:
-            console.print(f"  [yellow]\u26a0 Warning: GPU type '{gpu_type}' not in partition list ({', '.join(all_types)})[/]")
+            console.print(f"  [yellow]\u26a0 Warning: GPU type '{escape(str(gpu_type))}' not in partition list ({escape(', '.join(all_types))})[/]")
 
 
 _REQUIRED_FIELDS = [("job_name", "Job name"), ("partition", "Partition"), ("command", "Command to run")]
@@ -349,7 +351,9 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         if i < len(script_lines):
             body.append("\n")
 
-    script_w = max(num_w + 1 + len(ln) for ln in script_lines)
+    # Measure display cells, not code points, so wide (CJK) glyphs in a command
+    # don't overflow/misalign the panel border (each renders as 2 cells).
+    script_w = max(num_w + 1 + cell_len(ln) for ln in script_lines)
     title_text = "Generated sbatch script"
     script_panel = Panel(
         body,
@@ -374,9 +378,12 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         rows.append(("ETA:", str(queue_info["eta_label"]), eta_color))
 
     label_w = max(len(label) for label, _, _ in rows)
-    summary_w = max(label_w + 2 + len(val) for label, val, _ in rows)
+    summary_w = max(label_w + 2 + cell_len(val) for label, val, _ in rows)
+    # escape() every user-controlled value: a command/flag/etc. containing Rich
+    # markup like "[/]" would otherwise raise MarkupError (aborting the run) or
+    # silently drop bracketed text (e.g. a "[abc]" glob) from the summary.
     summary = "\n".join(
-        f"[bold bright_black]{label:<{label_w}}  [/][{style}]{val}[/]"
+        f"[bold bright_black]{label:<{label_w}}  [/][{style}]{escape(val)}[/]"
         for label, val, style in rows
     )
 

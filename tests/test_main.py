@@ -473,3 +473,58 @@ class TestMissingRequired:
             )
         assert missing == []
         assert cap.get() == ""
+
+
+class TestSummaryMarkupSafety:
+    """User-controlled values must never be interpreted as Rich markup (crash)
+    or silently dropped from the rendered summary."""
+
+    def _render(self, answers):
+        import io
+
+        from rich.console import Console
+
+        from slurmate.builder import build_from_answers, estimate_su
+        from slurmate.main import _show_script_and_summary
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=True)
+        script = build_from_answers(answers)
+        _show_script_and_summary(console, script, answers, estimate_su(1, "01:00:00"))
+        return buf.getvalue()
+
+    def test_closing_tag_in_command_does_not_crash(self):
+        # '[/]' used to raise rich.errors.MarkupError and abort the run.
+        out = self._render({"job_name": "j", "partition": "p",
+                            "command": "grep '[/]' f.txt"})
+        assert "grep" in out
+
+    def test_bracket_glob_not_dropped_from_summary(self):
+        out = self._render({"job_name": "j", "partition": "p",
+                            "command": "cp data/[abc]file.txt out/"})
+        assert "[abc]file.txt" in out
+
+    def test_cjk_command_does_not_crash(self):
+        # Wide glyphs must not blow up the panel-width math.
+        out = self._render({"job_name": "j", "partition": "p",
+                            "command": "echo 训练任务开始运行数据处理流程结束"})
+        assert "训练任务" in out
+
+
+class TestPartitionLimitWarningMarkupSafety:
+    def test_bracket_gpu_type_warning_does_not_crash(self):
+        import io
+
+        from rich.console import Console
+
+        from slurmate.main import _validate_partition_limits
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, force_terminal=True)
+        answers = {
+            "gpus": 1, "gpu_type": "[/]", "memory": "16G", "time_limit": "01:00:00",
+            "_partition_obj": {"name": "debug", "cpus_per_node": 8,
+                               "mem_per_node_mb": 32768, "timelimit": "01:00:00",
+                               "gpu_types": [], "has_gpu": False},
+        }
+        # Must not raise MarkupError.
+        _validate_partition_limits(answers, console)
+        assert "GPU" in buf.getvalue()

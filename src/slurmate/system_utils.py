@@ -168,9 +168,30 @@ def normalize_memory(value: str) -> str:
     # `sbatch --mem` accepts only a K/M/G/T unit, so "16GN" would be rejected.
     m = re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", v)
     if m:
+        # `sbatch --mem` requires an INTEGER magnitude, so a fractional value like
+        # "1.5G" — which validate_memory accepts — would be rejected at submit.
+        # Convert it to whole megabytes ("1.5G" -> "1536M") so a value that
+        # validates always normalizes to a directive Slurm accepts.
+        if "." in m.group(1):
+            return f"{_parse_mem_to_mb(v)}M"
         return f"{m.group(1)}{m.group(2)}"
     # Invalid but return it anyway (validation should catch this)
     return v
+
+
+# A token shaped like a GPU model name: a known GPU-family letter prefix
+# immediately followed by a digit (a100, h100/h200, v100, l40s, t4, p100, k80,
+# b200, mi250, gh200, gb200, rtx6000/gtx…). Deliberately does NOT match bare CPU
+# tokens like "i7"/"gold6248"/"avx512" (their prefixes aren't GPU families).
+_GPU_MODEL_RE = re.compile(
+    r"^(?:a|h|v|l|t|p|k|b|rtx|gtx|mi|gh|gb|quadro|tesla)\d", re.IGNORECASE
+)
+
+# CPU-generation tags that share a GPU-family letter prefix and would otherwise
+# be misread as a GPU model: Intel Xeon "vN" (E5/E7-…-v2…v6) and IBM POWER "pN"
+# (POWER8/9/10). No real GPU uses these exact tokens — V100/P100 etc. are
+# multi-digit — so excluding them is safe.
+_CPU_GEN_TOKENS = frozenset({"v2", "v3", "v4", "v5", "v6", "p8", "p9", "p10"})
 
 
 def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = None) -> str:
@@ -208,11 +229,23 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
             if token.lower() in known_lower:
                 return token
 
+    # Positive match: a token shaped like a GPU model name (a100, h100, v100,
+    # l40s, t4, p100, k80, rtx6000, mi250, gh200, b200, quadro/tesla…). This is
+    # far more reliable than negative filtering and, crucially, wins over a CPU
+    # vendor/codename token that happens to appear first in the features list.
+    for token in tokens:
+        if token.lower() in _CPU_GEN_TOKENS:
+            continue
+        if _GPU_MODEL_RE.match(token):
+            return token
+
     # Fall back to negative filtering: reject obvious non-GPU tokens and return
     # the first plausible one. Never drops a real GPU type that lives only in
     # the features string.
     for token in tokens:
         if not re.match(r"[a-zA-Z]", token):
+            continue
+        if token.lower() in _CPU_GEN_TOKENS:
             continue
         if len(token) >= 15:
             continue
@@ -229,6 +262,12 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
         if token.lower() in {
             "ssd", "nvme", "ib", "opa", "hdr", "hdd",
             "scratch", "fat", "thin", "gpu", "cpu", "mem", "node",
+            # Bare CPU vendor / microarch-codename tokens clusters put in node
+            # features, ahead of the GPU model. Without these the negative
+            # filter would return e.g. "intel"/"rome" as the GPU type.
+            "intel", "amd", "arm",
+            "rome", "milan", "genoa", "naples", "cascade",
+            "sandybridge", "ivybridge", "nehalem", "westmere",
         }:
             continue
         return token
@@ -776,6 +815,43 @@ def _strip_inline_comment(v: str) -> str:
     return v.rstrip()
 
 
+def _split_top_level_commas(s: str) -> list[str]:
+    """Split ``s`` on commas that sit outside single/double quotes.
+
+    A raw ``str.split(',')`` shreds a quoted array element that contains a comma
+    (e.g. ``"--constraint=a,b"``) into bogus tokens with dangling quotes; this
+    keeps such elements intact, matching how a real TOML parser reads the array.
+    """
+    items: list[str] = []
+    buf: list[str] = []
+    in_single = in_double = False
+    for ch in s:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        if ch == "," and not in_single and not in_double:
+            items.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    items.append("".join(buf))
+    return items
+
+
+def _has_unquoted_char(s: str, target: str) -> bool:
+    """True if ``target`` appears in ``s`` outside single/double quotes."""
+    in_single = in_double = False
+    for ch in s:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == target and not in_single and not in_double:
+            return True
+    return False
+
+
 def _coerce_scalar(v: str) -> Any:
     """Coerce a single bare scalar token (string/int/float/bool)."""
     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
@@ -804,7 +880,7 @@ def _coerce_config_value(v: str) -> Any:
         inner = v[1:-1].strip()
         if not inner:
             return []
-        return [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
+        return [_coerce_scalar(x.strip()) for x in _split_top_level_commas(inner) if x.strip()]
     return _coerce_scalar(v)
 
 
@@ -829,9 +905,14 @@ def _parse_config_naive(text: str) -> dict[str, Any]:
     for raw in text.splitlines():
         line = raw.strip()
         if pending_key is not None:
-            pending_parts.append(line)
-            if "]" in line:
-                store(pending_key, _strip_inline_comment(" ".join(pending_parts)))
+            # Strip a trailing comment from THIS physical line (TOML comments are
+            # line-oriented). Doing it once on the joined text would let an
+            # interior line's "#" swallow the rest of the array.
+            pending_parts.append(_strip_inline_comment(line))
+            # Only a "]" outside quotes closes the array; a "]" inside a string
+            # element (e.g. "--constraint=a]b") must not terminate it early.
+            if _has_unquoted_char(" ".join(pending_parts), "]"):
+                store(pending_key, " ".join(pending_parts))
                 pending_key, pending_parts = None, []
             continue
         if not line or line.startswith("#"):
@@ -844,10 +925,21 @@ def _parse_config_naive(text: str) -> dict[str, Any]:
             k = k.strip()
             v = _strip_inline_comment(v.strip())
             # A multi-line array (`key = [` with no closing `]` on this line).
-            if v.startswith("[") and "]" not in v:
+            if v.startswith("[") and not _has_unquoted_char(v, "]"):
                 pending_key, pending_parts = k, [v]
                 continue
             store(k, v)
+
+    # An array that opened but never closed: don't silently drop it (and every
+    # subsequent line accumulated into it). Warn, matching the tomllib path,
+    # which raises + surfaces a "warning: ignoring config" message in load_config.
+    if pending_key is not None:
+        import sys
+        print(
+            f"slurmate: warning: unclosed array for '{pending_key}' in config "
+            f"— ignoring it",
+            file=sys.stderr,
+        )
 
     config: dict[str, Any] = dict(top)
     for section in ("defaults", "slurmate"):

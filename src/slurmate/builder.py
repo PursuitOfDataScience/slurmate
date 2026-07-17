@@ -32,6 +32,20 @@ def sanitize_job_name(name: str) -> str:
     return cleaned or "slurm"
 
 
+def _fold_directive(value: str) -> str:
+    """Collapse CR/LF in a #SBATCH directive value to single spaces.
+
+    Slurm stops parsing ``#SBATCH`` directives at the first non-comment line, so
+    a newline smuggled into a value (via a CLI flag or an auto-loaded config)
+    would (a) inject a bare command line into the script body and (b) silently
+    drop every directive after it — the job then runs mis-sized. Fold any CR/LF
+    to a space so the value always stays a single well-formed directive. The
+    ``command`` body and ``custom_sbatch`` flags are handled separately (command
+    is intentionally multi-line; custom flags fold their own newlines).
+    """
+    return value.replace("\r", " ").replace("\n", " ")
+
+
 def _quote_sbatch_value(value: str) -> str:
     """Double-quote a #SBATCH value only if it contains whitespace.
 
@@ -39,7 +53,11 @@ def _quote_sbatch_value(value: str) -> str:
     like ``/scratch/My Group/log`` would bind only ``/scratch/My``). Slurm strips
     the surrounding quotes and preserves ``%j``/``%A``/``%a`` patterns literally,
     so quoting is safe; paths without spaces stay unquoted for readability.
+
+    A newline in the value is folded to a space first (see :func:`_fold_directive`)
+    so it can't split the directive across lines or inject a script-body line.
     """
+    value = _fold_directive(value)
     if value and any(ch.isspace() for ch in value):
         return '"' + value.replace('"', '\\"') + '"'
     return value
@@ -134,9 +152,14 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
     if output_file:
         of = output_file.strip()
         base, ext = os.path.splitext(of)
-        has_pattern = "%" in of
-        if array_spec and not has_pattern:
-            # An explicit output_file with no Slurm pattern would make every
+        # Only a per-task token (%a, or %j which is the per-task job id) makes an
+        # explicit pattern unique across array tasks. %A alone (the array *master*
+        # id, identical for every task) or a stray literal "%" would make every
+        # task write the same file, so treat those as "no usable pattern" and
+        # still insert the per-task %A_%a tag.
+        has_task_pattern = "%a" in of or "%j" in of
+        if array_spec and not has_task_pattern:
+            # An explicit output_file with no per-task pattern would make every
             # array task write the same file (clobbering each other). Insert the
             # per-task %A_%a tag before the extension, mirroring the output_dir
             # branch, so each task gets its own log.
@@ -157,6 +180,13 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
         else:
             output_path = _in_dir(of + ".out")
             error_path = _in_dir(of + ".err")
+        # A user output_file whose extension is literally ".err" (or the array
+        # variant of it) makes the derived error path equal the output path,
+        # collapsing stdout and stderr into one file. Give stderr a distinct
+        # name so the two streams stay separate as intended.
+        if output_path is not None and output_path == error_path:
+            e_base, e_ext = os.path.splitext(error_path)
+            error_path = f"{e_base}-err{e_ext or '.err'}"
     elif output_dir:
         out_dir = output_dir.strip().rstrip("/")
         output_path = f"{out_dir}/{prefix}-{tag}.out"
@@ -247,41 +277,53 @@ def build_sbatch_script(
     if job_name:
         lines.append(f"#SBATCH --job-name={job_name}")
     if partition:
-        lines.append(f"#SBATCH --partition={partition}")
+        lines.append(f"#SBATCH --partition={_fold_directive(partition)}")
     if account:
-        lines.append(f"#SBATCH --account={account}")
+        lines.append(f"#SBATCH --account={_fold_directive(account)}")
     if qos and qos != "Default (none)":
-        lines.append(f"#SBATCH --qos={qos}")
+        lines.append(f"#SBATCH --qos={_fold_directive(qos)}")
+    # Every free-form value goes through _fold_directive: a CR/LF in memory or
+    # time_limit (both free-form strings, often config-sourced) would otherwise
+    # inject a script-body line and silently drop the directives after it, the
+    # same hazard partition/account/qos are folded against. cpus/ntasks are
+    # normally ints but are folded too for defense-in-depth against stringy
+    # callers of the builder API that bypass the CLI/TUI validators.
     if cpus is not None:
-        lines.append(f"#SBATCH --cpus-per-task={cpus}")
+        lines.append(f"#SBATCH --cpus-per-task={_fold_directive(str(cpus))}")
     if memory:
-        lines.append(f"#SBATCH --mem={memory}")
+        lines.append(f"#SBATCH --mem={_fold_directive(str(memory))}")
     if time_limit:
-        lines.append(f"#SBATCH --time={time_limit}")
+        lines.append(f"#SBATCH --time={_fold_directive(str(time_limit))}")
     if nodes is not None:
         lines.append(f"#SBATCH --nodes={nodes}")
     if ntasks_per_node is not None:
-        lines.append(f"#SBATCH --ntasks-per-node={ntasks_per_node}")
+        lines.append(f"#SBATCH --ntasks-per-node={_fold_directive(str(ntasks_per_node))}")
     elif nodes is not None and nodes > 1:
         lines.append("#SBATCH --ntasks-per-node=1")
 
     gpu_fmt = (gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")).lower()
     gpu_any = gpu_type is not None and gpu_type.lower() == "any"
+    if gpu_type:
+        gpu_type = _fold_directive(gpu_type)
+    # The exact GPU directive values the chosen format emits, used below to drop
+    # only a custom flag that *duplicates* them (not a differing user override).
+    emitted_gres: str | None = None
+    emitted_gpus: str | None = None
     if gpus > 0:
         if gpu_fmt == "gres_type" and gpu_type and not gpu_any:
-            lines.append(f"#SBATCH --gres=gpu:{gpu_type}:{gpus}")
+            emitted_gres = f"gpu:{gpu_type}:{gpus}"
+            lines.append(f"#SBATCH --gres={emitted_gres}")
         elif gpu_fmt == "gpus":
-            if gpu_type and not gpu_any:
-                lines.append(f"#SBATCH --gpus={gpu_type}:{gpus}")
-            else:
-                lines.append(f"#SBATCH --gpus={gpus}")
-        else:  # "constraint"
-            lines.append(f"#SBATCH --gres=gpu:{gpus}")
+            emitted_gpus = f"{gpu_type}:{gpus}" if (gpu_type and not gpu_any) else f"{gpus}"
+            lines.append(f"#SBATCH --gpus={emitted_gpus}")
+        else:  # "constraint" (also gres_type with no/any type)
+            emitted_gres = f"gpu:{gpus}"
+            lines.append(f"#SBATCH --gres={emitted_gres}")
             if gpu_type and not gpu_any:
                 lines.append(f"#SBATCH --constraint={gpu_type}")
 
     if array_spec:
-        lines.append(f"#SBATCH --array={array_spec}")
+        lines.append(f"#SBATCH --array={_fold_directive(array_spec)}")
 
     # Output/error are auto-derived. In a partial preview, only show them once
     # the user has actually configured an output dir/file (output_path is set).
@@ -309,17 +351,20 @@ def build_sbatch_script(
                 continue
             if gpus > 0:
                 # Derive the flag name whether written with '=' or a space, and
-                # only drop a custom flag that would *duplicate* the directive the
-                # chosen gpu_format already emits (previously the space form
-                # slipped through, and --gpus/--constraint were stripped even under
-                # formats that don't emit them).
+                # only drop a custom flag that would *exactly duplicate* the
+                # directive the chosen gpu_format already emits. A custom flag
+                # with a *different* value (e.g. --gres=gpu:h100:4 overriding the
+                # wizard's a100) is a deliberate override and must be kept, so it
+                # isn't silently discarded (previously any gpu: --gres and any
+                # --gpus were stripped, dropping user overrides).
                 name_val = re.split(r"[=\s]", flag, maxsplit=1)
                 flag_name = name_val[0].strip()
                 flag_val = name_val[1].strip() if len(name_val) > 1 else ""
-                if gpu_fmt in ("gres_type", "constraint") and flag_name == "--gres" \
-                        and flag_val.startswith("gpu"):
+                if flag_name == "--gres" and emitted_gres is not None \
+                        and flag_val == emitted_gres:
                     continue
-                if gpu_fmt == "gpus" and flag_name == "--gpus":
+                if flag_name == "--gpus" and emitted_gpus is not None \
+                        and flag_val == emitted_gpus:
                     continue
                 if gpu_fmt == "constraint" and flag_name == "--constraint" \
                         and gpu_type and not gpu_any and flag_val == gpu_type:
@@ -332,6 +377,10 @@ def build_sbatch_script(
             # Strip "(default)" annotation that the module system appends
             if mod.endswith("(default)"):
                 mod = mod[:-9]
+            # Fold any CR/LF so a module name can't inject an extra script line.
+            mod = _fold_directive(str(mod)).strip()
+            if not mod:
+                continue
             lines.append(f"module load {mod}")
 
     if env_name:

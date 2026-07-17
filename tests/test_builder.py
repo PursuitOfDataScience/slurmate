@@ -455,9 +455,19 @@ class TestCustomFlagGpuDedup:
         args.update(kw)
         return build_sbatch_script(**args)
 
-    def test_space_form_gres_deduped(self):
-        s = self._base(custom_sbatch=["--gres gpu:a100:8"])
-        assert "--gres gpu:a100:8" not in s  # dropped as a duplicate GPU request
+    def test_space_form_exact_dup_gres_deduped(self):
+        # The space form of an *exact* duplicate of the emitted directive is
+        # dropped (the builder emits --gres=gpu:v100:2 for this _base).
+        s = self._base(custom_sbatch=["--gres gpu:v100:2"])
+        assert "--gres gpu:v100:2" not in s.replace("#SBATCH --gres=gpu:v100:2", "")
+        assert "#SBATCH --gres=gpu:v100:2" in s
+
+    def test_differing_gres_override_kept(self):
+        # A custom --gres with a *different* value than the wizard emits is a
+        # deliberate override and must survive (previously it was silently
+        # dropped by the over-broad "startswith('gpu')" dedup).
+        s = self._base(custom_sbatch=["--gres=gpu:a100:8"])
+        assert "#SBATCH --gres=gpu:a100:8" in s
         assert "#SBATCH --gres=gpu:v100:2" in s
 
     def test_gpus_equals_kept_under_gres_type(self):
@@ -494,6 +504,96 @@ class TestTildeExpansion:
         s = build_from_answers({"job_name": "j", "partition": "p", "output_dir": "~/logs"})
         assert f"#SBATCH --output={tmp_path}/logs/j-%j.out" in s
         assert "~/logs" not in s
+
+
+class TestDirectiveNewlineFolding:
+    """A newline in a directive value must not inject a script-body line or
+    silently drop the #SBATCH directives that follow it."""
+
+    def _lines(self, **kw):
+        from slurmate.builder import build_sbatch_script
+        args = dict(job_name="j", partition="p", cpus=4, memory="16G",
+                    time_limit="01:00:00", command="echo hi")
+        args.update(kw)
+        return build_sbatch_script(**args).splitlines()
+
+    def test_partition_newline_folded(self):
+        lines = self._lines(partition="gpu\ntouch /tmp/PWNED")
+        assert not any(ln.strip() == "touch /tmp/PWNED" for ln in lines)
+        assert "#SBATCH --partition=gpu touch /tmp/PWNED" in lines
+        # The directives after partition must survive (sbatch stops parsing at the
+        # first non-comment line, so an injected line would drop them).
+        assert "#SBATCH --cpus-per-task=4" in lines
+        assert "#SBATCH --mem=16G" in lines
+
+    def test_account_qos_array_module_newline_folded(self):
+        lines = self._lines(account="a\nrm -rf x", qos="q\nevil",
+                            array_spec="1-4\nbad", modules=["m\ninjected"])
+        assert not any(ln.strip() == "rm -rf x" for ln in lines)
+        assert not any(ln.strip() == "evil" for ln in lines)
+        assert not any(ln.strip() == "bad" for ln in lines)
+        assert not any(ln.strip() == "injected" for ln in lines)
+        assert "module load m injected" in lines
+
+    def test_output_path_newline_folded_and_quoted(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_file": "out\nevil.log", "command": "echo hi"})
+        assert not any(ln.strip() == 'evil.log"' for ln in s.splitlines())
+        # Folded to a space, so it is quoted into a single directive.
+        assert '#SBATCH --output="out evil.log"' in s
+        assert '#SBATCH --error="out evil.err"' in s
+
+    def test_command_newline_preserved(self):
+        # The command body is intentionally multi-line and must NOT be folded.
+        lines = self._lines(command="echo a\necho b")
+        assert "echo a" in lines
+        assert "echo b" in lines
+
+    def test_memory_and_time_newline_folded(self):
+        # Free-form memory/time_limit are folded too (same injection class).
+        lines = self._lines(memory="16G\necho pwned", time_limit="1:00:00\ninjected")
+        assert not any(ln.strip() == "echo pwned" for ln in lines)
+        assert not any(ln.strip() == "injected" for ln in lines)
+        # Directives after --mem/--time must survive.
+        assert "#SBATCH --time=1:00:00 injected" in lines
+        assert "#SBATCH --nodes=1" in lines
+
+
+class TestArrayLogClobberProtection:
+    def test_master_only_pattern_gets_per_task_tag(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"array_spec": "1-4", "output_file": "run_%A.log",
+                                "command": "run"})
+        # %A alone is identical for every task; a per-task token (%a) must be added.
+        out = next(ln for ln in s.splitlines() if ln.startswith("#SBATCH --output="))
+        err = next(ln for ln in s.splitlines() if ln.startswith("#SBATCH --error="))
+        assert "%a" in out and "%a" in err
+        assert out != err
+
+    def test_per_task_pattern_trusted(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"array_spec": "1-4", "output_file": "run_%a.log",
+                                "command": "run"})
+        assert "#SBATCH --output=run_%a.log" in s
+        assert "#SBATCH --error=run_%a.err" in s
+
+
+class TestOutputErrorCollision:
+    def test_err_extension_does_not_collapse_streams(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"output_file": "run.err", "command": "run"})
+        out = next(ln for ln in s.splitlines() if ln.startswith("#SBATCH --output="))
+        err = next(ln for ln in s.splitlines() if ln.startswith("#SBATCH --error="))
+        assert out != err, "stdout and stderr must not resolve to the same file"
+
+    def test_err_extension_array_variant(self):
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"array_spec": "1-4", "output_file": "run.err",
+                                "command": "run"})
+        out = next(ln for ln in s.splitlines() if ln.startswith("#SBATCH --output="))
+        err = next(ln for ln in s.splitlines() if ln.startswith("#SBATCH --error="))
+        assert out != err
 
 
 class TestStringyNumericCoercion:
