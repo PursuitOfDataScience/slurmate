@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, overload
 
 from prompt_toolkit.key_binding import KeyBindings
 from rich.cells import cell_len
@@ -67,12 +67,43 @@ def _coerce_int(value: Any, default: int, *, field: str | None = None,
         return default
 
 
+@overload
+def _coerce_str(value: Any, default: str, *, field: str, err_console: Console) -> str: ...
+@overload
+def _coerce_str(value: Any, default: None, *, field: str, err_console: Console) -> str | None: ...
+def _coerce_str(value: Any, default: str | None, *, field: str,
+                err_console: Console) -> str | None:
+    """Coerce a CLI/config value for a free-form string field.
+
+    A scalar (str/int/float/bool) is accepted and stringified — mirroring how
+    ``_coerce_int`` leniently accepts stringy numbers — but a list/dict (or any
+    other structured value) can't become a single directive value, so it is
+    rejected with a clean error and ``sys.exit(1)`` instead of crashing the
+    builder with an AttributeError/TypeError deep in script generation. This
+    guards the free-form string fields (partition/account/qos/array/command/
+    output paths/env) the way ``_coerce_int`` already guards the numerics.
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):  # bool is an int subclass — str() is fine
+        return str(value)
+    err_console.print(
+        f"  {c.RED}✗ Error: {field} must be a string "
+        f"(got {type(value).__name__}){c.RESET}"
+    )
+    sys.exit(1)
+
+
 def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]) -> dict[str, Any]:
     err_console = Console(stderr=True)
 
     # Get values fallback from config
     args_partition = getattr(args, "partition", None)
-    partition = args_partition if args_partition is not None else config.get("partition", "")
+    partition = _coerce_str(
+        args_partition if args_partition is not None else config.get("partition", ""),
+        "", field="partition", err_console=err_console)
 
     args_cpus = getattr(args, "cpus", None)
     cpus = _coerce_int(args_cpus if args_cpus is not None else config.get("cpus", 4), 4,
@@ -108,10 +139,14 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     gpu_format = args_gpu_format if args_gpu_format is not None else config.get("gpu_format")
 
     args_output_dir = getattr(args, "output_dir", None)
-    output_dir = args_output_dir if args_output_dir is not None else config.get("output_dir", "logs")
+    output_dir = _coerce_str(
+        args_output_dir if args_output_dir is not None else config.get("output_dir", "logs"),
+        "logs", field="output_dir", err_console=err_console)
 
     args_output_file = getattr(args, "output_file", None)
-    output_file = args_output_file if args_output_file is not None else config.get("output_file")
+    output_file = _coerce_str(
+        args_output_file if args_output_file is not None else config.get("output_file"),
+        None, field="output_file", err_console=err_console)
 
     # Seed the GPU format from SLURMATE_GPU_FORMAT (default gres_type) so the
     # env var documented in the README actually takes effect in batch mode.
@@ -165,7 +200,7 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     if raw_modules is None:
         cfg_mods = config.get("modules")
         if isinstance(cfg_mods, list):
-            mods = cfg_mods
+            mods = [str(m) for m in cfg_mods]
         elif isinstance(cfg_mods, str):
             mods = [m.strip() for m in cfg_mods.split(",") if m.strip()]
         else:
@@ -174,10 +209,14 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
         mods = [m.strip() for m in raw_modules.split(",") if m.strip()]
 
     args_env_type = getattr(args, "env_type", None)
-    env_type = args_env_type if args_env_type is not None else config.get("env_type")
+    env_type = _coerce_str(
+        args_env_type if args_env_type is not None else config.get("env_type"),
+        None, field="env_type", err_console=err_console)
 
     args_env = getattr(args, "env", None)
-    env_name = args_env if args_env is not None else config.get("env_name")
+    env_name = _coerce_str(
+        args_env if args_env is not None else config.get("env_name"),
+        None, field="env", err_console=err_console)
     if env_name and not env_type:
         env_type = "conda"
 
@@ -185,7 +224,7 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     if custom_sbatch_val is None:
         cfg_custom = config.get("custom_sbatch")
         if isinstance(cfg_custom, list):
-            custom_sbatch_list = cfg_custom
+            custom_sbatch_list = [str(f) for f in cfg_custom]
         elif isinstance(cfg_custom, str):
             custom_sbatch_list = _parse_custom_flags(cfg_custom)
         else:
@@ -200,12 +239,20 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     args_command = getattr(args, "command", None)
 
     raw_job_name = args_job_name if args_job_name is not None else config.get("job_name", "")
+    account = _coerce_str(args_account if args_account is not None else config.get("account"),
+                          None, field="account", err_console=err_console)
+    qos = _coerce_str(args_qos if args_qos is not None else config.get("qos"),
+                      None, field="qos", err_console=err_console)
+    array_spec = _coerce_str(args_array if args_array is not None else config.get("array_spec"),
+                             None, field="array", err_console=err_console)
+    command = _coerce_str(args_command if args_command is not None else config.get("command", ""),
+                          "", field="command", err_console=err_console)
     return {
         "job_name": sanitize_job_name(str(raw_job_name)),
-        "account": args_account if args_account is not None else config.get("account"),
+        "account": account,
         "partition": partition,
         "_partition_obj": part_obj,
-        "qos": args_qos if args_qos is not None else config.get("qos"),
+        "qos": qos,
         "cpus": cpus,
         "memory": normalize_memory(str(memory_val)),
         "time_limit": str(time_val),
@@ -214,13 +261,13 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
         "gpus": gpus,
         "gpu_type": gpu_type or None,
         "gpu_format": gpu_format or None,
-        "array_spec": args_array if args_array is not None else config.get("array_spec"),
+        "array_spec": array_spec,
         "modules": mods,
         "env_type": env_type,
         "env_name": env_name,
         "output_dir": output_dir,
         "output_file": output_file or None,
-        "command": args_command if args_command is not None else config.get("command", ""),
+        "command": command,
         "custom_sbatch": custom_sbatch_list,
     }
 
@@ -328,16 +375,16 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
     )
 
     # Share the ordered field list with the in-TUI Review step (job_summary_rows)
-    # so both summaries agree on what's shown; append the CLI-only SU/queue rows.
+    # so both summaries agree on what's shown; append the CLI-only cost/queue rows.
     rows: list[tuple[str, str, str]] = []
     for label, val in job_summary_rows(answers):
         style = "magenta" if label == "QoS" else "cyan"
         # Collapse a multi-line command to a single summary line (the full text
         # is still in the script panel) so the panel width stays correct.
         rows.append((f"{label}:", val.replace("\n", " \u21b5 "), style))
-    rows.append(("Est. SU:", f"{su_estimate} SU", "#ffaa00"))
+    rows.append(("Estimated CPU-hours:", f"{su_estimate}", "#ffaa00"))
     if queue_info:
-        rows.append(("Queue:", f"{queue_info['running']} run / {queue_info['pending']} wait", "white"))
+        rows.append(("Queue:", f"{queue_info['running']} running / {queue_info['pending']} pending", "white"))
         eta_color = "green" if queue_info["eta_seconds"] < 3600 else "#ffaa00"
         rows.append(("ETA:", str(queue_info["eta_label"]), eta_color))
 
@@ -388,12 +435,13 @@ def _editor_command() -> list[str]:
 
 def _edit_script_in_editor(script: str) -> str:
     argv = _editor_command()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False,
+                                     encoding="utf-8") as f:
         f.write(script)
         tmp_path = f.name
     try:
         subprocess.run([*argv, tmp_path], check=False)
-        with open(tmp_path) as f:
+        with open(tmp_path, encoding="utf-8", errors="replace") as f:
             return f.read()
     except OSError as e:
         # exec failure (editor not found / not executable) — check=False only
@@ -420,7 +468,7 @@ def _save_script(script: str, default_name: str) -> None:
         dir_name = os.path.dirname(path)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(script)
         print(f"  {c.GREEN}✓ Saved to {path}{c.RESET}")
     except OSError as e:
@@ -440,7 +488,7 @@ def _save_submitted_script(script: str, job_name: str, job_id: str,
     path = os.path.join(directory, f"{safe}-{job_id}.sh")
     try:
         os.makedirs(directory, exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(script)
         return path
     except OSError as e:
@@ -527,7 +575,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-type", default=None, help="GPU type (e.g. a100, h100)")
     parser.add_argument("--gpu-format", default=None, choices=["gres_type", "constraint", "gpus"],
                         help="GPU request format")
-    parser.add_argument("--array", default=None, help="Array spec (e.g. 1-10)")
+    parser.add_argument("--array", default=None, help="Array specification (e.g. 1-10)")
     parser.add_argument("--modules", default=None, help="Comma-separated modules")
     parser.add_argument("--env", default=None, help="Conda environment")
     parser.add_argument("--env-type", default=None, choices=["conda", "mamba", "venv", "none"],
@@ -540,7 +588,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Comma-separated extra #SBATCH flags (e.g. --exclusive,--reservation=abc)")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation and submit")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Show the full summary (script, limit warnings, SU/ETA, "
+                        help="Show the full summary (script, limit warnings, CPU-hours/ETA, "
                              "missing-field reminders) without submitting")
     parser.add_argument("--print", action="store_true",
                         help="Print only the raw script to stdout and exit (nothing else)")
@@ -616,7 +664,7 @@ def main() -> None:
         print(build_from_answers(answers))
         return
 
-    # build_and_show prints the summary panel, partition-limit warnings, SU/ETA,
+    # build_and_show prints the summary panel, partition-limit warnings, CPU-hours/ETA,
     # and missing-field reminders. --dry-run stops here without submitting.
     script, queue_info = build_and_show(answers, console)
 
@@ -625,10 +673,13 @@ def main() -> None:
         return
 
     if args.yes:
-        # Unattended submit: a missing command would submit a no-op job, so make
-        # it a hard error here rather than only an advisory warning. (Partition
-        # and job name stay advisory — sbatch supplies sensible defaults.)
-        if not answers.get("command"):
+        # Unattended submit: a blank / whitespace-only / comment-only command
+        # would submit a no-op job (the builder rstrips the body to nothing), so
+        # make it a hard error here rather than only an advisory warning. Strip
+        # each line and treat a command with no real (non-comment) line as
+        # missing. (Partition and job name stay advisory — sbatch defaults them.)
+        cmd_lines = [ln.strip() for ln in str(answers.get("command") or "").splitlines()]
+        if all(not ln or ln.startswith("#") for ln in cmd_lines):
             print(f"  {c.RED}✗ Nothing to run — refusing to submit with --yes "
                   f"(pass --command){c.RESET}", file=sys.stderr)
             sys.exit(1)

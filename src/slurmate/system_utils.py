@@ -132,13 +132,17 @@ def validate_memory(value: str) -> bool:
 # Slurm's accepted --time grammar, allowing 1–2 digit lead fields:
 #   minutes | minutes:seconds | hours:minutes:seconds |
 #   days-hours | days-hours:minutes | days-hours:minutes:seconds
+# Minute/second fields are range-limited to [0-5]\d (00–59) so obviously
+# out-of-range values like "1:60:60" or "1-99:99:99" are rejected client-side,
+# not just at submit. (Lead fields stay \d+ / \d{1,2}: hours in hh:mm:ss can
+# legitimately exceed 24, and Slurm accepts a bare "0" as "no limit".)
 _TIME_PATTERNS = (
-    r"^\d+$",                       # minutes
-    r"^\d+:\d{2}$",                 # minutes:seconds
-    r"^\d+:\d{2}:\d{2}$",           # hours:minutes:seconds
-    r"^\d+-\d{1,2}$",               # days-hours
-    r"^\d+-\d{1,2}:\d{2}$",         # days-hours:minutes
-    r"^\d+-\d{1,2}:\d{2}:\d{2}$",   # days-hours:minutes:seconds
+    r"^\d+$",                          # minutes
+    r"^\d+:[0-5]\d$",                  # minutes:seconds
+    r"^\d+:[0-5]\d:[0-5]\d$",          # hours:minutes:seconds
+    r"^\d+-\d{1,2}$",                  # days-hours
+    r"^\d+-\d{1,2}:[0-5]\d$",          # days-hours:minutes
+    r"^\d+-\d{1,2}:[0-5]\d:[0-5]\d$",  # days-hours:minutes:seconds
 )
 
 
@@ -236,6 +240,11 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
     for token in tokens:
         if token.lower() in _CPU_GEN_TOKENS:
             continue
+        # Apply the same length sanity cap as the negative branch below, so a
+        # pathologically long feature token (e.g. a concatenated garbage string)
+        # can't be returned verbatim as a GPU "model".
+        if len(token) >= 15:
+            continue
         if _GPU_MODEL_RE.match(token):
             return token
 
@@ -268,6 +277,9 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
             "intel", "amd", "arm",
             "rome", "milan", "genoa", "naples", "cascade",
             "sandybridge", "ivybridge", "nehalem", "westmere",
+            # Spelled-out IBM POWER CPUs (the short p8/p9/p10 forms are in
+            # _CPU_GEN_TOKENS; "power9" etc. would otherwise pass as a GPU model).
+            "power", "power8", "power9", "power10",
         }:
             continue
         return token
@@ -517,22 +529,31 @@ MOCK_QOS = ["normal", "high", "express", "gpu", "interactive"]
 
 
 def fetch_known_qos() -> list[str]:
-    """Fetch all QoS names known to the system via sacctmgr."""
-    if not is_tool_available("sacctmgr"):
+    """Fetch all QoS names known to the system via sacctmgr.
+
+    Returns the demo ``MOCK_QOS`` only in mock mode. When sacctmgr is genuinely
+    unavailable (or errors, or lists nothing), returns ``[]`` — an *unknown* set,
+    not the demo names — so the TUI can tell "QoS set unknown" apart from a real
+    list and skip filtering live ``AllowQos`` against a demo fallback (which
+    would otherwise silently drop real, lab-specific QoS names).
+    """
+    if _force_mock():
         return list(MOCK_QOS)
+    if not is_tool_available("sacctmgr"):
+        return []
 
     stdout, _, rc = _run_command(
         ["sacctmgr", "show", "qos", "-P", "format=Name", "--noheader"]
     )
     if rc != 0:
-        return list(MOCK_QOS)
+        return []
 
     qos: list[str] = []
     for line in stdout.splitlines():
         name = line.strip()
         if name:
             qos.append(name)
-    return qos or list(MOCK_QOS)
+    return qos
 
 
 def fetch_gpu_types_for_partition(partition: str) -> list[str]:
@@ -1038,8 +1059,8 @@ def _parse_config_naive(text: str) -> dict[str, Any]:
     if pending_key is not None:
         import sys
         print(
-            f"slurmate: warning: unclosed array for '{pending_key}' in config "
-            f"— ignoring it",
+            f"slurmate: warning: unclosed array for '{pending_key}' in the "
+            f"configuration file — ignoring it",
             file=sys.stderr,
         )
 
@@ -1107,7 +1128,7 @@ def load_config() -> dict[str, Any]:
             # configured default is silently dropped with no hint to the user.
             import sys
             print(
-                f"slurmate: warning: ignoring config {p} — {e}",
+                f"slurmate: warning: ignoring configuration file {p} — {e}",
                 file=sys.stderr,
             )
             logger.debug(f"Failed to load config from {p}: {e}")

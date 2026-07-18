@@ -100,15 +100,15 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     if nodes is not None and str(nodes) != "":
         add("Nodes", nodes)
     if answers.get("ntasks_per_node"):
-        add("Tasks/node", answers.get("ntasks_per_node"))
+        add("Tasks per node", answers.get("ntasks_per_node"))
     if _gpus_int(answers) > 0:
         add("GPUs", f"{answers.get('gpus')} × {answers.get('gpu_type') or 'any'}")
         add("GPU format", answers.get("gpu_format"))
-    add("Array spec", answers.get("array_spec"))
-    add("Output dir", answers.get("output_dir"))
+    add("Array specification", answers.get("array_spec"))
+    add("Output directory", answers.get("output_dir"))
     add("Output file", answers.get("output_file"))
     add("Modules", answers.get("modules"))
-    add("Env", answers.get("env_name"))
+    add("Environment", answers.get("env_name"))
     add("Custom flags", answers.get("custom_sbatch"))
     add("Command", answers.get("command"))
     return rows
@@ -268,6 +268,12 @@ def build_sbatch_script(
             nodes = int(nodes)
         except (TypeError, ValueError):
             nodes = 1
+    # Same defensive coercion for gpu_type: a direct API caller (or a stringy
+    # value that bypassed the CLI/TUI, which already stringify it) may pass a
+    # non-string; str() it so the .lower()/_fold_directive calls below don't
+    # raise AttributeError on e.g. an int.
+    if gpu_type is not None:
+        gpu_type = str(gpu_type)
 
     # One contiguous #SBATCH block, emitted in the same order the wizard asks
     # the questions, so the live preview grows top-to-bottom without reshuffling.
@@ -374,14 +380,20 @@ def build_sbatch_script(
     if modules:
         lines.append("")
         for mod in modules:
+            # Defensive: str() first so a non-string element (from a direct API
+            # caller) can't raise on the .endswith below.
+            mod = str(mod)
             # Strip "(default)" annotation that the module system appends
             if mod.endswith("(default)"):
                 mod = mod[:-9]
             # Fold any CR/LF so a module name can't inject an extra script line.
-            mod = _fold_directive(str(mod)).strip()
+            mod = _fold_directive(mod).strip()
             if not mod:
                 continue
-            lines.append(f"module load {mod}")
+            # Shell-quote the token (matching env_name below): shell metacharacters
+            # in a module name would otherwise survive into the generated script,
+            # and a name with a space would split into two `module load` arguments.
+            lines.append(f"module load {shlex.quote(mod)}")
 
     if env_name:
         strategy = (env_type or "conda").lower()
@@ -411,10 +423,12 @@ def build_sbatch_script(
 
 def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
                 ntasks_per_node: int | None = None) -> str:
-    """Estimate Service Units (SU) cost for a job.
+    """Estimate a job's compute cost in CPU core-hours.
 
-    Service Units are typically core-hours: CPUs-per-task × tasks-per-node ×
-    nodes × hours. When ``ntasks_per_node`` is unset it defaults to 1 task.
+    Core-hours = CPUs-per-task × tasks-per-node × nodes × hours. When
+    ``ntasks_per_node`` is unset it defaults to 1 task. (Kept the ``estimate_su``
+    name for back-compat; the UI shows the cluster-agnostic "CPU-hours" rather
+    than a site-specific "SU"/billing-unit name.)
 
     Args:
         cpus: Number of CPU cores per task.
@@ -423,8 +437,12 @@ def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
         ntasks_per_node: Tasks per node (multiplies the per-task core count).
 
     Returns:
-        Formatted string representation of estimated SUs.
+        Formatted string of the estimated core-hours.
     """
+    # Clamp negative core/node counts to 0 (parity with the time clamp below) so
+    # a direct-API caller passing a negative can't yield a negative estimate.
+    cpus = max(0, cpus)
+    nodes = max(0, nodes)
     minutes = _parse_slurm_time_to_minutes(time_limit) if time_limit else 120.0
     if minutes <= 0:
         minutes = 120.0

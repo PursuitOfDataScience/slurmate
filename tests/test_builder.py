@@ -242,8 +242,8 @@ class TestJobSummaryRows:
             "modules": ["cuda/12.1"], "env_name": "ai",
             "custom_sbatch": ["--exclusive"], "command": "python x.py",
         }))
-        for key in ("Job name", "Partition", "Tasks/node", "GPUs", "GPU format",
-                    "Modules", "Custom flags", "Command", "Output dir", "Output file"):
+        for key in ("Job name", "Partition", "Tasks per node", "GPUs", "GPU format",
+                    "Modules", "Custom flags", "Command", "Output directory", "Output file"):
             assert key in rows, key
         assert rows["GPUs"] == "2 × a100"
         assert rows["Modules"] == "cuda/12.1"
@@ -533,7 +533,9 @@ class TestDirectiveNewlineFolding:
         assert not any(ln.strip() == "evil" for ln in lines)
         assert not any(ln.strip() == "bad" for ln in lines)
         assert not any(ln.strip() == "injected" for ln in lines)
-        assert "module load m injected" in lines
+        # The folded name is now shell-quoted (a space would otherwise split it
+        # into two `module load` args, and metacharacters would survive).
+        assert "module load 'm injected'" in lines
 
     def test_output_path_newline_folded_and_quoted(self):
         from slurmate.builder import build_from_answers

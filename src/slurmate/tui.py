@@ -57,31 +57,90 @@ if os.environ.get("SLURMATE_DEBUG"):
     )
 
 
+# The wizard paints no stage background of its own (_STAGE_BG = ""), so the
+# terminal's native background — including any translucency/blur the user has
+# enabled — shows through: a frosted-glass "vibrancy" look instead of a flat
+# navy fill. Set _STAGE_BG to a "bg:#…" value to restore an opaque stage. Only
+# the floating completion menu keeps a solid backing (it overlays other text and
+# would be unreadable transparent — macOS popovers are effectively opaque too).
+_STAGE_BG = ""
+_ACCENT = "#5c9dff"   # focus, current step, headers, active card border
+_TEXT = "#dfe3ec"     # primary text
+_DIM = "#7e8699"      # subtitles, pending steps, hints, quiet card titles
+_BORDER = "#414a63"   # quiet card borders (unfocused)
+_GREEN = "#54c99a"    # done / success / env + module keywords
+_AMBER = "#e0b661"    # capacity warnings
+_RED = "#ef6f7e"      # errors
+
 _TUI_STYLE = PTStyle([
-    ("status-bar", "bg:#0088ff fg:#ffffff bold"),
-    ("sidebar-done", "fg:#00ff80 bold"),
-    ("sidebar-current", "fg:#bf00ff bold"),
-    ("sidebar-pending", "fg:#8888aa"),
-    ("title", "fg:#00ffff bold"),
-    ("subtitle", "fg:#aaaaaa"),
-    ("text-area", "fg:#dddddd bg:#2a2a3a"),
-    # Distinct focused look (brighter text + a blue selection-style background)
-    # so the active input field is obvious — previously identical to unfocused.
-    ("text-area focused", "fg:#ffffff bg:#264f78 bold"),
-    ("radio-list", "fg:#ffffff"),
-    ("radio-list.selected", "fg:#00ff80 bold"),
-    ("radio-list.pointer", "fg:#bf00ff bold"),
-    ("checkbox", "fg:#888888"),
-    ("checkbox.selected", "fg:#00ff80"),
-    ("preview-header", "fg:#00ffff bold"),
-    ("preview-text", "fg:#aaaaaa"),
-    ("error", "fg:#ff4444 bold"),
-    ("warning", "fg:#ffaa00 bold"),
-    ("info", "fg:#888888"),
-    ("completion-menu", "bg:#222222 fg:#cccccc"),
-    ("completion-menu.completion", "bg:#222222 fg:#cccccc"),
-    ("completion-menu.completion.current", "bg:#0088ff fg:#ffffff bold"),
+    ("status-bar", f"fg:{_ACCENT} bold"),
+    ("sidebar-done", f"fg:{_GREEN}"),
+    ("sidebar-current", f"fg:{_ACCENT} bold"),
+    ("sidebar-pending", f"fg:{_DIM}"),
+    ("title", f"fg:{_ACCENT} bold"),
+    ("subtitle", f"fg:{_DIM}"),
+    ("text-area", f"fg:{_TEXT}"),
+    ("text-area focused", "fg:#ffffff bold"),
+    ("radio-list", f"fg:{_TEXT}"),
+    ("radio-list.selected", f"fg:{_GREEN} bold"),
+    ("radio-list.pointer", f"fg:{_ACCENT} bold"),
+    ("checkbox", f"fg:{_DIM}"),
+    ("checkbox.selected", f"fg:{_GREEN}"),
+    ("preview-header", f"fg:{_ACCENT} bold"),
+    ("preview-text", f"fg:{_DIM}"),
+    ("error", f"fg:{_RED} bold"),
+    ("warning", f"fg:{_AMBER} bold"),
+    ("info", f"fg:{_DIM}"),
+    # Rounded region "cards": a quiet border by default, accent when the card
+    # holds the focused input (a macOS-style focus ring). Interiors stay transparent.
+    ("card-border", f"fg:{_BORDER}"),
+    ("card-border-focus", f"fg:{_ACCENT}"),
+    ("card-title", f"fg:{_DIM}"),
+    ("card-title-focus", f"fg:{_ACCENT} bold"),
+    # The floating completion menu keeps an opaque backing (it overlays other text
+    # and would be unreadable transparent — macOS popovers are effectively opaque).
+    ("completion-menu", "bg:#1c2233 fg:#c8cdda"),
+    ("completion-menu.completion", "bg:#1c2233 fg:#c8cdda"),
+    ("completion-menu.completion.current", f"bg:{_ACCENT} fg:#0b0f1a bold"),
 ])
+
+
+def _card(body: Any, title: str = "", *, focused: bool = False,
+          width: Any = None, height: Any = None) -> HSplit:
+    """Wrap a container in a rounded, fill-less border 'card'.
+
+    The interior stays transparent (the terminal shows through); only the rounded
+    frame (╭╮╰╯, matching the CLI summary panels) and an optional title are drawn,
+    so each region reads as a translucent macOS-style card. ``focused`` switches
+    the border and title to the accent color — a focus ring around the active input.
+    """
+    b = "class:card-border-focus" if focused else "class:card-border"
+    t = "class:card-title-focus" if focused else "class:card-title"
+    if title:
+        top = VSplit([
+            Window(width=1, char="╭", style=b),
+            Window(width=1, char="─", style=b),
+            Window(FormattedTextControl([(t, f" {title} ")]), height=1, dont_extend_width=True),
+            Window(char="─", style=b),
+            Window(width=1, char="╮", style=b),
+        ], height=1)
+    else:
+        top = VSplit([
+            Window(width=1, char="╭", style=b),
+            Window(char="─", style=b),
+            Window(width=1, char="╮", style=b),
+        ], height=1)
+    middle = VSplit([
+        Window(width=1, char="│", style=b),
+        body,
+        Window(width=1, char="│", style=b),
+    ])
+    bottom = VSplit([
+        Window(width=1, char="╰", style=b),
+        Window(char="─", style=b),
+        Window(width=1, char="╯", style=b),
+    ], height=1)
+    return HSplit([top, middle, bottom], width=width, height=height)
 
 
 CUSTOM = "Enter partition name manually..."
@@ -246,7 +305,7 @@ STEPS: list[Step] = [
     Step("job_name", "Job name", "text", subtitle="A name for your Slurm job", required=True),
     Step("partition", "Partition", "partition"),
     Step("account", "Account", "autocomplete",
-         subtitle="Slurm account to charge (optional)",
+         subtitle="Slurm account to charge",
          fetch=fetch_user_accounts),
     Step("qos", "QoS", "select", subtitle="Quality of Service",
          choices=["Default (none)"], default="Default (none)",
@@ -259,7 +318,7 @@ STEPS: list[Step] = [
          validate=validate_memory, default="16G",
          choices=MEMORY_CHOICES),
     Step("time_limit", "Time limit", "autocomplete",
-         subtitle="e.g. 30 (min), 5:00 (mm:ss), hh:mm:ss, d-hh:mm:ss, d-hh",
+         subtitle="e.g. 30 (minutes), 5:00 (mm:ss), hh:mm:ss, d-hh:mm:ss, d-hh",
          validate=validate_time, default="02:00:00",
          choices=TIME_CHOICES),
     Step("nodes", "Nodes", "text", subtitle="Number of nodes", default="1",
@@ -273,7 +332,7 @@ STEPS: list[Step] = [
          validate=lambda v: v.strip().isdigit()),
     Step("gpu_type", "GPU type", "gpu_type", subtitle="GPU hardware type"),
     Step("gpu_format", "GPU format", "gpu_format", subtitle="Format style for GPU requests"),
-    Step("array_spec", "Array spec", "text",
+    Step("array_spec", "Array specification", "text",
          subtitle="e.g. 1-10, 1,3,5-7%4 (optional)"),
     Step("output_dir", "Output directory", "text",
          subtitle="Directory for stdout/stderr logs (optional)", default="logs", path=True),
@@ -360,11 +419,11 @@ class Wizard:
         self._review_total_lines = 0
         self._review_config_window = Window(
             FormattedTextControl(self._render_review_config),
-            width=D(weight=2), wrap_lines=True, style="bg:#1a1a2e",
+            wrap_lines=True, style=_STAGE_BG,
         )
         self._review_script_window = Window(
             FormattedTextControl(self._render_review_script, focusable=True),
-            width=D(weight=3), style="bg:#1a1a2e",
+            style=_STAGE_BG,
         )
 
         self._build_app()
@@ -621,7 +680,11 @@ class Wizard:
         if not was_skipped:
             if s.kind in ("text", "autocomplete", "ntasks_per_node"):
                 val = self._text_val()
-                if val:
+                # Mirror the forward-path guard (_confirm_and_next): only persist a
+                # value that passes the step's validator, so a malformed entry
+                # (e.g. cpus="3.5") isn't fed to _coerce's int() and crash on Back.
+                # An invalid value is simply not saved — the prior answer stands.
+                if val and (s.validate is None or s.validate(val)):
                     self.answers[s.key] = self._coerce(val, s)
             elif s.kind in ("select", "gpu_format"):
                 val = self._radio_value()
@@ -807,9 +870,20 @@ class Wizard:
             try:
                 if s.key == "qos":
                     part = self.answers.get("partition", "")
-                    raw = s.fetch(part)
-                    known = set(fetch_known_qos())
-                    raw = [q for q in raw if q in known]
+                    raw = s.fetch(part)          # AllowQos for this partition
+                    known = fetch_known_qos()    # all QoS names, or [] if unknown
+                    if any(str(q).upper() == "ALL" for q in raw):
+                        # AllowQos=ALL is a sentinel ("any QoS allowed"), not a QoS
+                        # name — offer every known QoS rather than intersecting
+                        # against a value that can never match one.
+                        raw = list(known)
+                    elif known:
+                        # Filter AllowQos against the known set, but only when we
+                        # actually know it; if sacctmgr is unavailable (known ==
+                        # []), trust scontrol's list rather than dropping real QoS
+                        # against a demo fallback.
+                        known_set = set(known)
+                        raw = [q for q in raw if q in known_set]
                     result = (["Default (none)"] + raw) if raw else []
                 elif s.key == "env_name":
                     raw = s.fetch()
@@ -850,6 +924,16 @@ class Wizard:
         elif all_parts:
             choices.extend(_fmt_partition(p) for p in all_parts)
         self.radio_list = RadioList([(c, c) for c in choices])
+        # Restore the previously-chosen partition as the highlighted row (every
+        # other step restores its prior value on Back), so a stray Enter doesn't
+        # drop into the manual-entry flow. Best-effort: match by formatted label;
+        # a no-op for a manually-typed/private partition not in the select list.
+        prev_name = self.answers.get("partition")
+        if prev_name:
+            for p in list(public) + list(all_parts):
+                if p.get("name") == prev_name:
+                    self._set_radio_default(_fmt_partition(p))
+                    break
 
     def _handle_partition_confirm(self) -> None:
         sub = self.step_cache.get("partition_sub", "select")
@@ -1037,9 +1121,9 @@ class Wizard:
     def _review_max_scroll(self) -> int:
         """Largest scroll offset that still keeps the last script line on screen."""
         info = self._review_script_window.render_info
-        # The script window's first row is a fixed "── Final Script ──" header
-        # that doesn't scroll, so the body viewport is one row shorter.
-        visible = (info.window_height - 1) if info else 0
+        # The panel title now lives in the card border (not inside the window), so
+        # the whole window height is body — no header row to subtract.
+        visible = info.window_height if info else 0
         return max(0, self._review_total_lines - max(1, visible))
 
     # ── Layout ──────────────────────────────────────────────────────
@@ -1092,23 +1176,23 @@ class Wizard:
         s = self.current_step
         visible_total = len(STEPS) - len(self._skipped_indices)
         visible_done = sum(1 for i in range(self.idx) if i not in self._skipped_indices)
-        right = f"  {visible_done + 1}/{visible_total}  {s.title}"
+        right = f"{visible_done + 1} / {visible_total}  ·  {s.title}"
         return [("class:status-bar", f"  {right}  ")]
 
-    _SIDEBAR_WIDTH = 26
+    _SIDEBAR_WIDTH = 28
 
-    def _sidebar(self) -> Window:
-        return Window(
-            FormattedTextControl(self._render_sidebar),
-            width=self._SIDEBAR_WIDTH,
-            style="bg:#1a1a2e",
+    def _sidebar(self) -> HSplit:
+        return _card(
+            Window(FormattedTextControl(self._render_sidebar), style=_STAGE_BG),
+            title="Steps",
+            width=D.exact(self._SIDEBAR_WIDTH),
         )
 
     def _render_sidebar(self) -> list[tuple[str, str]]:
-        lines: list[tuple[str, str]] = [("class:subtitle", "  Steps\n\n")]
+        lines: list[tuple[str, str]] = [("", "\n")]
         # 4 columns of prefix ("  \u2713 "); ellipsize any title that would overflow
-        # the fixed width (e.g. "Environment name/path") rather than clipping it.
-        avail = self._SIDEBAR_WIDTH - 4
+        # the card interior (width minus 2 border columns) rather than clipping it.
+        avail = self._SIDEBAR_WIDTH - 2 - 4
         for i, s in enumerate(STEPS):
             if i in self._skipped_indices:
                 continue
@@ -1116,7 +1200,7 @@ class Wizard:
             if i < self.idx:
                 lines.append(("class:sidebar-done", f"  \u2713 {title}\n"))
             elif i == self.idx:
-                lines.append(("class:sidebar-current", f"  \u25b6 {title}\n"))
+                lines.append(("class:sidebar-current", f"  \u25b8 {title}\n"))
             else:
                 lines.append(("class:sidebar-pending", f"    {title}\n"))
         return lines
@@ -1124,13 +1208,8 @@ class Wizard:
     def _content(self) -> HSplit:
         s = self.current_step
 
-        title_text = f"\n  {s.title}\n"
-        subtitle_text = f"  {s.subtitle}\n\n"
-
-        # One consistent content background (the same navy as the chrome) across
-        # the title / error / warning / review windows, so the central column
-        # isn't a patchwork of terminal-default and themed panels.
-        content_bg = "bg:#1a1a2e"
+        # Cards carry the structure now, so the stage stays fill-less/transparent.
+        content_bg = _STAGE_BG
 
         error_control: list[Window] = []
         if self.step_cache.get("error"):
@@ -1150,41 +1229,43 @@ class Wizard:
                 height=1, style=content_bg,
             ))
 
-        title_win = Window(
-            FormattedTextControl([
-                ("class:title", title_text),
-                ("class:subtitle", subtitle_text),
-            ]),
-            height=2 + (1 if subtitle_text else 0),
-            dont_extend_height=True,
-            style=content_bg,
-        )
-
-        text_active = self._is_text_active()
-        select_active = self._is_select_active()
-
-        children: list[Any] = []
+        # The Review step is itself two side-by-side cards (Job Config | Script).
         if s.kind == "review":
             return HSplit([
-                title_win,
+                Window(FormattedTextControl([("class:subtitle", f"  {s.subtitle}\n")]),
+                       height=1, dont_extend_height=True),
                 VSplit([
-                    self._review_config_window,
-                    Window(width=1, char="│", style="class:subtitle bg:#1a1a2e"),
-                    self._review_script_window,
-                ], padding=1, style=content_bg),
-            ], style=content_bg)
-        if text_active:
-            if getattr(s, "multiline", False):
-                children = [self.multiline_text_area]
-            else:
-                children = [self.text_area]
-        elif select_active:
-            children = [self.radio_list]
+                    _card(self._review_config_window, "Job Configuration", width=D(weight=2)),
+                    _card(self._review_script_window, "Final Script", focused=True, width=D(weight=3)),
+                ], padding=1),
+            ])
 
-        return HSplit(
-            [title_win] + error_control + children + [self._queue_panel(), self._preview_panel()],
-            style=content_bg,
+        # The current step: subtitle + input widget in one focused card, titled
+        # with the step name. The accent border marks it as the live field.
+        subtitle_win = Window(
+            FormattedTextControl([("class:subtitle", f" {s.subtitle}\n")]),
+            height=1, dont_extend_height=True,
         )
+        if getattr(s, "multiline", False):
+            widget: Any = self.multiline_text_area
+            card_h: Any = 9
+        elif self._is_select_active():
+            widget = self.radio_list
+            n = len(getattr(self.radio_list, "values", []) or [1])
+            card_h = min(n, 12) + 3
+        else:
+            widget = self.text_area
+            card_h = 4
+
+        column: list[Any] = [
+            _card(HSplit([subtitle_win, widget]), title=s.title, focused=True, height=card_h),
+            *error_control,
+            self._queue_panel(),
+        ]
+        # Live script preview as its own card, once there's anything to show.
+        if self.idx >= 1:
+            column.append(_card(self._preview_panel(), "Script preview (so far)"))
+        return HSplit(column)
 
     def _past_hardware_config(self) -> bool:
         """True once every resource/hardware step is done (modules onward).
@@ -1202,7 +1283,7 @@ class Wizard:
         show = bool(self.transient.get("queue_info")) and self._past_hardware_config()
         return Window(
             FormattedTextControl(self._render_queue_text),
-            style="bg:#1a1a2e",
+            style=_STAGE_BG,
             dont_extend_height=True,
             height=2 if show else 0,
         )
@@ -1213,7 +1294,7 @@ class Wizard:
             return []
         part = self.transient.get("queue_info_part", "")
         eta_sec = qinfo.get("eta_seconds", 0)
-        eta_color = "fg:#00ff80 bold" if eta_sec < 3600 else "fg:#ffaa00 bold"
+        eta_color = f"fg:{_GREEN} bold" if eta_sec < 3600 else f"fg:{_AMBER} bold"
         return [
             ("", "\n  "),
             ("class:preview-header", f"Queue status ({part}): "),
@@ -1225,7 +1306,7 @@ class Wizard:
     def _preview_panel(self) -> Window:
         return Window(
             FormattedTextControl(self._render_preview_text),
-            style="bg:#1a1a2e",
+            style=_STAGE_BG,
             height=D(min=8),
         )
 
@@ -1237,9 +1318,7 @@ class Wizard:
 
     def _render_review_config(self) -> list[tuple[str, str]]:
         """Left column of the review step \u2014 the job configuration summary."""
-        out: list[tuple[str, str]] = [
-            ("class:preview-header", " \u2500\u2500 Job Configuration \u2500\u2500\n\n")
-        ]
+        out: list[tuple[str, str]] = [("", "\n")]
         label_w = 12
         # Continuation lines of a multi-line value (e.g. a multi-command script)
         # line up under the value column instead of starting at column 0.
@@ -1272,9 +1351,7 @@ class Wizard:
         """Right column \u2014 the final script, manually scrolled by ``_review_scroll``."""
         lines = self._build_script_lines()
         self._review_total_lines = len(lines)
-        out: list[tuple[str, str]] = [
-            ("class:preview-header", " \u2500\u2500 Final Script \u2500\u2500\n")
-        ]
+        out: list[tuple[str, str]] = []
         for frags in lines[self._review_scroll:]:
             out.extend(frags)
             out.append(("", "\n"))
@@ -1289,24 +1366,24 @@ class Wizard:
                 parts = line.split("=", 1)
                 if len(parts) == 2:
                     return [
-                        ("fg:#00ff80 bold", f"  {parts[0]}="),
-                        ("fg:#ffffff", f"{parts[1]}\n"),
+                        (f"fg:{_ACCENT} bold", f"  {parts[0]}="),
+                        (f"fg:{_TEXT}", f"{parts[1]}\n"),
                     ]
                 else:
-                    return [("fg:#00ff80 bold", f"  {line}\n")]
+                    return [(f"fg:{_ACCENT} bold", f"  {line}\n")]
             else:
-                return [("fg:#555555 italic", f"  {line}\n")]
+                return [(f"fg:{_DIM} italic", f"  {line}\n")]
 
         tokens = []
         words = line.split(" ")
         for idx, word in enumerate(words):
             space = " " if idx < len(words) - 1 else ""
             if word in ("source", "conda", "activate", "mamba", "module", "load"):
-                tokens.append(("fg:#00ffff bold", word + space))
+                tokens.append((f"fg:{_GREEN} bold", word + space))
             elif word.startswith("$") or "$(" in word:
-                tokens.append(("fg:#ff0080", word + space))
+                tokens.append((f"fg:{_AMBER}", word + space))
             else:
-                tokens.append(("", word + space))
+                tokens.append((f"fg:{_TEXT}", word + space))
 
         return [("", "  ")] + tokens + [("", "\n")]
 
@@ -1330,7 +1407,7 @@ class Wizard:
         script = build_from_answers(ans, partial=True)
         if not script.strip():
             return []
-        lines: list[tuple[str, str]] = [("class:preview-header", "\n  \u2500\u2500 Script preview (so far) \u2500\u2500\n\n")]
+        lines: list[tuple[str, str]] = []
         for line in script.split("\n"):
             lines.extend(self._tokenize_bash_line(line))
         self.transient["preview_lines"] = lines
@@ -1340,7 +1417,7 @@ class Wizard:
         return Window(
             FormattedTextControl(self._render_footer),
             height=1,
-            style="bg:#1a1a2e",
+            style=_STAGE_BG,
         )
 
     def _render_footer(self) -> list[tuple[str, str]]:

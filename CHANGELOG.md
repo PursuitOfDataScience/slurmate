@@ -5,10 +5,13 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.4.0] — 2026-07-18
 
-Another correctness-focused pass: real-cluster account discovery, more robust
-Slurm-output parsing, safer script generation, and clearer CLI behavior.
+Another correctness-focused pass — real-cluster account discovery, more robust
+Slurm-output parsing, safer script generation, and clearer CLI behavior — plus a
+second adversarial audit that hardened config-driven batch mode and interactive
+navigation, a redesigned transparent "card" wizard, and cluster-agnostic wording
+throughout.
 
 ### Fixed
 
@@ -62,6 +65,34 @@ Slurm-output parsing, safer script generation, and clearer CLI behavior.
 - **TUI** — the live preview refreshes after backward navigation; a skipped
   `env_name` no longer captures another step's leftover text; QoS choices are
   re-fetched when the partition changes.
+- **Batch mode crashed on a wrong-typed config value** — a TOML array (or wrong
+  scalar) for a free-form field (`command`, `partition`, `account`, `qos`,
+  `array_spec`, output paths, `env`/`env_type`) now produces a clean
+  `✗ Error: <field> must be a string` and exit 1 instead of an uncaught
+  `AttributeError`/`TypeError` traceback on `--print`/`--dry-run`/`--yes`.
+- **Wizard crashed on "go back" from an invalid numeric field** — pressing Esc /
+  Shift-Tab after typing a non-integer into CPU cores / Nodes / Tasks-per-node no
+  longer raises `ValueError`; `_go_back` now mirrors the forward validator guard
+  (an invalid value is simply not saved, so the prior answer stands).
+- **Empty QoS picker on `AllowQos=ALL`** (Slurm's default for most partitions) —
+  the wizard now offers the known QoS instead of only `Default (none)`, and when
+  `sacctmgr` is unavailable it trusts `scontrol`'s list rather than filtering
+  real, lab-specific QoS against the demo names.
+- **Crash saving/editing the script under a non-UTF-8 locale** — the temp-file
+  and saved-script I/O now force `encoding="utf-8"` (matching the already-hardened
+  subprocess paths), so a non-ASCII byte no longer raises a `UnicodeError` — in
+  the worst case *after* `sbatch` had already accepted the job.
+- **`validate_time` accepted out-of-range fields** — `1:60:60` / `1-99:99:99`
+  are now rejected client-side (minute/second fields are `[0-5]\d`); a bare `0`
+  (Slurm's "no limit") is still accepted.
+- **`_detect_gpu_type` false positives** — a spelled-out CPU codename (`power9`)
+  and a pathologically long feature token are no longer surfaced as GPU models.
+- **`--yes` submitted a no-op for a blank/comment-only command** — a whitespace-
+  or `#comment`-only command is now the same hard error as an empty one.
+- **Module names are shell-quoted** in `module load` (matching `env_name`), and
+  the partition step restores your prior selection on "go back" instead of
+  resetting the cursor to "Enter manually…". `build_sbatch_script` also coerces a
+  non-string `gpu_type` and clamps a negative core/node count in the cost estimate.
 
 ### Changed
 
@@ -72,6 +103,19 @@ Slurm-output parsing, safer script generation, and clearer CLI behavior.
   hard error rather than silently submitting a no-op job.
 - **`SLURMATE_NO_BANNER`** — honours affirmative values (`1`/`true`/`yes`/`on`)
   only, so `SLURMATE_NO_BANNER=0` no longer suppresses the banner.
+- **Redesigned wizard UI** — each region (Steps, the current field, the live
+  preview, and the Review columns) is now a rounded, fill-less "card", so the
+  terminal's own background (including any translucency/blur) shows through
+  instead of a flat navy fill. The palette is refined and desaturated — one blue
+  accent carries focus/headers/the current step; green/amber/red are reserved for
+  state — replacing the previous pure-neon look. The active input card carries an
+  accent focus-ring border so it's always clear which field is live.
+- **Cluster-agnostic wording** — dropped the misleading "(optional)" from the
+  Account field (accounting-enforced clusters reject jobs without a valid
+  account); the summary now shows **Estimated CPU-hours** instead of the
+  site-specific "SU"; and abbreviated labels are spelled out in full ("Tasks per
+  node", "Array specification", "Output directory", "Environment", and
+  "N running / M pending").
 
 ## [0.3.0] — 2026-06-23
 
@@ -391,6 +435,7 @@ Slurm, and the wizard's visuals are cleaner.
 - `ruff` and `mypy` CI checks.
 - Test suite with fixtures for partition, queue, and GPU type parsing.
 
+[0.4.0]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.1.0...v0.2.0
