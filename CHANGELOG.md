@@ -5,6 +5,35 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.4.1] — 2026-07-18
+
+A visual-polish release for the wizard TUI. No behavioral or CLI changes — every
+job it generates is byte-for-byte identical to 0.4.0; only the on-screen colors
+and card layout change.
+
+### Changed
+
+- **Multi-hue wizard palette** — the interactive wizard no longer renders as one
+  flat wall of blue. Each structural region now owns a distinct, harmonized hue:
+  teal for the header/brand and status labels, violet for the Steps sidebar,
+  pink for the progress counter, green for completed steps and the live script
+  preview, amber for warnings and the review "Job Configuration" card, and red
+  for errors. Blue is now reserved exclusively for the one element your keys
+  actually drive — the focused input/selection — so focus is unambiguous.
+- **Two-tone header** — the "Slurmate" brand sits in teal with a dimmed tagline,
+  and the right-aligned progress counter is pink, echoing the startup banner's
+  gradient instead of a single flat bar.
+- **Snugger review step** — the "Job Configuration" and "Final Script" cards are
+  sized to their content (config summary centered vertically) rather than sprawling
+  as two mostly-empty boxes; config values are clipped horizontally instead of
+  wrapping (the full, untruncated value is always visible in the Final Script
+  card alongside). A top margin and inter-region spacing give the header room to
+  breathe.
+- **`_card()` internals** — regions now take an explicit accent `color` for their
+  border and title (replacing the old `card-border`/`card-title` style classes);
+  card interiors remain transparent so the terminal's own (possibly translucent)
+  background shows through.
+
 ## [0.4.0] — 2026-07-18
 
 Another correctness-focused pass — real-cluster account discovery, more robust

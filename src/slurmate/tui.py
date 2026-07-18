@@ -64,18 +64,28 @@ if os.environ.get("SLURMATE_DEBUG"):
 # the floating completion menu keeps a solid backing (it overlays other text and
 # would be unreadable transparent — macOS popovers are effectively opaque too).
 _STAGE_BG = ""
-_ACCENT = "#5c9dff"   # focus, current step, headers, active card border
+# Each structural region of the wizard owns a distinct hue, so the screen reads
+# as several colored sections instead of one flat wall of blue. Blue is now
+# reserved for the element the user's keys actually drive (the active input /
+# selection); every other region gets its own color. All hues sit at a similar
+# mid brightness so they harmonize and stay legible over the terminal's own
+# (possibly translucent) background — the cards paint no fill of their own.
+_ACCENT = "#5c9dff"   # blue   — the active/focused input card + current selection
+_TEAL = "#3bc4c4"     # teal   — the header / brand bar and status labels
+_VIOLET = "#a889f5"   # violet — the Steps sidebar + current-step marker
+_PINK = "#ee85b5"     # pink   — the header progress counter
+_GREEN = "#54c99a"    # green  — done steps, the script-preview card, shell keywords
+_AMBER = "#e0b661"    # amber  — warnings, queue ETA, $variables, the review config card
+_RED = "#ef6f7e"      # red    — errors
 _TEXT = "#dfe3ec"     # primary text
-_DIM = "#7e8699"      # subtitles, pending steps, hints, quiet card titles
-_BORDER = "#414a63"   # quiet card borders (unfocused)
-_GREEN = "#54c99a"    # done / success / env + module keywords
-_AMBER = "#e0b661"    # capacity warnings
-_RED = "#ef6f7e"      # errors
+_DIM = "#7e8699"      # subtitles, pending steps, hints
+_BORDER = "#414a63"   # fallback border for an uncolored card
 
 _TUI_STYLE = PTStyle([
-    ("status-bar", f"fg:{_ACCENT} bold"),
+    ("status-bar", f"fg:{_TEAL} bold"),        # header brand
+    ("status-meter", f"fg:{_PINK} bold"),      # header progress counter
     ("sidebar-done", f"fg:{_GREEN}"),
-    ("sidebar-current", f"fg:{_ACCENT} bold"),
+    ("sidebar-current", f"fg:{_VIOLET} bold"),
     ("sidebar-pending", f"fg:{_DIM}"),
     ("title", f"fg:{_ACCENT} bold"),
     ("subtitle", f"fg:{_DIM}"),
@@ -86,17 +96,11 @@ _TUI_STYLE = PTStyle([
     ("radio-list.pointer", f"fg:{_ACCENT} bold"),
     ("checkbox", f"fg:{_DIM}"),
     ("checkbox.selected", f"fg:{_GREEN}"),
-    ("preview-header", f"fg:{_ACCENT} bold"),
+    ("preview-header", f"fg:{_TEAL} bold"),    # queue-status labels
     ("preview-text", f"fg:{_DIM}"),
     ("error", f"fg:{_RED} bold"),
     ("warning", f"fg:{_AMBER} bold"),
     ("info", f"fg:{_DIM}"),
-    # Rounded region "cards": a quiet border by default, accent when the card
-    # holds the focused input (a macOS-style focus ring). Interiors stay transparent.
-    ("card-border", f"fg:{_BORDER}"),
-    ("card-border-focus", f"fg:{_ACCENT}"),
-    ("card-title", f"fg:{_DIM}"),
-    ("card-title-focus", f"fg:{_ACCENT} bold"),
     # The floating completion menu keeps an opaque backing (it overlays other text
     # and would be unreadable transparent — macOS popovers are effectively opaque).
     ("completion-menu", "bg:#1c2233 fg:#c8cdda"),
@@ -105,17 +109,22 @@ _TUI_STYLE = PTStyle([
 ])
 
 
-def _card(body: Any, title: str = "", *, focused: bool = False,
-          width: Any = None, height: Any = None) -> HSplit:
+def _card(body: Any, title: str = "", *, color: str | None = None,
+          focused: bool = False, width: Any = None, height: Any = None) -> HSplit:
     """Wrap a container in a rounded, fill-less border 'card'.
 
     The interior stays transparent (the terminal shows through); only the rounded
     frame (╭╮╰╯, matching the CLI summary panels) and an optional title are drawn,
-    so each region reads as a translucent macOS-style card. ``focused`` switches
-    the border and title to the accent color — a focus ring around the active input.
+    so each region reads as a translucent macOS-style card. ``color`` sets the
+    card's accent hue for both its border and title, giving each region its own
+    color; ``focused`` overrides that with the blue focus accent and bolds the
+    title — a focus ring around the element the user's keys currently drive.
     """
-    b = "class:card-border-focus" if focused else "class:card-border"
-    t = "class:card-title-focus" if focused else "class:card-title"
+    hue = _ACCENT if focused else (color or _BORDER)
+    b = f"fg:{hue}"
+    # A colored or focused card gets a matching bold title; a plain default card
+    # keeps a quiet dim title so it recedes.
+    t = f"fg:{hue} bold" if (focused or color) else f"fg:{_DIM}"
     if title:
         top = VSplit([
             Window(width=1, char="╭", style=b),
@@ -417,9 +426,14 @@ class Wizard:
         # up/down/page key bindings).
         self._review_scroll = 0
         self._review_total_lines = 0
+        # No wrapping in the config summary: a long value (e.g. the command) is
+        # clipped horizontally rather than flowing onto extra lines. That keeps
+        # the rendered height equal to the logical line count, so the review step
+        # can size this card snugly to its content (see _content). The full,
+        # untruncated value is always visible in the Final Script card alongside.
         self._review_config_window = Window(
             FormattedTextControl(self._render_review_config),
-            wrap_lines=True, style=_STAGE_BG,
+            wrap_lines=False, dont_extend_height=True, style=_STAGE_BG,
         )
         self._review_script_window = Window(
             FormattedTextControl(self._render_review_script, focusable=True),
@@ -1146,7 +1160,9 @@ class Wizard:
         return Layout(
             FloatContainer(
                 HSplit([
+                    Window(height=1),   # top margin — keep the header off the top edge
                     self._header(),
+                    Window(height=1),   # breathing room between the header and the cards
                     VSplit([self._sidebar(), self._content()], padding=1),
                     self._footer(),
                 ]),
@@ -1156,8 +1172,9 @@ class Wizard:
         )
 
     def _header(self) -> VSplit:
-        # Reuse the status-bar class rather than re-declaring its colors inline,
-        # so the two definitions can't drift apart.
+        # The brand sits in the header's teal (status-bar); the progress counter
+        # on the right gets its own pink (status-meter) so the two ends of the bar
+        # echo the banner's pink→cyan gradient instead of a single flat color.
         return VSplit([
             Window(
                 FormattedTextControl(self._render_header_left),
@@ -1165,19 +1182,23 @@ class Wizard:
             ),
             Window(
                 FormattedTextControl(self._render_header_right),
-                height=1, style="class:status-bar", align=WindowAlign.RIGHT,
+                height=1, style="class:status-meter", align=WindowAlign.RIGHT,
             ),
         ])
 
     def _render_header_left(self) -> list[tuple[str, str]]:
-        return [("class:status-bar", "  \u26a1  Slurmate \u2014 sbatch wizard")]
+        # Two-tone brand: the name in the header's teal, the tagline dimmed.
+        return [
+            ("class:status-bar", "  \u26a1  Slurmate"),
+            ("class:subtitle", "  \u2014 sbatch wizard"),
+        ]
 
     def _render_header_right(self) -> list[tuple[str, str]]:
         s = self.current_step
         visible_total = len(STEPS) - len(self._skipped_indices)
         visible_done = sum(1 for i in range(self.idx) if i not in self._skipped_indices)
         right = f"{visible_done + 1} / {visible_total}  ·  {s.title}"
-        return [("class:status-bar", f"  {right}  ")]
+        return [("class:status-meter", f"  {right}  ")]
 
     _SIDEBAR_WIDTH = 28
 
@@ -1185,6 +1206,7 @@ class Wizard:
         return _card(
             Window(FormattedTextControl(self._render_sidebar), style=_STAGE_BG),
             title="Steps",
+            color=_VIOLET,
             width=D.exact(self._SIDEBAR_WIDTH),
         )
 
@@ -1231,17 +1253,31 @@ class Wizard:
 
         # The Review step is itself two side-by-side cards (Job Config | Script).
         if s.kind == "review":
+            # Size both cards to the taller column's content and let a flexible
+            # spacer below take the rest, so they read as snug panels rather than
+            # two mostly-empty boxes. When the script is taller than the screen the
+            # spacer collapses to zero and the Final Script card fills + scrolls.
+            config_lines = sum(t.count("\n") for _, t in self._render_review_config())
+            script_lines = len(self._build_script_lines())
+            body_h = max(config_lines, script_lines) + 2  # +2 for the card borders
+            # The script column usually drives the height, so the shorter config
+            # summary is centered vertically inside its card (flex spacers above and
+            # below) — balanced breathing room instead of a block crammed at the top.
+            config_body = HSplit([Window(), self._review_config_window, Window()])
             return HSplit([
                 Window(FormattedTextControl([("class:subtitle", f"  {s.subtitle}\n")]),
                        height=1, dont_extend_height=True),
+                Window(height=1),  # gap between the subtitle and the cards
                 VSplit([
-                    _card(self._review_config_window, "Job Configuration", width=D(weight=2)),
+                    _card(config_body, "Job Configuration", color=_AMBER, width=D(weight=2)),
                     _card(self._review_script_window, "Final Script", focused=True, width=D(weight=3)),
-                ], padding=1),
+                ], padding=1, height=D(preferred=body_h, max=body_h)),
+                Window(),  # spacer — keeps the footer pinned to the bottom
             ])
 
         # The current step: subtitle + input widget in one focused card, titled
-        # with the step name. The accent border marks it as the live field.
+        # with the step name. The blue focus ring marks it as the live field —
+        # the one region that stays blue, since blue now means "your keys act here".
         subtitle_win = Window(
             FormattedTextControl([("class:subtitle", f" {s.subtitle}\n")]),
             height=1, dont_extend_height=True,
@@ -1262,9 +1298,15 @@ class Wizard:
             *error_control,
             self._queue_panel(),
         ]
-        # Live script preview as its own card, once there's anything to show.
+        # Live script preview as its own card, once there's anything to show. It
+        # grows to fill the leftover height, which also pins the footer to the
+        # bottom. Before the preview exists (the first step), a flexible spacer
+        # takes that role so the footer still lands at the bottom instead of
+        # floating up with dead space beneath it.
         if self.idx >= 1:
-            column.append(_card(self._preview_panel(), "Script preview (so far)"))
+            column.append(_card(self._preview_panel(), "Script preview (so far)", color=_GREEN))
+        else:
+            column.append(Window())
         return HSplit(column)
 
     def _past_hardware_config(self) -> bool:
