@@ -668,6 +668,14 @@ class TestNoMockLeakOnRealCluster:
         from slurmate.system_utils import MOCK_ACCOUNTS, fetch_user_accounts
         assert fetch_user_accounts() == list(MOCK_ACCOUNTS)
 
+    def test_queue_eta_unknown_when_tools_absent(self, monkeypatch, mocker):
+        import slurmate.system_utils as su
+        monkeypatch.delenv("SLURMATE_MOCK", raising=False)
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        info = su.fetch_queue_eta("gpu")
+        assert info["eta_label"] == "unknown"
+        assert info["running"] == 0 and info["pending"] == 0
+
 
 class TestMemPerCoreAdvisory:
     """A5: warn when memory-per-core is well above the node's; silent when proportional."""

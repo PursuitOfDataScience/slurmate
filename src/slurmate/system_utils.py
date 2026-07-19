@@ -837,7 +837,11 @@ MOCK_QUEUE_INFO = {
 def fetch_queue_eta(partition: str, req_nodes: int = 1) -> dict[str, Any]:
     """Estimate queue wait time for a partition based on squeue / sinfo data."""
     if not is_tool_available("squeue") or not is_tool_available("sinfo"):
-        return dict(MOCK_QUEUE_INFO)
+        # Demo ETA only under SLURMATE_MOCK; on a real cluster missing squeue/sinfo
+        # report "unknown" rather than a fabricated queue depth / wait time.
+        if _force_mock():
+            return dict(MOCK_QUEUE_INFO)
+        return {"running": 0, "pending": 0, "eta_seconds": 0, "eta_label": "unknown"}
 
     stdout, _, _ = _run_command(
         ["squeue", "-p", partition, "-o", "%T|%M|%l|%D", "--noheader"]

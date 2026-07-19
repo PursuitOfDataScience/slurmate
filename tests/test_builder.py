@@ -712,3 +712,11 @@ class TestClusterAgnosticBuilder:
         assert "#SBATCH --gres=gpu:a100:2" in s
         assert "#SBATCH --constraint" not in s
         assert "#SBATCH --mem-per-cpu" not in s
+
+    def test_node_and_gpu_constraint_merge(self):
+        # A node -C plus gpu_format=constraint must produce ONE merged --constraint,
+        # not two conflicting lines (Slurm would keep only the last, dropping the node).
+        s = self._base(gpus=2, gpu_type="a100", gpu_format="constraint", constraint="cpu")
+        assert s.count("#SBATCH --constraint=") == 1
+        assert "#SBATCH --constraint=cpu&a100" in s
+        assert "#SBATCH --gres=gpu:2" in s

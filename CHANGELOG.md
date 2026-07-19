@@ -35,10 +35,13 @@ full audit and the rationale behind each fix.
   `"$(conda info --base)/etc/profile.d/conda.sh"` before `conda activate <env>`, replacing
   the legacy bare `source activate <env>` that silently no-ops on modern conda (4.4+) in a
   non-login `#!/bin/bash` job (the common batch case).
-- **No demo data on real clusters** — mock accounts/partitions/modules/GPU-types now
-  appear ONLY under `SLURMATE_MOCK`. When a real SLURM query is unavailable or errors, the
-  corresponding picker is empty (type your own) instead of showing fake values that can't
-  be submitted under — most importantly, no fake `--account`.
+- **No demo data on real clusters** — mock accounts/partitions/modules/GPU-types/queue-ETA
+  now appear ONLY under `SLURMATE_MOCK`. When a real SLURM query is unavailable or errors,
+  the corresponding picker is empty (type your own) / the ETA reads "unknown", instead of
+  showing fake values that can't be submitted under — most importantly, no fake `--account`.
+- **Node and GPU constraints merge** — a node `--constraint` combined with a GPU-as-
+  constraint (`--gpu-format constraint`) now emits a single `--constraint=a&b` directive
+  instead of two conflicting lines (Slurm would otherwise keep only the last).
 - **A user-supplied memory flag wins** — a `--mem`/`--mem-per-cpu` entry in the custom
   flags suppresses the auto memory directive, so a script never sets both at once.
 - **`module avail` parsing** tolerates Lmod terse extras (trailing `/` family short names,

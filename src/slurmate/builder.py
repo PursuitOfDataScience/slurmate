@@ -333,11 +333,14 @@ def build_sbatch_script(
     elif nodes is not None and nodes > 1:
         lines.append("#SBATCH --ntasks-per-node=1")
 
-    # A node-feature --constraint (e.g. NERSC Perlmutter's mandatory `-C cpu`/`-C gpu`,
-    # or an arch/fabric tag). Independent of the GPU "constraint" format below; if a
-    # user sets both, they're responsible for combining them (Slurm keeps the last).
+    # Node-feature constraint(s) (Slurm -C), e.g. NERSC Perlmutter's mandatory
+    # `-C cpu`/`-C gpu`. Collected here and emitted once *after* the GPU block, so a
+    # GPU-as-constraint (gpu_format="constraint") MERGES with a node -C via "&"
+    # rather than emitting a second, conflicting --constraint line (Slurm would
+    # otherwise keep only the last one, silently dropping the node feature).
+    constraint_parts: list[str] = []
     if constraint:
-        lines.append(f"#SBATCH --constraint={_fold_directive(str(constraint))}")
+        constraint_parts.append(_fold_directive(str(constraint)))
 
     gpu_fmt = (gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")).lower()
     gpu_any = gpu_type is not None and gpu_type.lower() == "any"
@@ -367,7 +370,11 @@ def build_sbatch_script(
             emitted_gres = f"gpu:{gpus}"
             lines.append(f"#SBATCH --gres={emitted_gres}")
             if typed:
-                lines.append(f"#SBATCH --constraint={gpu_type}")
+                constraint_parts.append(str(gpu_type))
+
+    # Emit the merged node/GPU constraint as a single directive.
+    if constraint_parts:
+        lines.append(f"#SBATCH --constraint={'&'.join(constraint_parts)}")
 
     if array_spec:
         lines.append(f"#SBATCH --array={_fold_directive(array_spec)}")
