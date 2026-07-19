@@ -94,7 +94,11 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     if qos and qos != "Default (none)":
         add("QoS", qos)
     add("CPUs", answers.get("cpus"))
-    add("Memory", answers.get("memory"))
+    # Mirror the builder: --mem-per-cpu takes precedence over --mem when set.
+    if answers.get("mem_per_cpu"):
+        add("Mem per CPU", answers.get("mem_per_cpu"))
+    else:
+        add("Memory", answers.get("memory"))
     add("Time limit", answers.get("time_limit"))
     nodes = answers.get("nodes")
     if nodes is not None and str(nodes) != "":
@@ -104,6 +108,7 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     if _gpus_int(answers) > 0:
         add("GPUs", f"{answers.get('gpus')} × {answers.get('gpu_type') or 'any'}")
         add("GPU format", answers.get("gpu_format"))
+    add("Constraint", answers.get("constraint"))
     add("Array specification", answers.get("array_spec"))
     add("Output directory", answers.get("output_dir"))
     add("Output file", answers.get("output_file"))
@@ -221,6 +226,8 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
         env_name=answers.get("env_name"),
         env_type=answers.get("env_type"),
         gpu_format=answers.get("gpu_format"),
+        constraint=answers.get("constraint"),
+        mem_per_cpu=opt("mem_per_cpu", None),
         command=answers.get("command", ""),
         partial=partial,
     )
@@ -246,6 +253,8 @@ def build_sbatch_script(
     env_name: str | None = None,
     env_type: str | None = None,
     gpu_format: str | None = None,
+    constraint: str | None = None,
+    mem_per_cpu: str | None = None,
     command: str = "",
     partial: bool = False,
 ) -> str:
@@ -296,7 +305,24 @@ def build_sbatch_script(
     # callers of the builder API that bypass the CLI/TUI validators.
     if cpus is not None:
         lines.append(f"#SBATCH --cpus-per-task={_fold_directive(str(cpus))}")
-    if memory:
+    # If the user supplied their own memory directive via custom flags, don't also
+    # emit the auto one: Slurm rejects a script that sets both --mem and
+    # --mem-per-cpu, so a user override wins (mirrors the GPU-flag dedup below).
+    _cs_for_mem = custom_sbatch if isinstance(custom_sbatch, list) else []
+    if isinstance(custom_sbatch, str):
+        from .tui import _parse_custom_flags
+        _cs_for_mem = _parse_custom_flags(custom_sbatch)
+    _custom_mem = any(
+        str(f).strip().startswith(("--mem=", "--mem-per-cpu=")) for f in _cs_for_mem
+    )
+    # Memory: --mem-per-cpu takes precedence over --mem when set (Slurm treats the
+    # two as mutually exclusive). A blank memory omits the directive entirely — what
+    # whole-node/exclusive sites need: e.g. TACC rejects any script that sets --mem.
+    if _custom_mem:
+        pass  # a custom --mem / --mem-per-cpu flag is emitted below instead
+    elif mem_per_cpu:
+        lines.append(f"#SBATCH --mem-per-cpu={_fold_directive(str(mem_per_cpu))}")
+    elif memory:
         lines.append(f"#SBATCH --mem={_fold_directive(str(memory))}")
     if time_limit:
         lines.append(f"#SBATCH --time={_fold_directive(str(time_limit))}")
@@ -307,6 +333,12 @@ def build_sbatch_script(
     elif nodes is not None and nodes > 1:
         lines.append("#SBATCH --ntasks-per-node=1")
 
+    # A node-feature --constraint (e.g. NERSC Perlmutter's mandatory `-C cpu`/`-C gpu`,
+    # or an arch/fabric tag). Independent of the GPU "constraint" format below; if a
+    # user sets both, they're responsible for combining them (Slurm keeps the last).
+    if constraint:
+        lines.append(f"#SBATCH --constraint={_fold_directive(str(constraint))}")
+
     gpu_fmt = (gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")).lower()
     gpu_any = gpu_type is not None and gpu_type.lower() == "any"
     if gpu_type:
@@ -315,17 +347,26 @@ def build_sbatch_script(
     # only a custom flag that *duplicates* them (not a differing user override).
     emitted_gres: str | None = None
     emitted_gpus: str | None = None
+    emitted_gpus_per_node: str | None = None
+    emitted_gpus_per_task: str | None = None
     if gpus > 0:
-        if gpu_fmt == "gres_type" and gpu_type and not gpu_any:
+        typed = bool(gpu_type and not gpu_any)
+        if gpu_fmt == "gpus":
+            emitted_gpus = f"{gpu_type}:{gpus}" if typed else f"{gpus}"
+            lines.append(f"#SBATCH --gpus={emitted_gpus}")
+        elif gpu_fmt == "gpus_per_node":
+            emitted_gpus_per_node = f"{gpu_type}:{gpus}" if typed else f"{gpus}"
+            lines.append(f"#SBATCH --gpus-per-node={emitted_gpus_per_node}")
+        elif gpu_fmt == "gpus_per_task":
+            emitted_gpus_per_task = f"{gpu_type}:{gpus}" if typed else f"{gpus}"
+            lines.append(f"#SBATCH --gpus-per-task={emitted_gpus_per_task}")
+        elif gpu_fmt == "gres_type" and typed:
             emitted_gres = f"gpu:{gpu_type}:{gpus}"
             lines.append(f"#SBATCH --gres={emitted_gres}")
-        elif gpu_fmt == "gpus":
-            emitted_gpus = f"{gpu_type}:{gpus}" if (gpu_type and not gpu_any) else f"{gpus}"
-            lines.append(f"#SBATCH --gpus={emitted_gpus}")
         else:  # "constraint" (also gres_type with no/any type)
             emitted_gres = f"gpu:{gpus}"
             lines.append(f"#SBATCH --gres={emitted_gres}")
-            if gpu_type and not gpu_any:
+            if typed:
                 lines.append(f"#SBATCH --constraint={gpu_type}")
 
     if array_spec:
@@ -372,6 +413,12 @@ def build_sbatch_script(
                 if flag_name == "--gpus" and emitted_gpus is not None \
                         and flag_val == emitted_gpus:
                     continue
+                if flag_name == "--gpus-per-node" and emitted_gpus_per_node is not None \
+                        and flag_val == emitted_gpus_per_node:
+                    continue
+                if flag_name == "--gpus-per-task" and emitted_gpus_per_task is not None \
+                        and flag_val == emitted_gpus_per_task:
+                    continue
                 if gpu_fmt == "constraint" and flag_name == "--constraint" \
                         and gpu_type and not gpu_any and flag_val == gpu_type:
                     continue
@@ -397,12 +444,16 @@ def build_sbatch_script(
 
     if env_name:
         strategy = (env_type or "conda").lower()
-        if strategy == "conda":
+        if strategy in ("conda", "mamba"):
+            # Robust activation for a non-login batch shell (the script is
+            # `#!/bin/bash`): source conda.sh first so the `conda`/`mamba` shell
+            # functions are defined, then activate. Bare `source activate <env>`
+            # (the old form) silently fails on modern conda (4.4+) whenever the
+            # job's shell hasn't been conda-initialized — i.e. the common batch
+            # case — leaving the job in the base/system Python.
             lines.append("")
-            lines.append(f"source activate {shlex.quote(env_name)}")
-        elif strategy == "mamba":
-            lines.append("")
-            lines.append(f"mamba activate {shlex.quote(env_name)}")
+            lines.append('source "$(conda info --base)/etc/profile.d/conda.sh"')
+            lines.append(f"{strategy} activate {shlex.quote(env_name)}")
         elif strategy in ("virtualenv (venv)", "venv"):
             lines.append("")
             lines.append(f"source {shlex.quote(env_name + '/bin/activate')}")

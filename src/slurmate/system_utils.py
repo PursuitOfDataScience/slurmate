@@ -3,6 +3,7 @@ from __future__ import annotations
 import getpass
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -410,18 +411,50 @@ def validate_job_config(
         if known and str(gpu_type).lower() not in known:
             out.append(("error", f"GPU type '{gpu_type}' not in partition list ({', '.join(all_types)})"))
 
+    # Memory-per-core advisory: on shared partitions that bill max(cores, memory-
+    # fraction), asking for markedly more memory per core than the node provides
+    # means the job is allocated/billed for more cores than requested. The site's
+    # billing model is unknown here, so this is a soft warning that fires only when
+    # the request exceeds 1.5x the node's per-core memory — a normal, roughly
+    # proportional request (incl. typical defaults) stays silent.
+    try:
+        cpus_v = answers.get("cpus")
+        mem_v = answers.get("memory")
+        node_cpus = part.get("cpus_per_node", 0)
+        node_mem = part.get("mem_per_node_mb", 0)
+        if (cpus_v is not None and str(cpus_v).strip() and mem_v
+                and validate_memory(str(mem_v)) and node_cpus and node_mem):
+            ntpn_raw = answers.get("ntasks_per_node")
+            ntpn = int(ntpn_raw) if ntpn_raw else 1
+            total_cpus = max(1, int(cpus_v) * max(1, ntpn))
+            mb = _parse_mem_to_mb(str(mem_v))
+            per_core_node = node_mem / node_cpus
+            if mb and per_core_node and (mb / total_cpus) > per_core_node * 1.5:
+                implied = math.ceil(mb / per_core_node)
+                out.append((
+                    "warning",
+                    f"Memory ({mem_v}) is well above '{part.get('name', '')}'s per-core "
+                    f"memory (~{int(per_core_node)} MB/core); a shared partition may "
+                    f"bill ~{implied} cores, not {total_cpus}"
+                ))
+    except (ValueError, TypeError):
+        pass
+
     return out
 
 
 def fetch_partitions() -> list[dict[str, Any]]:
     if not is_tool_available("sinfo"):
-        return list(MOCK_PARTITIONS)
+        # Demo data only under SLURMATE_MOCK; on a real cluster whose sinfo is
+        # missing/unrunnable, return nothing (the picker lets the user type a
+        # name) rather than fake partitions that can't be submitted to.
+        return list(MOCK_PARTITIONS) if _force_mock() else []
 
     stdout, _, rc = _run_command(
         ["sinfo", "-h", "-o", "%P|%l|%D|%a|%c|%m|%G"]
     )
     if rc != 0:
-        return list(MOCK_PARTITIONS)
+        return []
 
     partitions: dict[str, dict[str, Any]] = {}
     for line in stdout.splitlines():
@@ -480,11 +513,11 @@ def fetch_public_partitions(all_parts: list[dict[str, Any]] | None = None) -> li
     redundant ``sinfo`` call — the partition step fetches it once and shares it.
     """
     if not is_tool_available("sinfo") or not is_tool_available("scontrol"):
-        return [p for p in MOCK_PARTITIONS if p.get("is_public")]
+        return [p for p in MOCK_PARTITIONS if p.get("is_public")] if _force_mock() else []
 
     stdout, _, rc = _run_command(["scontrol", "show", "partition", "-o"])
     if rc != 0:
-        return [p for p in MOCK_PARTITIONS if p.get("is_public")]
+        return []
 
     partition_lines: dict[str, str] = {}
     for line in stdout.splitlines():
@@ -500,10 +533,16 @@ def fetch_public_partitions(all_parts: list[dict[str, Any]] | None = None) -> li
         scontrol_line = partition_lines.get(name, "")
         allow_accounts = _extract_token(scontrol_line, "AllowAccounts")
         hidden = _extract_token(scontrol_line, "Hidden")
+        state = _extract_token(scontrol_line, "State")
 
+        # "Public" = usable by anyone: open to all accounts, not hidden, and up.
+        # (AllowGroups gating can't be evaluated here without the caller's groups;
+        # such partitions still appear under the picker's "[Private]"/"[Custom]"
+        # paths, so nothing usable is truly hidden — only mis-ranked.)
         is_public = (
             allow_accounts.upper() == "ALL"
             and hidden.upper() != "YES"
+            and state.upper() in ("", "UP")
         )
         p = dict(part)
         p["is_public"] = is_public
@@ -558,6 +597,8 @@ def fetch_known_qos() -> list[str]:
 
 def fetch_gpu_types_for_partition(partition: str) -> list[str]:
     if not is_tool_available("sinfo"):
+        if not _force_mock():
+            return []
         # In mock mode, prefer the specific partition's GPU types so a demo
         # doesn't claim every partition offers all GPU models; fall back to the
         # full list only for an unknown/manually-typed partition name.
@@ -570,7 +611,7 @@ def fetch_gpu_types_for_partition(partition: str) -> list[str]:
         ["sinfo", "-h", "-N", "-p", partition, "-o", "%f|%G"]
     )
     if rc != 0:
-        return list(MOCK_GPU_TYPES)
+        return []
 
     # Pass 1: collect typed GPU models from gpu:MODEL:N across all nodes,
     # and stash the raw lines for a second pass.
@@ -697,7 +738,7 @@ def fetch_available_modules() -> list[str]:
     stdout, stderr, rc = _run_command(["bash", "-lc", "command -v module && module -t avail 2>&1"])
     output = stdout + stderr
     if rc != 0:
-        return list(MOCK_MODULES)
+        return []
 
     modules: set[str] = set()
     for line in output.splitlines():
@@ -712,6 +753,13 @@ def fetch_available_modules() -> list[str]:
             # Strip "(default)" annotation that the module system appends
             if mod.endswith("(default)"):
                 mod = mod[:-9].strip()
+            # Lmod terse output can carry extras a Tcl-modules parser wouldn't: an
+            # alias annotation "(@name)", a tag marker like "(D)"/"<F>", and a
+            # trailing "/" on a family short-name ("gcc/" — loadable as "gcc").
+            if mod.startswith("(@") or (mod.startswith("<") and mod.endswith(">")) \
+                    or (mod.startswith("(") and mod.endswith(")")):
+                continue
+            mod = mod.rstrip("/")
             # Drop the leading `command -v module` probe output — either the
             # bare "module" function name or its resolved path (/usr/bin/module).
             if not mod or mod == "module" or mod.endswith("/module"):
@@ -737,18 +785,21 @@ def fetch_user_accounts() -> list[str]:
     the user can't actually charge to.
     """
     if not is_tool_available("sacctmgr"):
-        return list(MOCK_ACCOUNTS)
+        # Demo accounts only under SLURMATE_MOCK. On a real cluster without
+        # sacctmgr, return nothing rather than fake accounts the user can't
+        # charge to — the account field is free-text, so they type their own.
+        return list(MOCK_ACCOUNTS) if _force_mock() else []
 
     user = _current_username()
     if not user:
-        return list(MOCK_ACCOUNTS)
+        return []
 
     stdout, _, rc = _run_command(
         ["sacctmgr", "show", "assoc", f"user={user}", "-P",
          "format=Account", "--noheader"]
     )
     if rc != 0:
-        return list(MOCK_ACCOUNTS)
+        return []
 
     accounts: list[str] = []
     for line in stdout.splitlines():
@@ -758,7 +809,7 @@ def fetch_user_accounts() -> list[str]:
     # De-dupe while preserving order; a user is often associated to the same
     # account through several partitions/QoS, yielding duplicate rows.
     accounts = list(dict.fromkeys(accounts))
-    return accounts or list(MOCK_ACCOUNTS)
+    return accounts
 
 
 def _format_eta(seconds: int) -> str:

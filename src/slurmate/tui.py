@@ -737,6 +737,10 @@ class Wizard:
         if s.key == "memory":
             if val:
                 return normalize_memory(val)
+            # A cleared field reverts to the config/literal default (P3-10 invariant,
+            # shared with cpus/nodes) — the base case. To OMIT --mem on a whole-node
+            # site (e.g. TACC), use batch mode's `--memory none` / `--mem-per-cpu`,
+            # or delete the line via the editor step.
             return normalize_memory(self._config_defaults.get("memory", "")) or "16G"
         if s.key == "modules":
             return [m.strip() for m in val.split(",") if m.strip()] if val else None
@@ -1053,7 +1057,7 @@ class Wizard:
                 self._go_back()
             return
 
-        choices = ["gres_type", "constraint", "gpus"]
+        choices = ["gres_type", "constraint", "gpus", "gpus_per_node", "gpus_per_task"]
         self.radio_list = RadioList([(c, c) for c in choices])
         prev = self.answers.get("gpu_format")
         # Seed from SLURMATE_GPU_FORMAT (documented default) when there's no

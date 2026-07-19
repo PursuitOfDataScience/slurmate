@@ -111,6 +111,9 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
 
     args_memory = getattr(args, "memory", None)
     memory_val = args_memory if args_memory is not None else config.get("memory", "16G")
+    # An explicit empty / "none" memory omits --mem entirely — required by
+    # whole-node/exclusive sites (e.g. TACC) that reject a memory request.
+    mem_omit = str(memory_val).strip().lower() in ("", "none")
 
     args_time = getattr(args, "time", None)
     time_val = args_time if args_time is not None else config.get("time_limit", "02:00:00")
@@ -157,7 +160,7 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     # already constrained by argparse choices, but config/env values are not):
     # clamp an unrecognized value to gres_type instead of silently falling
     # through to the constraint-style directives, matching the TUI's behavior.
-    _GPU_FORMATS = ("gres_type", "constraint", "gpus")
+    _GPU_FORMATS = ("gres_type", "constraint", "gpus", "gpus_per_node", "gpus_per_task")
     if gpu_format is not None:
         gpu_format = str(gpu_format).lower()
         if gpu_format not in _GPU_FORMATS:
@@ -183,10 +186,27 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
         err_console.print(f"  {c.RED}\u2717 Error: --ntasks-per-node must be a positive integer (got {ntasks_per_node}){c.RESET}")
         sys.exit(1)
 
-    # Hard-validate memory
-    if not validate_memory(str(memory_val)):
+    # Hard-validate memory (unless deliberately omitted for a whole-node site)
+    if not mem_omit and not validate_memory(str(memory_val)):
         err_console.print(f"  {c.RED}\u2717 Error: Invalid memory value: {memory_val}{c.RESET}")
         sys.exit(1)
+
+    # --mem-per-cpu (validated as a memory value); takes precedence over --mem.
+    args_mem_per_cpu = getattr(args, "mem_per_cpu", None)
+    mem_per_cpu = _coerce_str(
+        args_mem_per_cpu if args_mem_per_cpu is not None else config.get("mem_per_cpu"),
+        None, field="mem_per_cpu", err_console=err_console)
+    if mem_per_cpu:
+        if not validate_memory(str(mem_per_cpu)):
+            err_console.print(f"  {c.RED}\u2717 Error: Invalid --mem-per-cpu value: {mem_per_cpu}{c.RESET}")
+            sys.exit(1)
+        mem_per_cpu = normalize_memory(str(mem_per_cpu))
+
+    # Node-feature --constraint (Slurm -C), e.g. NERSC Perlmutter's required cpu/gpu.
+    args_constraint = getattr(args, "constraint", None)
+    constraint = _coerce_str(
+        args_constraint if args_constraint is not None else config.get("constraint"),
+        None, field="constraint", err_console=err_console)
 
     # Hard-validate time limit
     if not validate_time(str(time_val)):
@@ -254,13 +274,15 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
         "_partition_obj": part_obj,
         "qos": qos,
         "cpus": cpus,
-        "memory": normalize_memory(str(memory_val)),
+        "memory": None if mem_omit else normalize_memory(str(memory_val)),
+        "mem_per_cpu": mem_per_cpu or None,
         "time_limit": str(time_val),
         "nodes": nodes,
         "ntasks_per_node": ntasks_per_node,
         "gpus": gpus,
         "gpu_type": gpu_type or None,
         "gpu_format": gpu_format or None,
+        "constraint": constraint,
         "array_spec": array_spec,
         "modules": mods,
         "env_type": env_type,
@@ -567,14 +589,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--partition", default=None, help="Target partition")
     parser.add_argument("--qos", default=None, help="QoS")
     parser.add_argument("--cpus", type=int, default=None, help="CPU cores")
-    parser.add_argument("--memory", default=None, help="Memory (e.g. 16G, 32G, 64000M)")
+    parser.add_argument("--memory", default=None,
+                        help="Memory per node (e.g. 16G, 64000M; empty or 'none' omits --mem for whole-node sites)")
+    parser.add_argument("--mem-per-cpu", default=None,
+                        help="Memory per CPU (e.g. 2G); takes precedence over --memory")
     parser.add_argument("--time", default=None, help="Time limit")
     parser.add_argument("--nodes", type=int, default=None, help="Node count")
     parser.add_argument("--ntasks-per-node", type=int, default=None, help="Tasks per node")
     parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs")
     parser.add_argument("--gpu-type", default=None, help="GPU type (e.g. a100, h100)")
-    parser.add_argument("--gpu-format", default=None, choices=["gres_type", "constraint", "gpus"],
+    parser.add_argument("--gpu-format", default=None,
+                        choices=["gres_type", "constraint", "gpus", "gpus_per_node", "gpus_per_task"],
                         help="GPU request format")
+    parser.add_argument("--constraint", default=None,
+                        help="Node feature constraint / Slurm -C (e.g. 'gpu', 'cpu', 'a100')")
     parser.add_argument("--array", default=None, help="Array specification (e.g. 1-10)")
     parser.add_argument("--modules", default=None, help="Comma-separated modules")
     parser.add_argument("--env", default=None, help="Conda environment")
@@ -602,9 +630,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # (batch) mode — not just --partition. Output modes (--print/--dry-run) and
 # --no-save-script are deliberately excluded; --yes is handled separately.
 _BATCH_FLAGS = (
-    "job_name", "account", "partition", "qos", "cpus", "memory", "time", "nodes",
-    "ntasks_per_node", "gpus", "gpu_type", "gpu_format", "array", "modules", "env",
-    "env_type", "output_dir", "output_file", "command", "custom_sbatch",
+    "job_name", "account", "partition", "qos", "cpus", "memory", "mem_per_cpu",
+    "time", "nodes", "ntasks_per_node", "gpus", "gpu_type", "gpu_format",
+    "constraint", "array", "modules", "env", "env_type", "output_dir",
+    "output_file", "command", "custom_sbatch",
 )
 
 

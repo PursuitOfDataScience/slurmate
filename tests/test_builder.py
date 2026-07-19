@@ -52,7 +52,7 @@ class TestBuildSbatchScript:
         assert "#SBATCH --array=1-5" in script
         assert "module load python/3.10" in script
         assert "module load cuda/12.0" in script
-        assert "source activate myenv" in script
+        assert "conda activate myenv" in script
         assert "python train.py --epochs 100" in script
         assert "#SBATCH --exclusive" in script
         assert "#SBATCH --constraint=ssd" in script
@@ -127,7 +127,12 @@ class TestBuildSbatchScript:
             job_name="test", partition="cpu", cpus=1, memory="1G",
             time_limit="00:01:00", env_name="myenv", env_type="Conda", command="echo hi"
         )
-        assert "source activate myenv" in script_conda
+        assert "conda activate myenv" in script_conda
+        # Robust form: conda.sh is sourced first so the `conda` shell function is
+        # defined in a non-login batch shell; the legacy bare `source activate`
+        # (which silently no-ops on modern conda in batch) is no longer emitted.
+        assert 'source "$(conda info --base)/etc/profile.d/conda.sh"' in script_conda
+        assert "source activate myenv" not in script_conda
 
         script_mamba = build_sbatch_script(
             job_name="test", partition="cpu", cpus=1, memory="1G",
@@ -637,3 +642,73 @@ class TestDirectiveOrdering:
         first_cmd = min(i for i, ln in enumerate(lines)
                         if ln and not ln.startswith("#") and ln.strip())
         assert last_sbatch < first_cmd
+
+
+class TestClusterAgnosticBuilder:
+    """Fixes from the cluster-agnostic audit: memory/constraint/GPU-format/conda."""
+
+    def _base(self, **kw):
+        args = dict(job_name="j", partition="p", cpus=4, memory="16G",
+                    time_limit="01:00:00", command="echo hi")
+        args.update(kw)
+        return build_sbatch_script(**args)
+
+    def test_mem_per_cpu_replaces_mem(self):
+        s = self._base(mem_per_cpu="4G")
+        assert "#SBATCH --mem-per-cpu=4G" in s
+        assert "#SBATCH --mem=" not in s
+
+    def test_empty_memory_omits_mem(self):
+        # Whole-node/exclusive sites (e.g. TACC) reject --mem entirely.
+        s = self._base(memory="")
+        assert "#SBATCH --mem=" not in s
+        assert "#SBATCH --mem-per-cpu" not in s
+
+    def test_custom_mem_flag_suppresses_auto_mem(self):
+        # A user-supplied memory flag wins; the auto --mem is not also emitted
+        # (Slurm rejects a script setting both --mem and --mem-per-cpu).
+        s = self._base(memory="16G", custom_sbatch=["--mem-per-cpu=2G"])
+        assert "#SBATCH --mem=16G" not in s
+        assert "#SBATCH --mem-per-cpu=2G" in s
+        assert s.count("--mem-per-cpu") == 1
+
+    def test_constraint_emitted(self):
+        s = self._base(constraint="gpu")
+        assert "#SBATCH --constraint=gpu" in s
+
+    def test_gpus_per_node_format(self):
+        s = self._base(gpus=4, gpu_type="a100", gpu_format="gpus_per_node")
+        assert "#SBATCH --gpus-per-node=a100:4" in s
+        assert "#SBATCH --gres" not in s
+
+    def test_gpus_per_task_format(self):
+        s = self._base(gpus=2, gpu_format="gpus_per_task")
+        assert "#SBATCH --gpus-per-task=2" in s
+
+    def test_gpus_per_node_custom_dedup(self):
+        s = self._base(gpus=4, gpu_type="a100", gpu_format="gpus_per_node",
+                       custom_sbatch=["--gpus-per-node=a100:4"])
+        assert s.count("--gpus-per-node=a100:4") == 1
+
+    def test_conda_uses_robust_activation(self):
+        s = self._base(env_type="conda", env_name="ml")
+        assert 'source "$(conda info --base)/etc/profile.d/conda.sh"' in s
+        assert "conda activate ml" in s
+        assert "source activate ml" not in s
+
+    def test_nersc_style_script(self):
+        # NERSC Perlmutter: mandatory -A and -C, GPUs via --gpus-per-node, no --gres.
+        s = self._base(gpus=4, gpu_type="a100", gpu_format="gpus_per_node",
+                       constraint="gpu", account="m1234")
+        assert "#SBATCH --account=m1234" in s
+        assert "#SBATCH --constraint=gpu" in s
+        assert "#SBATCH --gpus-per-node=a100:4" in s
+        assert "#SBATCH --gres" not in s
+
+    def test_base_case_unchanged(self):
+        # Shared-node cluster (e.g. midway3): defaults still produce --mem + --gres.
+        s = self._base(gpus=2, gpu_type="a100")
+        assert "#SBATCH --mem=16G" in s
+        assert "#SBATCH --gres=gpu:a100:2" in s
+        assert "#SBATCH --constraint" not in s
+        assert "#SBATCH --mem-per-cpu" not in s

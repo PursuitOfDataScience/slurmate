@@ -643,3 +643,65 @@ class TestValidateJobConfig:
         # A non-numeric gpus string must not crash and must not warn.
         assert validate_job_config(
             {"_partition_obj": self.CPU_PART, "gpus": "abc"}) == []
+
+
+class TestNoMockLeakOnRealCluster:
+    """A6: demo data appears only under SLURMATE_MOCK, never as a real-cluster fallback."""
+
+    def test_empty_when_tools_absent_and_not_mock(self, monkeypatch, mocker):
+        import slurmate.system_utils as su
+        monkeypatch.delenv("SLURMATE_MOCK", raising=False)
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        assert su.fetch_user_accounts() == []
+        assert su.fetch_partitions() == []
+        assert su.fetch_public_partitions() == []
+        assert su.fetch_gpu_types_for_partition("gpu") == []
+
+    def test_modules_empty_on_probe_failure(self, monkeypatch, mocker):
+        import slurmate.system_utils as su
+        monkeypatch.delenv("SLURMATE_MOCK", raising=False)
+        mocker.patch.object(su, "_run_command", return_value=("", "no module", 1))
+        assert su.fetch_available_modules() == []
+
+    def test_still_mock_under_mock_mode(self):
+        # conftest forces SLURMATE_MOCK=1: demo data stays available for demos.
+        from slurmate.system_utils import MOCK_ACCOUNTS, fetch_user_accounts
+        assert fetch_user_accounts() == list(MOCK_ACCOUNTS)
+
+
+class TestMemPerCoreAdvisory:
+    """A5: warn when memory-per-core is well above the node's; silent when proportional."""
+
+    SHARED = {"name": "shared", "cpus_per_node": 48, "mem_per_node_mb": 96000,
+              "gpu_types": [], "has_gpu": False, "timelimit": None}
+
+    def test_over_ratio_warns(self):
+        from slurmate.system_utils import validate_job_config
+        # 96000/48 = 2000 MB/core; 32G/4 = 8192 MB/core >> 1.5x.
+        issues = validate_job_config(
+            {"_partition_obj": self.SHARED, "cpus": 4, "memory": "32G"})
+        assert any(lvl == "warning" and "bill" in m for lvl, m in issues)
+
+    def test_proportional_silent(self):
+        from slurmate.system_utils import validate_job_config
+        part = dict(self.SHARED, mem_per_node_mb=196608)  # 4096 MB/core
+        issues = validate_job_config(
+            {"_partition_obj": part, "cpus": 4, "memory": "16G"})  # 4096 MB/core
+        assert all("bill" not in m for _, m in issues)
+
+
+class TestModuleParseLmod:
+    """A9: Lmod terse extras (trailing '/', tag/alias markers) are cleaned out."""
+
+    def test_strips_lmod_extras(self, monkeypatch, mocker):
+        import slurmate.system_utils as su
+        monkeypatch.delenv("SLURMATE_MOCK", raising=False)
+        out = "/opt/modulefiles:\ngcc/\ngcc/12.2 (D)\nopenmpi/4.1 (@ompi)\npython/3.11\n"
+        mocker.patch.object(su, "_run_command", return_value=(out, "", 0))
+        mods = su.fetch_available_modules()
+        assert "gcc" in mods          # trailing "/" stripped -> family short name
+        assert "gcc/12.2" in mods
+        assert "python/3.11" in mods
+        assert "(D)" not in mods
+        assert "(@ompi)" not in mods
+        assert all(not m.endswith(":") for m in mods)

@@ -5,6 +5,46 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.0] — 2026-07-19
+
+Cluster-agnostic hardening from a documentation audit of the major US SLURM centers
+(TACC, NERSC, SDSC, OLCF, PSC, Purdue, Harvard, …). New options and safer generation let a
+script work on exclusive-node and mandatory-account/constraint sites, while the shared-node
+base case (e.g. UChicago Midway3) is byte-for-byte unchanged. See `problems.md` for the
+full audit and the rationale behind each fix.
+
+### Added
+
+- **`--mem-per-cpu`** — request memory per CPU instead of per node; takes precedence over
+  `--mem` (Slurm treats the two as mutually exclusive).
+- **`--constraint` (Slurm `-C`)** — a first-class node-feature constraint, e.g. NERSC
+  Perlmutter's mandatory `-C cpu` / `-C gpu`.
+- **GPU formats `gpus_per_node` and `gpus_per_task`** for `--gpu-format` /
+  `SLURMATE_GPU_FORMAT` (matching NERSC/Anvil conventions), alongside the existing
+  `gres_type` (default), `gpus`, and `constraint`.
+- **Omit `--mem` entirely** — pass `--memory none` (or empty) so no memory directive is
+  emitted, as whole-node/exclusive sites (e.g. TACC, which rejects `--mem`) require.
+- **Memory-per-core advisory** — a warning when the requested memory-per-core is well
+  above (>1.5×) the partition's per-core memory; on shared partitions billed
+  `max(cores, memory-fraction)` the job may be charged for more cores than requested.
+  Silent for proportional/default requests.
+
+### Changed
+
+- **conda/mamba activation is now batch-shell-safe** — the generated script sources
+  `"$(conda info --base)/etc/profile.d/conda.sh"` before `conda activate <env>`, replacing
+  the legacy bare `source activate <env>` that silently no-ops on modern conda (4.4+) in a
+  non-login `#!/bin/bash` job (the common batch case).
+- **No demo data on real clusters** — mock accounts/partitions/modules/GPU-types now
+  appear ONLY under `SLURMATE_MOCK`. When a real SLURM query is unavailable or errors, the
+  corresponding picker is empty (type your own) instead of showing fake values that can't
+  be submitted under — most importantly, no fake `--account`.
+- **A user-supplied memory flag wins** — a `--mem`/`--mem-per-cpu` entry in the custom
+  flags suppresses the auto memory directive, so a script never sets both at once.
+- **`module avail` parsing** tolerates Lmod terse extras (trailing `/` family short names,
+  `(D)`/`<F>` tag markers, `(@alias)` annotations).
+- **Public-partition detection** also requires `State=UP`.
+
 ## [0.4.1] — 2026-07-18
 
 A visual-polish release for the wizard TUI. No behavioral or CLI changes — every
