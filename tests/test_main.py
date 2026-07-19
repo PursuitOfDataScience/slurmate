@@ -541,3 +541,31 @@ class TestPartitionLimitWarningMarkupSafety:
         # Must not raise MarkupError.
         _validate_partition_limits(answers, console)
         assert "GPU" in buf.getvalue()
+
+
+class TestHardErrorsSubmitGuard:
+    """Pre-submit guard: errors (not warnings) block submission of a doomed job."""
+
+    CPU = {"name": "cpu1", "cpus_per_node": 48, "mem_per_node_mb": 100000,
+           "gpu_types": [], "has_gpu": False, "timelimit": None}
+
+    def test_gpu_on_cpu_partition_is_hard_error(self):
+        from slurmate.main import _hard_errors
+        errs = _hard_errors({"_partition_obj": self.CPU, "gpus": 2})
+        assert any("does not support GPUs" in m for m in errs)
+
+    def test_valid_job_has_no_hard_errors(self):
+        from slurmate.main import _hard_errors
+        assert _hard_errors({"_partition_obj": self.CPU, "gpus": 0,
+                             "cpus": 4, "memory": "16G"}) == []
+
+    def test_warnings_do_not_block(self):
+        from slurmate.main import _hard_errors
+        # Over-limit memory is advisory (a heterogeneous partition can under-report),
+        # so it is a WARNING, not a hard error — it must not block submission.
+        assert _hard_errors({"_partition_obj": self.CPU, "cpus": 4,
+                             "memory": "512G", "gpus": 0}) == []
+
+    def test_no_partition_object_no_errors(self):
+        from slurmate.main import _hard_errors
+        assert _hard_errors({"gpus": 4}) == []

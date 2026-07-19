@@ -46,6 +46,12 @@ full audit and the rationale behind each fix.
 - **Clearer memory prompt + wrapped warnings** — the Memory step states the value is the
   total per-node request (Slurm `--mem`), and long validation warnings now wrap onto extra
   lines instead of truncating at the card's right edge.
+- **Pre-submit error guard** — a job with a hard error (e.g. GPUs on a CPU-only partition)
+  is no longer submitted: navigation stays free and the error shows on every step, but
+  "Submit" / `--yes` now refuse and point back to the fix, instead of letting `sbatch`
+  reject it after a wasted round-trip. Warnings remain advisory and never block.
+- **Simpler header** — the top-right shows just the step counter ("Step 9 / 20"); the
+  current step's name (already the card title and the highlighted sidebar row) was dropped.
 
 ## [0.4.1] — 2026-07-18
 

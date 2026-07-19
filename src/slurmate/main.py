@@ -294,16 +294,18 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     }
 
 
-def _validate_partition_limits(answers: dict[str, Any], console: Console) -> None:
+def _partition_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
+    """Resolved ``(level, msg)`` validation issues for the answers.
+
+    A GPU model the partition doesn't statically list may still be valid \u2014 a live
+    ``sinfo`` lookup can surface types the cached partition object missed, so widen
+    the known set with a one-shot query (only when there's an unrecognized type, to
+    avoid a needless call). Single source of truth shared by the CLI summary and the
+    pre-submit guard.
+    """
     part = answers.get("_partition_obj")
     if not part:
-        return
-
-    # A GPU model the partition doesn't statically list may still be valid \u2014 a
-    # live sinfo lookup can surface types the cached partition object missed. The
-    # final CLI summary can afford that one-shot query (the live TUI check can't),
-    # so resolve it here and hand the widened list to the shared validator. Only
-    # query when there's an unrecognized type to check, to avoid a needless call.
+        return []
     extra_gpu_types: list[str] = []
     gpu_type = answers.get("gpu_type")
     if gpu_type and str(gpu_type).lower() != "any":
@@ -315,17 +317,23 @@ def _validate_partition_limits(answers: dict[str, Any], console: Console) -> Non
                     extra_gpu_types = fetch_gpu_types_for_partition(part_name)
                 except Exception:
                     extra_gpu_types = []
+    return validate_job_config(answers, extra_gpu_types=extra_gpu_types)
 
-    # Single source of truth, shared with the live TUI check (see
-    # system_utils.validate_job_config). escape() the whole message: only
-    # user-supplied values can carry Rich-markup metacharacters ('[', ']'), and
-    # the static text never does, so escaping the lot is equivalent to escaping
-    # each interpolated value and can't accidentally miss one.
-    for level, msg in validate_job_config(answers, extra_gpu_types=extra_gpu_types):
+
+def _validate_partition_limits(answers: dict[str, Any], console: Console) -> None:
+    # escape() the whole message: only user-supplied values can carry Rich-markup
+    # metacharacters ('[', ']'); the static text never does, so escaping the lot is
+    # equivalent to escaping each interpolated value and can't accidentally miss one.
+    for level, msg in _partition_issues(answers):
         if level == "error":
             console.print(f"  [red]\u2717 Error: {escape(msg)}[/]")
         else:
             console.print(f"  [yellow]\u26a0 Warning: {escape(msg)}[/]")
+
+
+def _hard_errors(answers: dict[str, Any]) -> list[str]:
+    """Error-level issues only \u2014 a configuration Slurm will reject outright."""
+    return [msg for level, msg in _partition_issues(answers) if level == "error"]
 
 
 _REQUIRED_FIELDS = [("job_name", "Job name"), ("partition", "Partition"), ("command", "Command to run")]
@@ -712,6 +720,16 @@ def main() -> None:
             print(f"  {c.RED}✗ Nothing to run — refusing to submit with --yes "
                   f"(pass --command){c.RESET}", file=sys.stderr)
             sys.exit(1)
+        # Don't fire off a job Slurm will certainly reject (e.g. GPUs on a CPU-only
+        # partition). Errors are hard rejections; warnings stay advisory (a
+        # heterogeneous partition can under-report, so they aren't guaranteed fails).
+        errs = _hard_errors(answers)
+        if errs:
+            for m in errs:
+                print(f"  {c.RED}✗ {m}{c.RESET}", file=sys.stderr)
+            print(f"  {c.RED}✗ Refusing to submit — Slurm would reject this job "
+                  f"(fix the above and pass corrected flags){c.RESET}", file=sys.stderr)
+            sys.exit(1)
         _submit_and_report(script, answers, console, save_script=save_script)
         return
 
@@ -769,6 +787,16 @@ def main() -> None:
             print(f"  {c.YELLOW}Not submitted.{c.RESET}")
             return
         if action.startswith("Submit"):
+            # Navigation stays free (the error shows on every step), but block the
+            # actual submit — otherwise slurmate fires off a script sbatch rejects,
+            # wasting a round-trip. The fix is usually an earlier step (partition).
+            errs = _hard_errors(answers)
+            if errs:
+                for m in errs:
+                    console.print(f"  [red]✗ {escape(m)}[/]")
+                console.print("  [red]This job has errors Slurm will reject.[/] "
+                              "[dim]Choose \"Go back to edit answers\" to fix, or Quit.[/]")
+                continue
             _submit_and_report(script, answers, console, save_script=save_script)
             return
         if action.startswith("Open"):

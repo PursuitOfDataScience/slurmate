@@ -1198,11 +1198,11 @@ class Wizard:
         ]
 
     def _render_header_right(self) -> list[tuple[str, str]]:
-        s = self.current_step
+        # Just the progress counter — the current step's name is already the card
+        # title and the highlighted sidebar row, so repeating it here was redundant.
         visible_total = len(STEPS) - len(self._skipped_indices)
         visible_done = sum(1 for i in range(self.idx) if i not in self._skipped_indices)
-        right = f"{visible_done + 1} / {visible_total}  ·  {s.title}"
-        return [("class:status-meter", f"  {right}  ")]
+        return [("class:status-meter", f"  Step {visible_done + 1} / {visible_total}  ")]
 
     _SIDEBAR_WIDTH = 28
 
