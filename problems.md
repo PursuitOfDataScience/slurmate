@@ -67,17 +67,17 @@ regression:** on shared-node clusters the generated script is byte-for-byte unch
 | A2 | First-class `--constraint` (Slurm `-C`), threaded through CLI/config/builder — covers NERSC's mandatory `-C cpu`/`-C gpu`. |
 | A3 | conda/mamba now emit `source "$(conda info --base)/etc/profile.d/conda.sh"` then `conda activate` — works in a non-login batch shell (the old bare `source activate` did not). |
 | A4 | Added `--gpu-format gpus_per_node` and `gpus_per_task` (with custom-flag dedup); `--gres` kept as the default (correct for most clusters incl. midway3). |
-| A5 | Advisory warning when memory-per-core exceeds ~1.5× the node's ratio; silent for proportional/default requests. |
+| A5 | **Reconsidered and dropped.** A memory-per-core warning can't tell a normal request (e.g. 4 CPU / 16G) from genuine waste without the site's billing model — it fired on reasonable defaults on low-per-core-memory partitions (e.g. midway3 `amd`) and was net-negative UX. Removed; the real per-node "Memory exceeds partition limit" check stays. |
 | A6 | Mock accounts/partitions/modules/GPU-types appear ONLY under `SLURMATE_MOCK`; a real-cluster query failure now returns empty (the user types their own) instead of fake data. |
 | A7 | Public-partition test also requires `State=UP`. (`AllowGroups` still needs the caller's groups; `[Private]`/`[Custom]` remain the escape hatches.) |
 | A8 | Subsumed by A1/A2/A4 (mem-per-cpu, constraint, GPU formats now first-class); `--exclusive`/`--reservation` remain via the custom-flags field. |
 | A9 | Module list strips Lmod terse extras (trailing `/`, `(D)`/`<F>` tags, `(@alias)`). |
 
-**Applicability to midway3 (this cluster):** verified empirically — A1/A4/A5/A6 never
-applied here (shared nodes so `--mem` is valid; `--gres` is the native GPU idiom; real
-accounts via `sacctmgr` with default `rcc-staff`; default `4 cpu / 16G` is within caslake's
-per-core ratio). Only A3 (conda `source activate`) genuinely affected midway3, and it is
-now fixed and re-verified on the cluster.
+**Applicability to midway3 (this cluster):** verified empirically — A1/A4/A6 never applied
+here (shared nodes so `--mem` is valid; `--gres` is the native GPU idiom; real accounts via
+`sacctmgr` with default `rcc-staff`). The A5 warning was removed after it wrongly flagged a
+normal `4 cpu / 16G` request on the `amd` partition. Only A3 (conda `source activate`)
+genuinely affected midway3, and it is now fixed and re-verified on the cluster.
 
 ---
 

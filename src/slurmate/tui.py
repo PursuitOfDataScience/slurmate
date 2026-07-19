@@ -323,7 +323,7 @@ STEPS: list[Step] = [
          subtitle="Number of CPU cores per task", default="4",
          validate=lambda v: v.strip().isdigit() and int(v) > 0),
     Step("memory", "Memory", "autocomplete",
-         subtitle="e.g. 16G, 32G, 64000M",
+         subtitle="Total memory per node (--mem) — e.g. 16G, 32G, 64000M",
          validate=validate_memory, default="16G",
          choices=MEMORY_CHOICES),
     Step("time_limit", "Time limit", "autocomplete",
@@ -1240,19 +1240,20 @@ class Wizard:
         error_control: list[Window] = []
         if self.step_cache.get("error"):
             error_control.append(Window(
-                FormattedTextControl([("class:error", f"  \u2717 {self.step_cache['error']}\n")]),
-                height=1, style=content_bg,
+                FormattedTextControl([("class:error", f"  \u2717 {self.step_cache['error']}")]),
+                wrap_lines=True, dont_extend_height=True, style=content_bg,
             ))
         # Persistent whole-config validation: every issue in the work-in-progress
         # script stays visible on every step, not just the one that introduced it.
         # Errors (a config Slurm will reject \u2014 e.g. GPUs on a CPU-only partition)
-        # render red; capacity warnings render orange.
+        # render red; capacity warnings render orange. Wrapped (not fixed height=1)
+        # so a long message flows onto extra lines instead of truncating at the edge.
         for level, msg in self._config_warnings():
             cls = "class:error" if level == "error" else "class:warning"
             icon = "\u2717" if level == "error" else "\u26a0"
             error_control.append(Window(
-                FormattedTextControl([(cls, f"  {icon} {msg}\n")]),
-                height=1, style=content_bg,
+                FormattedTextControl([(cls, f"  {icon} {msg}")]),
+                wrap_lines=True, dont_extend_height=True, style=content_bg,
             ))
 
         # The Review step is itself two side-by-side cards (Job Config | Script).

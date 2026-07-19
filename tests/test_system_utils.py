@@ -677,27 +677,6 @@ class TestNoMockLeakOnRealCluster:
         assert info["running"] == 0 and info["pending"] == 0
 
 
-class TestMemPerCoreAdvisory:
-    """A5: warn when memory-per-core is well above the node's; silent when proportional."""
-
-    SHARED = {"name": "shared", "cpus_per_node": 48, "mem_per_node_mb": 96000,
-              "gpu_types": [], "has_gpu": False, "timelimit": None}
-
-    def test_over_ratio_warns(self):
-        from slurmate.system_utils import validate_job_config
-        # 96000/48 = 2000 MB/core; 32G/4 = 8192 MB/core >> 1.5x.
-        issues = validate_job_config(
-            {"_partition_obj": self.SHARED, "cpus": 4, "memory": "32G"})
-        assert any(lvl == "warning" and "bill" in m for lvl, m in issues)
-
-    def test_proportional_silent(self):
-        from slurmate.system_utils import validate_job_config
-        part = dict(self.SHARED, mem_per_node_mb=196608)  # 4096 MB/core
-        issues = validate_job_config(
-            {"_partition_obj": part, "cpus": 4, "memory": "16G"})  # 4096 MB/core
-        assert all("bill" not in m for _, m in issues)
-
-
 class TestModuleParseLmod:
     """A9: Lmod terse extras (trailing '/', tag/alias markers) are cleaned out."""
 

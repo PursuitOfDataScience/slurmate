@@ -24,10 +24,6 @@ full audit and the rationale behind each fix.
   `gres_type` (default), `gpus`, and `constraint`.
 - **Omit `--mem` entirely** — pass `--memory none` (or empty) so no memory directive is
   emitted, as whole-node/exclusive sites (e.g. TACC, which rejects `--mem`) require.
-- **Memory-per-core advisory** — a warning when the requested memory-per-core is well
-  above (>1.5×) the partition's per-core memory; on shared partitions billed
-  `max(cores, memory-fraction)` the job may be charged for more cores than requested.
-  Silent for proportional/default requests.
 
 ### Changed
 
@@ -47,6 +43,9 @@ full audit and the rationale behind each fix.
 - **`module avail` parsing** tolerates Lmod terse extras (trailing `/` family short names,
   `(D)`/`<F>` tag markers, `(@alias)` annotations).
 - **Public-partition detection** also requires `State=UP`.
+- **Clearer memory prompt + wrapped warnings** — the Memory step states the value is the
+  total per-node request (Slurm `--mem`), and long validation warnings now wrap onto extra
+  lines instead of truncating at the card's right edge.
 
 ## [0.4.1] — 2026-07-18
 

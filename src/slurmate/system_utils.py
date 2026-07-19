@@ -3,7 +3,6 @@ from __future__ import annotations
 import getpass
 import json
 import logging
-import math
 import os
 import re
 import shlex
@@ -410,35 +409,6 @@ def validate_job_config(
         known = {str(g).lower() for g in all_types}
         if known and str(gpu_type).lower() not in known:
             out.append(("error", f"GPU type '{gpu_type}' not in partition list ({', '.join(all_types)})"))
-
-    # Memory-per-core advisory: on shared partitions that bill max(cores, memory-
-    # fraction), asking for markedly more memory per core than the node provides
-    # means the job is allocated/billed for more cores than requested. The site's
-    # billing model is unknown here, so this is a soft warning that fires only when
-    # the request exceeds 1.5x the node's per-core memory — a normal, roughly
-    # proportional request (incl. typical defaults) stays silent.
-    try:
-        cpus_v = answers.get("cpus")
-        mem_v = answers.get("memory")
-        node_cpus = part.get("cpus_per_node", 0)
-        node_mem = part.get("mem_per_node_mb", 0)
-        if (cpus_v is not None and str(cpus_v).strip() and mem_v
-                and validate_memory(str(mem_v)) and node_cpus and node_mem):
-            ntpn_raw = answers.get("ntasks_per_node")
-            ntpn = int(ntpn_raw) if ntpn_raw else 1
-            total_cpus = max(1, int(cpus_v) * max(1, ntpn))
-            mb = _parse_mem_to_mb(str(mem_v))
-            per_core_node = node_mem / node_cpus
-            if mb and per_core_node and (mb / total_cpus) > per_core_node * 1.5:
-                implied = math.ceil(mb / per_core_node)
-                out.append((
-                    "warning",
-                    f"Memory ({mem_v}) is well above '{part.get('name', '')}'s per-core "
-                    f"memory (~{int(per_core_node)} MB/core); a shared partition may "
-                    f"bill ~{implied} cores, not {total_cpus}"
-                ))
-    except (ValueError, TypeError):
-        pass
 
     return out
 
