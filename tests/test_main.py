@@ -254,6 +254,32 @@ class TestBatchNumericValidation:
         ans = run_batch(self._ns(cpus=8, nodes=2, gpus=1), Console(), {})
         assert ans["cpus"] == 8 and ans["nodes"] == 2 and ans["gpus"] == 1
 
+    def test_ntasks_non_integer_config_rejected(self):
+        # A non-integer ntasks (e.g. a stringy config value) is a single clean
+        # hard error naming the value — not the old "using 0" warning followed
+        # by a confusing "got 0" that never echoed what the user wrote.
+        import pytest
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        with pytest.raises(SystemExit):
+            run_batch(self._ns(), Console(), {"ntasks_per_node": "x"})
+
+    def test_ntasks_zero_rejected(self):
+        import pytest
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        with pytest.raises(SystemExit):
+            run_batch(self._ns(ntasks_per_node=0), Console(), {})
+
+    def test_ntasks_valid_from_config(self):
+        from rich.console import Console
+
+        from slurmate.main import run_batch
+        ans = run_batch(self._ns(nodes=2), Console(), {"ntasks_per_node": "4"})
+        assert ans["ntasks_per_node"] == 4
+
 
 class TestBatchStringyConfigCoercion:
     def test_stringy_config_numerics_do_not_crash(self):

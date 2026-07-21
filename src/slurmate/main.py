@@ -128,10 +128,22 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
 
     args_ntasks_per_node = getattr(args, "ntasks_per_node", None)
     raw_ntasks = args_ntasks_per_node if args_ntasks_per_node is not None else config.get("ntasks_per_node")
-    ntasks_per_node = (
-        _coerce_int(raw_ntasks, 0, field="ntasks_per_node", err_console=err_console)
-        if raw_ntasks is not None else None
-    )
+    ntasks_per_node: int | None
+    if raw_ntasks is None:
+        ntasks_per_node = None
+    else:
+        try:
+            ntasks_per_node = int(raw_ntasks)
+        except (TypeError, ValueError):
+            # A non-integer (e.g. a config `ntasks_per_node = "x"`) is a hard
+            # error naming the original value — not _coerce_int's "using 0",
+            # which would then trip the positive-int guard below with a
+            # confusing "got 0" that never echoes what the user wrote.
+            err_console.print(
+                f"  {c.RED}✗ Error: --ntasks-per-node must be a positive integer "
+                f"(got {raw_ntasks!r}){c.RESET}"
+            )
+            sys.exit(1)
 
     args_gpu_type = getattr(args, "gpu_type", None)
     gpu_type = args_gpu_type if args_gpu_type is not None else config.get("gpu_type")

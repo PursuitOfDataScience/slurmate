@@ -132,17 +132,19 @@ def validate_memory(value: str) -> bool:
 # Slurm's accepted --time grammar, allowing 1–2 digit lead fields:
 #   minutes | minutes:seconds | hours:minutes:seconds |
 #   days-hours | days-hours:minutes | days-hours:minutes:seconds
-# Minute/second fields are range-limited to [0-5]\d (00–59) so obviously
-# out-of-range values like "1:60:60" or "1-99:99:99" are rejected client-side,
-# not just at submit. (Lead fields stay \d+ / \d{1,2}: hours in hh:mm:ss can
-# legitimately exceed 24, and Slurm accepts a bare "0" as "no limit".)
+# Minute/second fields are range-limited to [0-5]?\d (0–59, one or two digits):
+# obviously out-of-range values like "1:60:60" or "1-99:99:99" are still
+# rejected client-side, while unpadded fields Slurm accepts ("5:3", "1:2:3")
+# are no longer falsely rejected (the parser already reads them correctly).
+# (Lead fields stay \d+ / \d{1,2}: hours in hh:mm:ss can legitimately exceed 24,
+# and Slurm accepts a bare "0" as "no limit".)
 _TIME_PATTERNS = (
-    r"^\d+$",                          # minutes
-    r"^\d+:[0-5]\d$",                  # minutes:seconds
-    r"^\d+:[0-5]\d:[0-5]\d$",          # hours:minutes:seconds
-    r"^\d+-\d{1,2}$",                  # days-hours
-    r"^\d+-\d{1,2}:[0-5]\d$",          # days-hours:minutes
-    r"^\d+-\d{1,2}:[0-5]\d:[0-5]\d$",  # days-hours:minutes:seconds
+    r"^\d+$",                              # minutes
+    r"^\d+:[0-5]?\d$",                     # minutes:seconds
+    r"^\d+:[0-5]?\d:[0-5]?\d$",            # hours:minutes:seconds
+    r"^\d+-\d{1,2}$",                      # days-hours
+    r"^\d+-\d{1,2}:[0-5]?\d$",             # days-hours:minutes
+    r"^\d+-\d{1,2}:[0-5]?\d:[0-5]?\d$",    # days-hours:minutes:seconds
 )
 
 

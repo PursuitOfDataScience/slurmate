@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 from collections.abc import Callable, Generator
 from typing import Any
 
@@ -253,20 +254,32 @@ def _parse_custom_flags(raw: str) -> list[str]:
     standalone option (``exclusive`` -> ``--exclusive``), *not* glued onto the
     previous flag, since the wizard can't know which options take a value. A
     leading ``#SBATCH`` (pasted by mistake) is stripped.
+
+    Tokenizing is quote-aware (via ``shlex``): a value quoted to hold a space —
+    ``--comment="my job"`` — stays a single flag instead of splitting on the
+    inner space into two broken directives. The surrounding quotes are consumed
+    here; :func:`~slurmate.builder._quote_custom_flag` re-quotes any value that
+    still contains whitespace when the directive is emitted.
     """
-    # Turn only "flag-separating" commas (those before a dash) into spaces;
-    # commas inside a value (e.g. a node list) survive.
-    raw = re.sub(r",(\s*-)", r" \1", raw)
+    try:
+        tokens = shlex.split(raw, posix=True)
+    except ValueError:
+        # Unbalanced quotes (e.g. a half-typed value) — fall back to a plain
+        # whitespace split so the user still gets something rather than nothing.
+        tokens = raw.split()
     flags: list[str] = []
-    for tok in raw.split():
+    for tok in tokens:
         if tok.startswith("#SBATCH"):
             tok = tok[len("#SBATCH"):]
-        tok = tok.strip().rstrip(",")
-        if not tok:
-            continue
-        if not tok.startswith("-"):
-            tok = f"--{tok}"
-        flags.append(tok)
+        # A comma that introduces the next flag (one followed by a dash)
+        # separates options; a comma inside a value (a node list) survives.
+        for part in re.split(r",(?=\s*-)", tok):
+            part = part.strip().rstrip(",")
+            if not part:
+                continue
+            if not part.startswith("-"):
+                part = f"--{part}"
+            flags.append(part)
     return flags
 
 

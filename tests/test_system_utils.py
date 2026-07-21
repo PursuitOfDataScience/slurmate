@@ -179,6 +179,16 @@ class TestHelpers:
         for bad in ("abc", "1:2:3:4", "-5", "1-"):
             assert validate_time(bad) is False, bad
 
+    def test_validate_time_unpadded_fields(self):
+        # Slurm accepts unpadded 1-digit minute/second fields; the wizard must
+        # not falsely reject them (the parser already reads them correctly),
+        # while genuinely out-of-range fields (60–99) stay rejected.
+        from slurmate.system_utils import validate_time
+        for ok in ("5:3", "1:2:3", "5:0", "1-0:5", "1-0:5:9"):
+            assert validate_time(ok) is True, ok
+        for bad in ("1:60", "1:60:60", "1-99:99:99", "1:5:99"):
+            assert validate_time(bad) is False, bad
+
     def test_mock_queue_eta_label_matches_formatter(self):
         # P3-7: the mock label is derived from _format_eta, not hand-written.
         from slurmate.system_utils import MOCK_QUEUE_INFO, _format_eta
