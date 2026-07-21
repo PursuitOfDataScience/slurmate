@@ -430,6 +430,18 @@ class TestJobNameFallback:
         assert sanitize_job_name("训练任务") == "slurm"
         assert sanitize_job_name("") == ""  # truly empty stays empty
 
+    def test_leading_dash_dot_plus_stripped(self):
+        from slurmate.builder import sanitize_job_name
+        # A leading '-'/'+'/'.' is stripped so the saved "<job>-<id>.sh" file and
+        # the log path don't look like a CLI option (tail -f -rf-1.out) or hide
+        # as a dotfile. Interior dashes/dots are preserved.
+        assert sanitize_job_name("-rf") == "rf"
+        assert sanitize_job_name("--force") == "force"
+        assert sanitize_job_name(".hidden") == "hidden"
+        assert sanitize_job_name("+x") == "x"
+        assert sanitize_job_name("---") == "slurm"  # only special chars → fallback
+        assert sanitize_job_name("ok-name_1.2") == "ok-name_1.2"
+
     def test_builder_emits_fallback_not_empty_directive(self):
         from slurmate.builder import build_from_answers
         s = build_from_answers({"job_name": "@#%", "partition": "p", "command": "x"})
@@ -484,6 +496,60 @@ class TestCustomFlagGpuDedup:
     def test_newline_in_flag_not_injected_into_body(self):
         s = self._base(custom_sbatch=["--comment=a\necho pwned"])
         assert not any(ln.strip() == "echo pwned" for ln in s.splitlines())
+        # The folded value now also has a space, so it is quoted into a single
+        # well-formed directive rather than left to split at submit time.
+        assert '#SBATCH --comment="a echo pwned"' in s
+
+
+class TestCustomFlagQuoting:
+    def _base(self, **kw):
+        from slurmate.builder import build_sbatch_script
+        args = dict(job_name="j", partition="p", cpus=1, memory="1G",
+                    time_limit="01:00:00", command="x")
+        args.update(kw)
+        return build_sbatch_script(**args)
+
+    def test_spaced_value_quoted(self):
+        # A custom-flag value containing a space is wrapped in quotes so Slurm's
+        # directive parser keeps it one argument (--comment=my job would
+        # otherwise bind --comment=my and leave "job" as a stray token).
+        s = self._base(custom_sbatch=["--comment=my job"])
+        assert '#SBATCH --comment="my job"' in s
+
+    def test_spaceless_value_unquoted(self):
+        s = self._base(custom_sbatch=["--reservation=abc", "--exclusive"])
+        assert "#SBATCH --reservation=abc" in s
+        assert "#SBATCH --exclusive" in s
+
+    def test_already_quoted_value_not_double_quoted(self):
+        s = self._base(custom_sbatch=['--comment="pre quoted"'])
+        assert '#SBATCH --comment="pre quoted"' in s
+        assert '\\"' not in s  # not escaped / double-wrapped
+
+    def test_full_flow_cli_string_comment_with_space(self):
+        # End-to-end: the CLI string form parses and emits one clean directive.
+        from slurmate.builder import build_from_answers
+        from slurmate.tui import _parse_custom_flags
+        flags = _parse_custom_flags('--comment="my job" --exclusive')
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "custom_sbatch": flags, "command": "x"})
+        assert '#SBATCH --comment="my job"' in s
+        assert "#SBATCH --exclusive" in s
+        assert not any(ln.strip().endswith('job"') and "comment" not in ln
+                       for ln in s.splitlines())
+
+
+class TestModulesCoercion:
+    def test_stray_string_split_not_iterated(self):
+        # A bare string (direct-API misuse) is split on commas, not iterated
+        # character-by-character into "module load n / o / t / …".
+        from slurmate.builder import build_sbatch_script
+        s = build_sbatch_script(job_name="j", partition="p", cpus=1, memory="1G",
+                                time_limit="01:00:00", modules="cuda/12.1,gcc",
+                                command="x")
+        assert "module load cuda/12.1" in s
+        assert "module load gcc" in s
+        assert "module load c\n" not in s
 
 
 class TestEnvNameQuoting:
@@ -500,6 +566,14 @@ class TestEnvNameQuoting:
                                 time_limit="01:00:00", env_name="/path/to/venv",
                                 env_type="venv", command="x")
         assert "source /path/to/venv/bin/activate" in s
+
+    def test_venv_trailing_slash_no_double_slash(self):
+        from slurmate.builder import build_sbatch_script
+        s = build_sbatch_script(job_name="j", partition="p", cpus=1, memory="1G",
+                                time_limit="01:00:00", env_name="/venv/",
+                                env_type="venv", command="x")
+        assert "source /venv/bin/activate" in s
+        assert "//bin/activate" not in s
 
 
 class TestTildeExpansion:

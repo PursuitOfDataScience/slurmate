@@ -23,12 +23,19 @@ def sanitize_job_name(name: str) -> str:
     non-empty name that sanitizes away entirely (e.g. an all-symbol or non-Latin
     name like ``###`` or ``训练任务``) falls back to ``slurm`` rather than emitting a
     malformed empty ``--job-name=``.
+
+    A leading ``-``/``+``/``.`` is stripped: the sanitized name becomes the
+    auto-saved ``<job>-<id>.sh`` filename and the ``%x`` log path, and a leading
+    ``-`` makes those look like a CLI option (``tail -f -rf-1.out`` parses
+    ``-rf`` as flags), while a leading ``.`` would hide the file. A name that is
+    only such characters (``--``) also falls back to ``slurm``.
     """
     name = (name or "").strip()
     if not name:
         return name
     name = re.sub(r"\s+", "_", name)
     cleaned = re.sub(r"[^A-Za-z0-9._+-]", "", name)
+    cleaned = cleaned.lstrip("-+.")
     return cleaned or "slurm"
 
 
@@ -61,6 +68,29 @@ def _quote_sbatch_value(value: str) -> str:
     if value and any(ch.isspace() for ch in value):
         return '"' + value.replace('"', '\\"') + '"'
     return value
+
+
+def _quote_custom_flag(flag: str) -> str:
+    """Quote the value of a ``--flag=value`` custom directive if it holds whitespace.
+
+    A custom flag whose value contains a space (e.g. ``--comment=my job``, once
+    the parser has consumed the user's quotes) would otherwise be split by
+    Slurm's directive parser into ``--comment=my`` plus a stray ``job`` token,
+    producing a script Slurm rejects. Wrap the value in double quotes — which
+    Slurm strips — so it stays a single argument. A bare flag (``--exclusive``),
+    a value with no whitespace, or a value the caller already quoted is emitted
+    unchanged; a value written with a space rather than ``=`` (no ``=`` present)
+    is left alone, since we can't tell which token is the value.
+    """
+    if "=" not in flag:
+        return flag
+    name, value = flag.split("=", 1)
+    if not value or not any(ch.isspace() for ch in value):
+        return flag
+    # Already wrapped in matching quotes — don't double-quote it.
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return flag
+    return f"{name}={_quote_sbatch_value(value)}"
 
 
 def _gpus_int(answers: dict[str, Any]) -> int:
@@ -429,8 +459,14 @@ def build_sbatch_script(
                 if gpu_fmt == "constraint" and flag_name == "--constraint" \
                         and gpu_type and not gpu_any and flag_val == gpu_type:
                     continue
-            lines.append(f"#SBATCH {flag}")
+            lines.append(f"#SBATCH {_quote_custom_flag(flag)}")
 
+    # Defensive: a bare string here (from a direct API caller) would be iterated
+    # character-by-character (module load n, module load o, …). Mirror the
+    # custom_sbatch coercion above and split a stray string on commas so a
+    # misuse degrades to sensible output instead of one directive per character.
+    if isinstance(modules, str):
+        modules = [m.strip() for m in modules.split(",") if m.strip()]
     if modules:
         lines.append("")
         for mod in modules:
@@ -463,7 +499,8 @@ def build_sbatch_script(
             lines.append(f"{strategy} activate {shlex.quote(env_name)}")
         elif strategy in ("virtualenv (venv)", "venv"):
             lines.append("")
-            lines.append(f"source {shlex.quote(env_name + '/bin/activate')}")
+            # rstrip a trailing "/" so "/venv/" doesn't become "/venv//bin/activate".
+            lines.append(f"source {shlex.quote(env_name.rstrip('/') + '/bin/activate')}")
         else:
             logger.warning(f"env_type '{env_type}' with env_name '{env_name}' — no activation line emitted")
 

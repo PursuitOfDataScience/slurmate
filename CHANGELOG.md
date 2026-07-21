@@ -5,6 +5,44 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.1] — 2026-07-21
+
+A bug-fix release from an adversarial edge-case pass over script generation, the
+validators, and batch mode. No CLI or config-key changes; the base case is
+byte-for-byte unchanged.
+
+### Fixed
+
+- **Custom `#SBATCH` flags with a space in the value were mangled** — a flag like
+  `--comment="my job"` was split on the inner space into two broken directives
+  (`#SBATCH --comment="my` + `#SBATCH --job"`), a script Slurm rejects. The
+  parser (`_parse_custom_flags`) is now quote-aware (`shlex`), so a quoted value
+  stays a single flag, and the builder re-quotes any custom-flag value that
+  still contains whitespace (mirroring the existing output-path quoting) — so
+  even a config-list entry like `custom_sbatch = ["--comment=my job"]` emits one
+  well-formed `#SBATCH --comment="my job"` directive. Space- and comma-separated
+  flags, comma-bearing values (`--exclude=node1,node2`), and a pasted `#SBATCH`
+  prefix all still work; an unbalanced quote falls back to a plain split.
+- **`validate_time` falsely rejected unpadded fields** — Slurm accepts
+  single-digit minute/second fields (`5:3`, `1:2:3`), and the parser already
+  read them correctly, but the wizard/CLI validator required two digits and
+  rejected them. Minute/second fields are now `[0-5]?\d`, so unpadded values are
+  accepted while genuinely out-of-range ones (`1:60`, `1-99:99:99`) stay rejected.
+- **`build_sbatch_script(modules=…)` iterated a stray string** — a bare string
+  (from a direct API call) was emitted one `module load <char>` per character;
+  it is now split on commas like `custom_sbatch`, matching that field's existing
+  defensive coercion.
+- **Leading-dash job names produced flag-like filenames** — a name like `-rf`
+  yielded `--output=-rf-%j.out` and a saved `-rf-<id>.sh`, so a follow-up
+  `tail -f -rf-….out` parsed `-rf` as options. `sanitize_job_name` now strips a
+  leading `-`/`+`/`.` (a name made only of those falls back to `slurm`); interior
+  dashes/dots are preserved.
+- **venv path with a trailing slash** — `--env /venv/` emitted
+  `source /venv//bin/activate`; the trailing slash is now trimmed.
+- **Confusing batch error for a non-integer `ntasks_per_node`** — a config value
+  like `ntasks_per_node = "x"` printed `⚠ … using 0` and then hard-errored
+  `… (got 0)`; it now raises a single clean error that names the actual value.
+
 ## [0.5.0] — 2026-07-19
 
 Cluster-agnostic hardening from a documentation audit of the major US SLURM centers
@@ -512,6 +550,7 @@ Slurm, and the wizard's visuals are cleaner.
 - `ruff` and `mypy` CI checks.
 - Test suite with fixtures for partition, queue, and GPU type parsing.
 
+[0.5.1]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.5.0...v0.5.1
 [0.4.0]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/PursuitOfDataScience/slurmate/compare/v0.2.0...v0.2.1

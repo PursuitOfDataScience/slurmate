@@ -227,6 +227,25 @@ class TestHelpers:
     def test_parse_custom_flags_whitespace(self):
         assert _parse_custom_flags("  ,  ,  ") == []
 
+    def test_parse_custom_flags_quoted_value_with_space(self):
+        # Regression: a value quoted to hold a space stays ONE flag. The old
+        # whitespace split turned --comment="my job" into two broken directives
+        # (--comment="my and --job").
+        assert _parse_custom_flags('--comment="my job"') == ["--comment=my job"]
+        assert _parse_custom_flags('--comment="my job",--exclusive') == [
+            "--comment=my job", "--exclusive",
+        ]
+        assert _parse_custom_flags('--wrap="sleep 60 && echo hi"') == [
+            "--wrap=sleep 60 && echo hi",
+        ]
+        # A comma inside a quoted value is preserved (not a flag separator).
+        assert _parse_custom_flags('--comment="a, b"') == ["--comment=a, b"]
+
+    def test_parse_custom_flags_unbalanced_quote_falls_back(self):
+        # A half-typed value with no closing quote must not raise; it degrades
+        # to a plain whitespace split rather than dropping everything.
+        assert _parse_custom_flags('--comment="oops') == ['--comment="oops']
+
 
 class TestStepValidation:
     def test_validate_cpus_valid(self):
