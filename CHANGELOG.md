@@ -48,8 +48,7 @@ byte-for-byte unchanged.
 Cluster-agnostic hardening from a documentation audit of the major US SLURM centers
 (TACC, NERSC, SDSC, OLCF, PSC, Purdue, Harvard, …). New options and safer generation let a
 script work on exclusive-node and mandatory-account/constraint sites, while the shared-node
-base case (e.g. UChicago Midway3) is byte-for-byte unchanged. See `problems.md` for the
-full audit and the rationale behind each fix.
+base case (e.g. UChicago Midway3) is byte-for-byte unchanged.
 
 ### Added
 
@@ -235,7 +234,7 @@ throughout.
 ## [0.3.0] — 2026-06-23
 
 A correctness- and polish-focused release that works through the v0.3.0
-planning backlog (see the prior `issues.md`). Highlights: the version is now
+planning backlog. Highlights: the version is now
 single-sourced, batch mode is far more robust, time/memory validation matches
 Slurm, and the wizard's visuals are cleaner.
 
