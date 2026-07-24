@@ -5,6 +5,162 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.2] — 2026-07-24
+
+A correctness release from a full-codebase audit that verified every
+Slurm-behaviour claim against a live `sbatch --test-only` rather than by
+inspection. Two findings were *only* visible that way (**a typed `--gres` request
+on a count-only-GRES cluster**, and **`mamba activate` failing under mamba 2.x**),
+and two previously-suspected issues were withdrawn as non-bugs.
+
+### Fixed
+
+- **A GPU model that a site exposes only as a node feature was requested as a
+  GRES type, and Slurm rejected the job** — many clusters configure GPUs
+  count-only (`Gres=gpu:4`) and put the model in the node's *feature* list.
+  slurmate read those models correctly and offered them in the picker, but then
+  emitted `--gres=gpu:<model>:N` (the default `gres_type` format), which fails
+  with "Requested node configuration is not available", while validation reported
+  nothing wrong. `fetch_gpu_type_sources()` now reports *how* each model can be
+  requested (typed GRES vs. node feature); `validate_job_config` raises a hard
+  error naming the fix when a feature-only model is requested through any
+  type-naming format, and the wizard's GPU-format step defaults to `constraint`
+  for such a model. Requesting `--gres=gpu:N` + `--constraint=<model>` — the form
+  that actually schedules — is now what you get.
+- **A custom `--constraint`/`-C` produced two conflicting `#SBATCH --constraint`
+  lines** — Slurm keeps only the last one and silently discards the earlier,
+  which was always slurmate's own (the GPU type or the `--constraint` answer), so
+  the job landed on the wrong nodes with no error. Custom constraint flags are
+  now merged into the single `&`-joined directive, values de-duplicated
+  case-sensitively (Slurm features are case-sensitive) and an OR-expression
+  parenthesised so `a&(b|c)` keeps its meaning.
+- **A custom `--output`/`--error`/`-o`/`-e` left a contradictory auto directive**,
+  and the submit report read the *first* `--output` — the one Slurm ignores — so
+  "Log path:" and the `tail -f` hint pointed at a file the job never wrote. The
+  auto directive is now suppressed per stream (as a custom `--mem` already did),
+  and the report resolves the effective (last-wins) path, understanding
+  `--output=P`, `--output P` and `-o P`.
+- **Space-separated option values were shredded into nonsense flags** — `-C
+  bigmem` became `['-C', '--bigmem']` and `-o /logs/x.out` became
+  `['-o', '--/logs/x.out']`, emitting a valueless directive plus an invalid one
+  that sbatch rejects. A bare token is now attached to the preceding option when
+  that option takes a value (or when the token can't be an option name); a bare
+  word after a boolean option is still its own flag. The same rule is shared by
+  the free-form parser and the list/API path, so `--custom-sbatch="-o /p"`,
+  `custom_sbatch = ["-o /p"]` and `custom_sbatch = ["-o", "/p"]` all agree.
+- **The summary panel misreported memory** when a custom `--mem`/`--mem-per-cpu`
+  flag suppressed the auto directive: it kept showing the unused answer value, so
+  the panel and the script disagreed. Both surfaces now derive the row from the
+  same custom-flag override the builder uses.
+- **`mamba activate` failed on modern mamba, leaving the job in the wrong
+  environment** — `conda.sh` defines only the `conda` hook, so on mamba ≥ 2
+  (miniforge's current default) the emitted line died with "critical libmamba
+  Shell not initialized" *without* stopping the script, and the job silently ran
+  in whatever interpreter it inherited. The generated activation now falls back
+  to `conda activate`, which activates a mamba-created env identically.
+- **Fabric, rack and form-factor node features were reported as GPU models** —
+  the blocklist covered `ib`/`opa`/`hdr` but not `hdr100`/`edr`/`fdr`/`ndr`, and
+  the shape heuristic matched two-character labels like `b12`/`t2`, which then
+  beat the real model that appeared later in the feature list. Detection is now
+  known-model-first, then a stricter shape rule (family letter + 3-plus digits),
+  with fabric/rack/form-factor/cooling tokens filtered from both branches.
+- **A GPU type differing only in case passed validation and then failed at
+  submit** — Slurm node features are case-sensitive (`-C A100` does not match a
+  node advertising `a100`), while the check lowercased both sides. A case-only
+  mismatch is now a warning naming the advertised spelling. (The picker keeps
+  both spellings when a partition really has both — they select different nodes.)
+- **A stale GPU-type cache suppressed a live "not in partition list" error** in
+  the wizard after switching partitions; the cache is now keyed on the partition
+  it was fetched for, like the QoS cache.
+- **`submit_sbatch` created log directories before checking for `sbatch`**, so
+  mock mode (and any host without Slurm) left stray `logs/` trees behind while
+  reporting "no job submitted".
+- **A leading space defeated tilde expansion** — `output_dir = " ~/logs"` emitted
+  a literal `~/logs`, which Slurm does not expand; the value is now stripped
+  before `expanduser`.
+- **`validate_memory` accepted a `P` unit** that `sbatch --mem` rejects
+  client-side ("Invalid --mem specification"); units are now K/M/G/T.
+- **The action menu's editor label disagreed with the editor launched** (blank
+  when `EDITOR` was set-but-empty); it now shows `_editor_command()`'s result.
+- **The TUI review's label column used a fixed width**, so labels longer than 12
+  characters broke the value column and multi-line indentation; it now measures
+  the actual labels, as the CLI summary already did.
+- **The queue-ETA cache ignored a later `nodes` change** (it is computed from
+  whether enough idle nodes exist), and so always reported the `req_nodes=1`
+  estimate; the cache key now includes the node count.
+- **`theme.C` ignored `FORCE_COLOR`** while `rich` honours it, so piping with
+  `FORCE_COLOR=1` produced half-coloured output. (`CLICOLOR_FORCE` is
+  deliberately still ignored — rich ignores it too.) Banner animation now
+  requires a real TTY explicitly, since colour is no longer a proxy for one.
+- **An un-confirmed GPU-type edit was discarded by Back** in the free-text
+  sub-mode — the only input the wizard's Back path didn't persist.
+- **A space-form custom value containing a space was emitted unquoted** — once the
+  parser consumes the user's quotes, `--comment "my job"` arrives as
+  `--comment my job`, and only the `=` form was re-quoted, so Slurm split it into
+  `--comment=my` plus a stray `job`. The space form is now quoted too, using the
+  known value-taking option names to find where the value starts.
+- **Whitespace inside a `--constraint` value produced a job Slurm rejects** —
+  measured: `-C "a100 & 384g"` fails with "Invalid feature specification" while
+  `-C "a100&384g"` schedules. All whitespace is now stripped from every constraint
+  source (feature names cannot contain any), and a stray leading space no longer
+  emits `--constraint= a100`.
+- **A custom `--gres`/`--gpus*` override left a duplicate directive** and the summary
+  then described a GPU request the job doesn't make (`2 × v100` for a script asking
+  for `gpu:a100:8`). A differing custom flag on the option the chosen format emits now
+  replaces the auto directive, as a custom `--mem`/`--output` already did; an *exact*
+  duplicate still keeps slurmate's canonical `=` spelling, and a custom `--gpus` does
+  not suppress an auto `--gres` (different requests to Slurm).
+- **`--mem-per-cpu` was never checked against the node's memory** — it is per *core*,
+  so `--mem-per-cpu=64G` with 8 cores (512G/node) passed silently while the equivalent
+  `--mem=512G` warned. The check now multiplies by the cores requested per node and
+  shows the arithmetic.
+- **Validation warned about a memory value the script doesn't request** — a `--mem`
+  superseded by `--mem-per-cpu` (or by a custom flag) still produced a limit warning,
+  while the value actually requested went unchecked. Validation now resolves the
+  effective memory the same way the builder does.
+
+### Added
+
+- **`--constraint` and `--mem-per-cpu` wizard steps.** Both were already CLI
+  flags and config keys, but had no step — and because `Wizard` builds its
+  defaults by iterating the step list, a config file's `constraint`/`mem_per_cpu`
+  was silently dropped in interactive mode, so the same `.slurmate.toml` produced
+  different jobs in batch and interactive mode. Both now appear in
+  builder-directive order (`mem_per_cpu` with `memory`, `constraint` after the
+  GPU block).
+- **`python -m slurmate`** works alongside the console script.
+- **An "Estimated GPU-hours" summary row** for GPU jobs, alongside CPU-hours;
+  the multiplier follows the chosen `gpu_format` (per-node vs. per-task vs.
+  job-wide).
+- **`fetch_gpu_type_sources()`** — GPU models split by how they can be requested.
+- **`effective_log_path()`** — the log path Slurm will actually use for a script.
+
+### Documentation
+
+- README: `constraint` and `mem_per_cpu` added to the recognized config keys; all
+  five `--gpu-format` values listed (`gpus_per_node`/`gpus_per_task` were missing
+  from three places); the `SLURMATE_BANNER_ANIMATE` row no longer claims it forces
+  animation on a non-TTY (it cannot — and should not); `FORCE_COLOR` documented.
+- The wizard's custom-flags subtitle and the `--custom-sbatch` help now state that a
+  value may use `=` or a space, and that a value containing a space must be quoted —
+  an unquoted `--comment=big run` is genuinely ambiguous, so slurmate rejects it loudly
+  rather than guessing (guessing would fabricate values).
+
+### Not changed (investigated, found correct)
+
+- **`validate_time("1-99")`** was suspected of accepting a value sbatch rejects.
+  It does not: Slurm accepts `1-99` (1 day + 99 hours) — measured — while
+  slurmate already *rejects* input Slurm accepts (`25:99:99`). The validator is
+  stricter than Slurm, not looser; tightening the days-hours field would have
+  rejected valid input.
+- **Case-duplicated GPU types in the picker** (`A100` *and* `a100`) look like a
+  de-duplication bug but are correct: the two select different nodes, so folding
+  them would break the constraint.
+- **An OR node-feature constraint denied by cluster policy** (`--constraint=a100|v100`
+  → "Access/permission denied" on the audit cluster) is not slurmate's doing: the
+  identical request typed straight into `sbatch` fails the same way, while each
+  individual feature schedules.
+
 ## [0.5.1] — 2026-07-21
 
 A bug-fix release from an adversarial edge-case pass over script generation, the

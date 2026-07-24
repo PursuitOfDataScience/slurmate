@@ -33,11 +33,11 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import RadioList, TextArea
 
-from .builder import build_from_answers, job_summary_rows
+from .builder import _join_flag_values, build_from_answers, job_summary_rows
 from .system_utils import (
     fetch_available_modules,
     fetch_conda_envs,
-    fetch_gpu_types_for_partition,
+    fetch_gpu_type_sources,
     fetch_known_qos,
     fetch_partitions,
     fetch_public_partitions,
@@ -250,10 +250,14 @@ def _parse_custom_flags(raw: str) -> list[str]:
     and ``--exclusive,--reservation=abc`` both yield two directives. Only a comma
     that introduces another flag (one followed by ``-``) separates options — a
     comma inside a value is kept, so ``--exclude=node1,node2`` stays a single
-    directive. Give an option its value with ``=``; a bare word is taken as a
-    standalone option (``exclusive`` -> ``--exclusive``), *not* glued onto the
-    previous flag, since the wizard can't know which options take a value. A
-    leading ``#SBATCH`` (pasted by mistake) is stripped.
+    directive. A leading ``#SBATCH`` (pasted by mistake) is stripped.
+
+    A value may be given with ``=`` **or** with a space: a bare word becomes the
+    value of the preceding option when that option is known to take one
+    (``-C bigmem`` -> ``-C bigmem``) or when the word can't be an option name
+    (``-o /logs/%j.out``). Otherwise it is still taken as a standalone option the
+    user wrote without dashes (``exclusive`` -> ``--exclusive``, and
+    ``exclusive hold`` -> two flags).
 
     Tokenizing is quote-aware (via ``shlex``): a value quoted to hold a space —
     ``--comment="my job"`` — stays a single flag instead of splitting on the
@@ -267,23 +271,23 @@ def _parse_custom_flags(raw: str) -> list[str]:
         # Unbalanced quotes (e.g. a half-typed value) — fall back to a plain
         # whitespace split so the user still gets something rather than nothing.
         tokens = raw.split()
-    flags: list[str] = []
+    parts: list[str] = []
     for tok in tokens:
         if tok.startswith("#SBATCH"):
             tok = tok[len("#SBATCH"):]
         # A comma that introduces the next flag (one followed by a dash)
         # separates options; a comma inside a value (a node list) survives.
-        for part in re.split(r",(?=\s*-)", tok):
-            part = part.strip().rstrip(",")
-            if not part:
-                continue
-            if not part.startswith("-"):
-                part = f"--{part}"
-            flags.append(part)
-    return flags
+        parts.extend(p.strip().rstrip(",") for p in re.split(r",(?=\s*-)", tok))
+    # Shared with the builder's list/API path, so every way of supplying custom
+    # flags resolves a space-separated value identically.
+    return _join_flag_values(parts)
 
 
 MEMORY_CHOICES = ["4G", "8G", "16G", "32G", "64G", "128G", "256G", "512G", "64000M"]
+MEM_PER_CPU_CHOICES = ["1G", "2G", "4G", "8G", "2000M"]
+# Suggestions only — the field is free-text. "cpu"/"gpu" are the mandatory
+# node-type features on Perlmutter-style sites, which is why --constraint exists.
+CONSTRAINT_CHOICES = ["cpu", "gpu", "bigmem", "haswell", "knl"]
 TIME_CHOICES = ["01:00:00", "02:00:00", "04:00:00", "08:00:00", "12:00:00",
                 "24:00:00", "48:00:00", "7-00:00:00"]
 SBATCH_FLAGS = [
@@ -339,6 +343,10 @@ STEPS: list[Step] = [
          subtitle="Total memory per node (--mem) — e.g. 16G, 32G, 64000M",
          validate=validate_memory, default="16G",
          choices=MEMORY_CHOICES),
+    Step("mem_per_cpu", "Memory per CPU", "autocomplete",
+         subtitle="--mem-per-cpu, e.g. 2G — overrides Memory when set (optional, blank = use Memory)",
+         validate=validate_memory, default="",
+         choices=MEM_PER_CPU_CHOICES),
     Step("time_limit", "Time limit", "autocomplete",
          subtitle="e.g. 30 (minutes), 5:00 (mm:ss), hh:mm:ss, d-hh:mm:ss, d-hh",
          validate=validate_time, default="02:00:00",
@@ -354,6 +362,9 @@ STEPS: list[Step] = [
          validate=lambda v: v.strip().isdigit()),
     Step("gpu_type", "GPU type", "gpu_type", subtitle="GPU hardware type"),
     Step("gpu_format", "GPU format", "gpu_format", subtitle="Format style for GPU requests"),
+    Step("constraint", "Node constraint", "autocomplete",
+         subtitle="Node feature / Slurm -C, e.g. cpu, gpu, bigmem ('&' = and, '|' = or) (optional)",
+         choices=CONSTRAINT_CHOICES),
     Step("array_spec", "Array specification", "text",
          subtitle="e.g. 1-10, 1,3,5-7%4 (optional)"),
     Step("output_dir", "Output directory", "text",
@@ -361,7 +372,7 @@ STEPS: list[Step] = [
     Step("output_file", "Output file", "text",
          subtitle="Log name: %j = job ID, %A/%a = array job/task (optional; blank = auto). Bare name gets .out; .err derived", path=True),
     Step("custom_sbatch", "Custom #SBATCH flags", "autocomplete",
-         subtitle="e.g. --exclusive --reservation=abc  (space- or comma-separated, optional)",
+         subtitle='e.g. --exclusive --reservation=abc  (space/comma-separated; quote a value with spaces: --comment="my run")',
          choices=SBATCH_FLAGS),
     Step("modules", "Modules", "autocomplete",
          subtitle="Enter a name, press Enter to add (comma auto-inserted); Tab to advance when done",
@@ -696,6 +707,9 @@ class Wizard:
         # user's, and the shared text widget may still hold another step's text —
         # capture this before the pruning below drops the index.
         was_skipped = self.idx in self._skipped_indices
+        # Read the gpu_type sub-mode before it's cleared below — the save block
+        # needs it to know whether a typed value is on screen.
+        gpu_sub = self.step_cache.get("gpu_sub")
         self._skipped_indices = {i for i in self._skipped_indices if i < self.idx - 1}
         self.step_cache.pop("partition_sub", None)
         self.step_cache.pop("gpu_sub", None)
@@ -717,6 +731,13 @@ class Wizard:
                 val = self._radio_value()
                 if val:
                     self.answers[s.key] = self._coerce(val, s)
+            elif s.kind == "gpu_type" and gpu_sub == "text":
+                # The free-text GPU-type sub-mode (used when the partition lists no
+                # typed GPUs) was the one input the Back path didn't persist, so a
+                # typed model was silently lost — unlike every other kind of step.
+                val = self._text_val()
+                if val:
+                    self.answers["gpu_type"] = val
         # The live preview is cached; going backward changes which steps feed it,
         # so mark it dirty (forward navigation already does this in _advance).
         self.transient["preview_dirty"] = True
@@ -763,7 +784,11 @@ class Wizard:
             return _parse_custom_flags(val) if val else None
         if s.key == "qos":
             return None if (not val or val == "Default (none)") else val
-        if s.key in ("account", "array_spec", "gpu_type", "gpu_format",
+        if s.key == "mem_per_cpu":
+            # Normalize like batch mode does, so "2000" becomes "2000M" rather
+            # than a bare number; blank means "use --mem instead".
+            return normalize_memory(val) if val else None
+        if s.key in ("account", "array_spec", "gpu_type", "gpu_format", "constraint",
                      "output_dir", "output_file"):
             return val or None
         return val
@@ -777,6 +802,20 @@ class Wizard:
     _VALIDATED_KEYS = frozenset(
         {"cpus", "memory", "time_limit", "nodes", "ntasks_per_node", "gpus", "gpu_type"}
     )
+
+    def _cached_gpu_types(self, slot: str = "gpu_types") -> list[str] | None:
+        """GPU types cached by the gpu_type step, but only for the CURRENT partition.
+
+        The cache is keyed on the partition it was fetched for (mirroring the
+        partition-keyed QoS cache): passing a stale list to ``validate_job_config``
+        as ``extra_gpu_types`` *widens* the accepted set, so after switching
+        partitions it silently suppressed a real "GPU type not in partition list"
+        error on every step until the gpu_type step was re-entered.
+        """
+        if self.transient.get("gpu_types_part") != self.answers.get("partition"):
+            return None
+        types = self.transient.get(slot)
+        return list(types) if types else None
 
     def _config_warnings(self) -> list[tuple[str, str]]:
         """(level, message) issues for the whole work-in-progress config.
@@ -798,7 +837,11 @@ class Wizard:
             elif self._is_select_active():
                 live[s.key] = self._radio_value()
         from .system_utils import validate_job_config
-        return validate_job_config(live, extra_gpu_types=self.transient.get("gpu_types"))
+        return validate_job_config(
+            live,
+            extra_gpu_types=self._cached_gpu_types(),
+            feature_only_gpu_types=self._cached_gpu_types("gpu_types_feature_only"),
+        )
 
     def _step_default(self, s: Step) -> str:
         """Default value for a step, preferring a per-instance config override."""
@@ -812,13 +855,19 @@ class Wizard:
 
         part = self.answers.get("partition")
         if part:
-            cached_part = self.transient.get("queue_info_part")
-            if cached_part != part:
+            # Key the cache on the node count as well as the partition: the ETA is
+            # computed from whether enough idle nodes exist for `req_nodes`, and the
+            # first fetch happens on the step right after partition — before `nodes`
+            # has been entered, so it always used req_nodes=1. A later nodes=8 then
+            # never refreshed it (same partition) and the ETA stayed optimistic.
+            nodes = self.answers.get("nodes", 1)
+            if self.transient.get("queue_info_key") != (part, nodes):
                 try:
                     from .system_utils import fetch_queue_eta
-                    qinfo = fetch_queue_eta(part, req_nodes=self.answers.get("nodes", 1))
+                    qinfo = fetch_queue_eta(part, req_nodes=nodes)
                     self.transient["queue_info"] = qinfo
                     self.transient["queue_info_part"] = part
+                    self.transient["queue_info_key"] = (part, nodes)
                 except Exception as e:
                     logger.debug(f"Failed to fetch queue info in TUI: {e}")
 
@@ -1041,11 +1090,17 @@ class Wizard:
 
         part_name = self.answers.get("partition", "")
         try:
-            gpu_types = fetch_gpu_types_for_partition(part_name)
+            sources = fetch_gpu_type_sources(part_name)
         except Exception as e:
             logger.debug(f"Failed to fetch GPU types for partition {part_name}: {e}")
-            gpu_types = []
+            sources = {"typed": [], "feature": []}
+        gpu_types = sorted(set(sources["typed"]) | set(sources["feature"]))
         self.transient["gpu_types"] = gpu_types
+        # Key the cache on the partition, and keep the models that can only be
+        # requested via --constraint (count-only GRES) so the format step can
+        # default correctly and the live validation can flag a mismatch.
+        self.transient["gpu_types_part"] = part_name
+        self.transient["gpu_types_feature_only"] = list(sources["feature"])
         if gpu_types:
             choices = ["Any"] + gpu_types
             self.radio_list = RadioList([(c, c) for c in choices])
@@ -1078,6 +1133,14 @@ class Wizard:
         env_default = os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")
         if env_default not in choices:
             env_default = "gres_type"
+        # If the chosen GPU model exists only as a node *feature* (the partition's
+        # GRES is count-only, "gpu:4"), then --gres=gpu:<model>:N is a request Slurm
+        # rejects outright and "constraint" is the only format that can work.
+        # Default to it rather than letting the user walk into a doomed script.
+        gpu_type = self.answers.get("gpu_type")
+        feature_only = self._cached_gpu_types("gpu_types_feature_only") or []
+        if gpu_type and str(gpu_type) in {str(t) for t in feature_only}:
+            env_default = "constraint"
         self._set_radio_default(prev if prev and prev in choices else env_default)
 
     def _setup_ntasks_per_node(self, direction: str = "forward") -> None:
@@ -1379,13 +1442,16 @@ class Wizard:
     def _render_review_config(self) -> list[tuple[str, str]]:
         """Left column of the review step \u2014 the job configuration summary."""
         out: list[tuple[str, str]] = [("", "\n")]
-        label_w = 12
+        items = [(label, val) for label, val in self._review_summary_items() if val]
+        # Width comes from the actual labels (as the CLI summary already does): a
+        # fixed 12 neither padded nor truncated the longer ones ("Array
+        # specification", "Output directory", "Tasks per node"), so their values
+        # started mid-column and multi-line continuations lined up with nothing.
+        label_w = max((len(label) for label, _ in items), default=12)
         # Continuation lines of a multi-line value (e.g. a multi-command script)
         # line up under the value column instead of starting at column 0.
         indent = " " + " " * label_w + " "
-        for label, val in self._review_summary_items():
-            if not val:
-                continue
+        for label, val in items:
             parts = str(val).split("\n")
             out.append(("", f" {label:<{label_w}} "))
             out.append(("class:preview-text", f"{parts[0]}\n"))

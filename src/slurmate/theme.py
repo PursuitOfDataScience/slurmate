@@ -14,11 +14,25 @@ def _env_flag(name: str) -> bool:
 
 
 def _should_use_color() -> bool:
-    """Check if we should use color output based on environment."""
+    """Check if we should use color output based on environment.
+
+    ``FORCE_COLOR`` is honoured because ``rich`` honours it: without it, piping
+    slurmate's output with ``FORCE_COLOR=1`` produced half-coloured output — rich's
+    panels kept their colour while every ``c.*``-prefixed status line lost it.
+
+    The test matches rich's exactly, down to the edges: any **non-empty** value
+    forces colour (including ``FORCE_COLOR=0``, which rich also treats as "on"),
+    while ``FORCE_COLOR=""`` counts as unset — checked against the installed rich
+    rather than assumed. ``NO_COLOR`` still wins. ``CLICOLOR_FORCE`` is
+    deliberately *not* honoured: rich ignores it, so acting on it here would
+    recreate the very mismatch this removes.
+    """
     if os.environ.get("NO_COLOR"):
         return False
     if os.environ.get("TERM") == "dumb":
         return False
+    if os.environ.get("FORCE_COLOR", "").strip():
+        return True
     return sys.stdout.isatty()
 
 
@@ -115,8 +129,14 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
     use_animation = bool(animate) or _env_flag("SLURMATE_BANNER_ANIMATE")
 
     # The animation drives the cursor with absolute save/restore over the banner
-    # region; on a terminal too short to hold it, that garbles the screen. Fall
-    # back to the static banner when there isn't enough vertical room.
+    # region, which only means anything on a real terminal — into a pipe or a log
+    # file it would just emit escape soup. Colour alone is no longer a proxy for
+    # that (FORCE_COLOR can enable colour on a non-TTY), so check isatty directly.
+    if use_animation and not sys.stdout.isatty():
+        use_animation = False
+
+    # On a terminal too short to hold the banner region, the save/restore garbles
+    # the screen. Fall back to the static banner when there isn't enough room.
     if use_animation:
         try:
             rows = shutil.get_terminal_size().lines

@@ -595,3 +595,131 @@ class TestHardErrorsSubmitGuard:
     def test_no_partition_object_no_errors(self):
         from slurmate.main import _hard_errors
         assert _hard_errors({"gpus": 4}) == []
+
+
+class TestReportedLogPath:
+    """M1: the report must point at the file Slurm will actually write."""
+
+    SCRIPT_CUSTOM = (
+        "#!/bin/bash\n"
+        "#SBATCH --output=logs/j-%j.out\n"      # auto (would be suppressed now)
+        "#SBATCH --error=logs/j-%j.err\n"
+        "#SBATCH -o /real/place/%j.log\n"       # user's, and what Slurm honours
+        "true\n"
+    )
+
+    def _submit(self, mocker, script, capsys):
+        from rich.console import Console
+
+        import slurmate.main as m
+        mocker.patch.object(m, "submit_sbatch", return_value=(0, "12345", ""))
+        m._submit_and_report(script, {"job_name": "j"}, Console(), save_script=False)
+        return capsys.readouterr().out
+
+    def test_last_directive_wins(self, mocker, capsys):
+        out = self._submit(mocker, self.SCRIPT_CUSTOM, capsys)
+        assert "Log path: /real/place/12345.log" in out
+        assert "tail -f /real/place/12345.log" in out
+        assert "logs/j-12345.out" not in out
+
+    def test_space_form_is_understood(self, mocker, capsys):
+        script = "#!/bin/bash\n#SBATCH --output /somewhere/%j.out\ntrue\n"
+        out = self._submit(mocker, script, capsys)
+        assert "Log path: /somewhere/12345.out" in out
+
+    def test_plain_script_unchanged(self, mocker, capsys):
+        script = "#!/bin/bash\n#SBATCH --output=logs/j-%j.out\ntrue\n"
+        out = self._submit(mocker, script, capsys)
+        assert "Log path: logs/j-12345.out" in out
+
+    def test_no_directive_falls_back_to_job_name(self, mocker, capsys):
+        out = self._submit(mocker, "#!/bin/bash\ntrue\n", capsys)
+        assert "Log path: j-12345.out" in out
+
+
+class TestEditorLabelMatchesLaunch:
+    """L5: the menu label and the launched command must agree."""
+
+    def test_empty_editor_var_shows_the_real_fallback(self, monkeypatch):
+        from slurmate.main import _editor_command
+        monkeypatch.setenv("EDITOR", "")
+        monkeypatch.delenv("VISUAL", raising=False)
+        assert _editor_command() == ["vim"]
+        assert " ".join(_editor_command()) == "vim"   # what the menu now shows
+
+    def test_editor_with_flags(self, monkeypatch):
+        from slurmate.main import _editor_command
+        monkeypatch.setenv("EDITOR", "code --wait")
+        assert " ".join(_editor_command()) == "code --wait"
+
+
+class TestFeatureOnlyGpuTypeBlocksSubmit:
+    """H2: end-to-end through _partition_issues / _hard_errors."""
+
+    PART = {"name": "gpu", "gpu_types": [], "has_gpu": True, "cpus_per_node": 32,
+            "mem_per_node_mb": 100000, "timelimit": None}
+
+    def _answers(self, **kw):
+        a = {"_partition_obj": self.PART, "gpus": 1, "gpu_type": "a100",
+             "cpus": 4, "memory": "16G"}
+        a.update(kw)
+        return a
+
+    def test_hard_error_for_count_only_partition(self, mocker):
+        import slurmate.main as m
+        mocker.patch.object(m, "fetch_gpu_type_sources",
+                            return_value={"typed": [], "feature": ["a100"]})
+        errs = m._hard_errors(self._answers(gpu_format="gres_type"))
+        assert any("node feature" in e for e in errs)
+
+    def test_constraint_format_is_clean(self, mocker):
+        import slurmate.main as m
+        mocker.patch.object(m, "fetch_gpu_type_sources",
+                            return_value={"typed": [], "feature": ["a100"]})
+        assert m._hard_errors(self._answers(gpu_format="constraint")) == []
+
+    def test_typed_gres_is_clean(self, mocker):
+        import slurmate.main as m
+        mocker.patch.object(m, "fetch_gpu_type_sources",
+                            return_value={"typed": ["a100"], "feature": []})
+        assert m._hard_errors(self._answers(gpu_format="gres_type")) == []
+
+    def test_no_live_lookup_when_type_is_statically_known(self, mocker):
+        import slurmate.main as m
+        spy = mocker.patch.object(m, "fetch_gpu_type_sources",
+                                  return_value={"typed": [], "feature": []})
+        part = dict(self.PART, gpu_types=["a100"])
+        assert m._hard_errors(self._answers(_partition_obj=part)) == []
+        spy.assert_not_called()
+
+    def test_lookup_failure_degrades_quietly(self, mocker):
+        import slurmate.main as m
+        mocker.patch.object(m, "fetch_gpu_type_sources", side_effect=OSError("boom"))
+        assert m._hard_errors(self._answers()) == []
+
+
+class TestGpuHoursRow:
+    def test_gpu_hours_shown_only_for_gpu_jobs(self, capsys):
+        from rich.console import Console
+
+        import slurmate.main as m
+        console = Console(width=200)
+        answers = {"job_name": "j", "partition": "p", "cpus": 4, "memory": "16G",
+                   "time_limit": "02:00:00", "nodes": 2, "gpus": 4,
+                   "gpu_format": "gres_type", "command": "x"}
+        m._show_script_and_summary(console, "#!/bin/bash\ntrue\n", answers, "16.0")
+        out = capsys.readouterr().out
+        assert "GPU-hours" in out
+        answers["gpus"] = 0
+        m._show_script_and_summary(console, "#!/bin/bash\ntrue\n", answers, "16.0")
+        assert "GPU-hours" not in capsys.readouterr().out
+
+
+class TestModuleEntryPoint:
+    def test_python_dash_m_works(self):
+        import subprocess
+        import sys
+        r = subprocess.run([sys.executable, "-m", "slurmate", "--version"],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0
+        assert "slurmate" in r.stdout.lower()

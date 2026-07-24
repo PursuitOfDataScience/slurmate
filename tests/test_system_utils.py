@@ -118,7 +118,7 @@ class TestSubmitSbatch:
         assert ret == 0
         assert "not available" in err
 
-    def test_submit_creates_log_directories(self, tmp_path):
+    def test_submit_creates_log_directories(self, tmp_path, mocker):
         out_dir = tmp_path / "test_out_dir"
         err_dir = tmp_path / "test_err_dir"
         assert not out_dir.exists()
@@ -129,10 +129,43 @@ class TestSubmitSbatch:
 #SBATCH --error={err_dir}/job-%j.err
 echo hello
 """
+        # Log dirs are created only when a submission is actually going to happen,
+        # so pretend sbatch exists (and stub the call itself out).
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su.subprocess, "run", return_value=mocker.Mock(
+            returncode=0, stdout="12345", stderr=""))
         submit_sbatch(script)
 
         assert out_dir.exists()
         assert err_dir.exists()
+
+    def test_submit_creates_log_dirs_for_space_and_short_forms(self, tmp_path, mocker):
+        # L4: --output PATH (long option + space) must be recognized too, or the
+        # directory goes un-created and Slurm fails the job on a missing dir.
+        long_dir = tmp_path / "space_form"
+        short_dir = tmp_path / "short_form"
+        script = f"""#!/bin/bash
+#SBATCH --output {long_dir}/job-%j.out
+#SBATCH -e {short_dir}/job-%j.err
+echo hello
+"""
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su.subprocess, "run", return_value=mocker.Mock(
+            returncode=0, stdout="12345", stderr=""))
+        submit_sbatch(script)
+        assert long_dir.exists()
+        assert short_dir.exists()
+
+    def test_mock_mode_creates_nothing(self, tmp_path):
+        # L3: nothing is submitted in mock mode, so nothing should be written to
+        # the filesystem either (this used to leave stray log dirs behind).
+        out_dir = tmp_path / "should_not_exist"
+        script = f"#!/bin/bash\n#SBATCH --output={out_dir}/job-%j.out\ntrue\n"
+        ret, _, err = submit_sbatch(script)
+        assert ret == 0 and "not available" in err
+        assert not out_dir.exists()
 
 
 class TestHelpers:
@@ -357,7 +390,9 @@ class TestFetchGpuTypesMock:
 
     def test_unknown_partition_returns_full_list(self):
         from slurmate.system_utils import MOCK_GPU_TYPES, fetch_gpu_types_for_partition
-        assert fetch_gpu_types_for_partition("mystery") == list(MOCK_GPU_TYPES)
+        # Sorted: the flattened view unions the typed/feature sources, matching the
+        # live path (which has always returned a sorted list).
+        assert fetch_gpu_types_for_partition("mystery") == sorted(MOCK_GPU_TYPES)
 
 
 class TestNaiveConfigSections:
@@ -702,3 +737,270 @@ class TestModuleParseLmod:
         assert "(D)" not in mods
         assert "(@ompi)" not in mods
         assert all(not m.endswith(":") for m in mods)
+
+
+class TestGpuTypeProvenance:
+    """H2: a model found only in node FEATURES is not a GRES type.
+
+    Measured on a real count-only-GRES partition: `--gres=gpu:a100:1` fails with
+    "Requested node configuration is not available", while `--gres=gpu:1
+    --constraint=a100` schedules. So the two sources must be tracked separately.
+    """
+
+    def _sinfo(self, mocker, out):
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=(out, "", 0))
+        return su
+
+    def test_count_only_gres_yields_feature_source(self, mocker):
+        su = self._sinfo(mocker, "gold-6248r,384g,a100|gpu:4\n")
+        assert su.fetch_gpu_type_sources("gpu") == {"typed": [], "feature": ["a100"]}
+        # The flattened view (used by pickers) still lists it.
+        assert su.fetch_gpu_types_for_partition("gpu") == ["a100"]
+
+    def test_typed_gres_yields_typed_source(self, mocker):
+        su = self._sinfo(mocker, "gold-6346,256g,a30|gpu:a30:4\n")
+        assert su.fetch_gpu_type_sources("p") == {"typed": ["a30"], "feature": []}
+
+    def test_typed_elsewhere_promotes_out_of_feature_only(self, mocker):
+        # Mixed partition: one node types the GRES, another only features it. The
+        # model IS requestable as a GRES type, so it must not be flagged.
+        su = self._sinfo(mocker, "x,a100|gpu:a100:4\ny,a100|gpu:4\n")
+        assert su.fetch_gpu_type_sources("p") == {"typed": ["a100"], "feature": []}
+
+    def test_mock_types_count_as_typed(self):
+        from slurmate.system_utils import fetch_gpu_type_sources
+        # Demos/tests must not see a spurious format mismatch.
+        assert fetch_gpu_type_sources("gpu-shared")["feature"] == []
+
+    def test_unreachable_sinfo_returns_empty_sources(self, mocker):
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=("", "boom", 1))
+        assert su.fetch_gpu_type_sources("p") == {"typed": [], "feature": []}
+
+
+class TestFeatureOnlyGpuFormatValidation:
+    """H2: requesting a feature-only model through a GRES-naming format is an error."""
+
+    PART = {"name": "gpu", "gpu_types": [], "has_gpu": True, "cpus_per_node": 0,
+            "mem_per_node_mb": 0, "timelimit": None}
+
+    def _issues(self, fmt, **kw):
+        from slurmate.system_utils import validate_job_config
+        answers = {"_partition_obj": self.PART, "gpus": 1, "gpu_type": "a100",
+                   "gpu_format": fmt}
+        answers.update(kw)
+        return validate_job_config(answers, extra_gpu_types=["a100"],
+                                   feature_only_gpu_types=["a100"])
+
+    def test_gres_type_is_an_error(self):
+        errs = [m for lvl, m in self._issues("gres_type") if lvl == "error"]
+        assert any("node feature" in m and "constraint" in m for m in errs)
+
+    def test_every_type_naming_format_is_an_error(self):
+        for fmt in ("gres_type", "gpus", "gpus_per_node", "gpus_per_task"):
+            assert any(lvl == "error" for lvl, _ in self._issues(fmt)), fmt
+
+    def test_constraint_format_is_accepted(self):
+        assert self._issues("constraint") == []
+
+    def test_default_format_is_checked(self, monkeypatch):
+        # gpu_format unset => the builder's default (gres_type) applies, so the
+        # mismatch must still be reported rather than slipping through.
+        monkeypatch.delenv("SLURMATE_GPU_FORMAT", raising=False)
+        from slurmate.system_utils import validate_job_config
+        issues = validate_job_config(
+            {"_partition_obj": self.PART, "gpus": 1, "gpu_type": "a100"},
+            extra_gpu_types=["a100"], feature_only_gpu_types=["a100"])
+        assert any(lvl == "error" for lvl, _ in issues)
+
+    def test_typed_model_is_not_flagged(self):
+        from slurmate.system_utils import validate_job_config
+        assert validate_job_config(
+            {"_partition_obj": self.PART, "gpus": 1, "gpu_type": "a100",
+             "gpu_format": "gres_type"},
+            extra_gpu_types=["a100"], feature_only_gpu_types=[]) == []
+
+    def test_no_gpus_requested_is_not_flagged(self):
+        assert self._issues("gres_type", gpus=0) == []
+
+
+class TestGpuTypeCaseSensitivity:
+    """M6: Slurm node features are case-sensitive; validation lowercased."""
+
+    PART = {"name": "gpu", "gpu_types": ["A100"], "has_gpu": True,
+            "cpus_per_node": 0, "mem_per_node_mb": 0, "timelimit": None}
+
+    def _issues(self, gpu_type):
+        from slurmate.system_utils import validate_job_config
+        return validate_job_config({"_partition_obj": self.PART, "gpus": 1,
+                                    "gpu_type": gpu_type,
+                                    "gpu_format": "constraint"})
+
+    def test_case_mismatch_warns(self):
+        issues = self._issues("a100")
+        assert any(lvl == "warning" and "case-sensitive" in m for lvl, m in issues)
+        # Still not an error: it does name a model the partition advertises.
+        assert all(lvl != "error" for lvl, _ in issues)
+
+    def test_exact_case_is_silent(self):
+        assert self._issues("A100") == []
+
+    def test_unknown_model_still_errors_not_warns(self):
+        issues = self._issues("h100")
+        assert any(lvl == "error" and "not in partition list" in m for lvl, m in issues)
+        assert all("case-sensitive" not in m for _, m in issues)
+
+
+class TestInfraTokensAreNotGpuModels:
+    """M2: fabric / rack / form-factor feature tokens are not GPU models."""
+
+    def test_infiniband_generations_rejected(self):
+        from slurmate.system_utils import _detect_gpu_type
+        for tok in ("hdr100", "hdr200", "edr", "fdr", "ndr", "qdr", "roce", "ib0"):
+            assert _detect_gpu_type(tok, "gpu:4") == "gpu", tok
+
+    def test_rack_and_form_factor_labels_rejected(self):
+        from slurmate.system_utils import _detect_gpu_type
+        for tok in ("rack2", "rack", "row3", "pod1", "chassis4", "blade2",
+                    "sxm4", "pcie", "nvlink", "dlc"):
+            assert _detect_gpu_type(tok, "gpu:4") == "gpu", tok
+
+    def test_real_model_wins_over_earlier_infra_label(self):
+        from slurmate.system_utils import _detect_gpu_type
+        # The old shape regex matched "b12"/"t2"/"p2" and returned them because
+        # they came first in the feature list, beating the real model.
+        assert _detect_gpu_type("b12,a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("t2,a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("p2,a100", "gpu:4") == "a100"
+        assert _detect_gpu_type("rack2,edr,v100", "gpu:4") == "v100"
+        assert _detect_gpu_type("gold6248,avx512,hdr100,768g,a100", "gpu:4") == "a100"
+
+    def test_fabric_only_features_fall_back_to_generic(self):
+        from slurmate.system_utils import _detect_gpu_type
+        assert _detect_gpu_type("gold6248,avx512,hdr100,768g", "gpu:4") == "gpu"
+
+    def test_short_real_models_still_detected(self):
+        from slurmate.system_utils import _detect_gpu_type
+        for tok in ("t4", "l4", "a30", "a40", "l40s", "k80", "mi50", "h200"):
+            assert _detect_gpu_type(f"rack1,{tok}", "gpu:4") == tok, tok
+
+    def test_unknown_future_model_shape_still_detected(self):
+        from slurmate.system_utils import _detect_gpu_type
+        # Not in the known list, but shaped like one (3+ digits).
+        assert _detect_gpu_type("epyc-9335,768g,h300", "gpu:4") == "h300"
+        assert _detect_gpu_type("mi450", "gpu:4") == "mi450"
+
+    def test_case_is_preserved(self):
+        from slurmate.system_utils import _detect_gpu_type
+        # Features are case-sensitive, so the token must come back verbatim.
+        assert _detect_gpu_type("epyc-9335,768g,H200,DLC", "gpu:4") == "H200"
+        assert _detect_gpu_type("gold-6346,512g,L40S", "gpu:4") == "L40S"
+
+
+class TestSbatchLogPathForms:
+    """L4 + M1: every spelling sbatch accepts, and last-wins resolution."""
+
+    def test_all_forms_parsed(self):
+        from slurmate.system_utils import _sbatch_log_path
+        assert _sbatch_log_path("#SBATCH --output=/a/%j.out") == "/a/%j.out"
+        assert _sbatch_log_path("#SBATCH --output /a/%j.out") == "/a/%j.out"
+        assert _sbatch_log_path("#SBATCH -o /a/%j.out") == "/a/%j.out"
+        assert _sbatch_log_path("#SBATCH --error /a/%j.err") == "/a/%j.err"
+        assert _sbatch_log_path("#SBATCH -e /a/%j.err") == "/a/%j.err"
+        assert _sbatch_log_path('#SBATCH --output="/a b/%j.out"') == "/a b/%j.out"
+
+    def test_non_log_directives_and_blanks_ignored(self):
+        from slurmate.system_utils import _sbatch_log_path
+        assert _sbatch_log_path("#SBATCH --mem=16G") == ""
+        assert _sbatch_log_path("#SBATCH -o") == ""
+        assert _sbatch_log_path("echo hi") == ""
+        assert _sbatch_log_path("#SBATCH --open-mode=append") == ""
+
+    def test_kind_filter(self):
+        from slurmate.system_utils import _sbatch_log_path
+        assert _sbatch_log_path("#SBATCH -e /a.err", kind="output") == ""
+        assert _sbatch_log_path("#SBATCH -e /a.err", kind="error") == "/a.err"
+
+    def test_effective_log_path_takes_the_last(self):
+        from slurmate.system_utils import effective_log_path
+        script = ("#!/bin/bash\n#SBATCH --output=logs/j-%j.out\n"
+                  "#SBATCH --error=logs/j-%j.err\n#SBATCH -o /real/%j.log\ntrue\n")
+        assert effective_log_path(script, "output") == "/real/%j.log"
+        assert effective_log_path(script, "error") == "logs/j-%j.err"
+
+    def test_effective_log_path_empty_when_absent(self):
+        from slurmate.system_utils import effective_log_path
+        assert effective_log_path("#!/bin/bash\ntrue\n") == ""
+
+
+class TestMemoryUnitStrictness:
+    def test_petabyte_rejected(self):
+        from slurmate.system_utils import validate_memory
+        # `sbatch --mem` documents K/M/G/T and rejects 16P client-side with
+        # "Invalid --mem specification", so accepting it only deferred the failure.
+        assert validate_memory("16P") is False
+        assert validate_memory("0.5P") is False
+
+    def test_supported_units_still_accepted(self):
+        from slurmate.system_utils import validate_memory
+        for v in ("16K", "512M", "16G", "1T", "16GN", "1.5G", "64000"):
+            assert validate_memory(v) is True, v
+
+
+class TestEffectiveMemoryValidation:
+    """P2/P3: validate the memory the SCRIPT requests, not the raw answer.
+
+    The builder gives --mem-per-cpu precedence over --mem and lets a custom flag
+    suppress both, so checking `answers["memory"]` unconditionally warned about a
+    value the job never requests while staying silent about the one it does.
+    """
+
+    PART = {"name": "cpu-shared", "cpus_per_node": 32, "mem_per_node_mb": 131072,
+            "gpu_types": [], "has_gpu": False, "timelimit": None}
+
+    def _v(self, **kw):
+        from slurmate.system_utils import validate_job_config
+        a = {"_partition_obj": self.PART, "cpus": 8}
+        a.update(kw)
+        return validate_job_config(a)
+
+    def test_mem_per_cpu_total_is_checked(self):
+        # 64G/CPU x 8 cores = 512G on a 128G node: silent before.
+        warns = [m for lvl, m in self._v(mem_per_cpu="64G") if lvl == "warning"]
+        assert any("64G/CPU × 8 cores" in m and "exceeds partition limit" in m
+                   for m in warns)
+
+    def test_mem_per_cpu_within_limit_is_silent(self):
+        assert self._v(mem_per_cpu="2G") == []
+
+    def test_mem_per_cpu_accounts_for_tasks_per_node(self):
+        # 8 cpus/task x 4 tasks = 32 cores x 8G = 256G > 128G.
+        warns = [m for lvl, m in self._v(mem_per_cpu="8G", ntasks_per_node=4)
+                 if lvl == "warning"]
+        assert any("8G/CPU × 32 cores" in m for m in warns)
+
+    def test_superseded_memory_is_not_warned_about(self):
+        # --mem-per-cpu wins, so the unused --mem value must not raise a warning.
+        assert self._v(memory="512G", mem_per_cpu="2G") == []
+
+    def test_custom_mem_flag_is_what_gets_checked(self):
+        warns = [m for lvl, m in self._v(memory="16G", custom_sbatch=["--mem=512G"])
+                 if lvl == "warning"]
+        assert any("Memory (512G)" in m for m in warns)
+
+    def test_custom_mem_flag_suppresses_the_answer_check(self):
+        # The auto --mem=512G is suppressed by the custom flag, so don't warn on it.
+        assert self._v(memory="512G", custom_sbatch=["--mem=8G"]) == []
+
+    def test_plain_memory_check_unchanged(self):
+        warns = [m for lvl, m in self._v(memory="512G") if lvl == "warning"]
+        assert any("Memory (512G) exceeds partition limit (131072 MB per node)" in m
+                   for m in warns)
+
+    def test_no_cpus_answer_does_not_crash(self):
+        from slurmate.system_utils import validate_job_config
+        assert validate_job_config({"_partition_obj": self.PART,
+                                    "mem_per_cpu": "2G"}) == []

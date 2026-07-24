@@ -79,18 +79,205 @@ def _quote_custom_flag(flag: str) -> str:
     producing a script Slurm rejects. Wrap the value in double quotes — which
     Slurm strips — so it stays a single argument. A bare flag (``--exclusive``),
     a value with no whitespace, or a value the caller already quoted is emitted
-    unchanged; a value written with a space rather than ``=`` (no ``=`` present)
-    is left alone, since we can't tell which token is the value.
+    unchanged.
+
+    The **space** form (``--comment my job``) is handled too, but only when the
+    option name is a known value-taking one (``_VALUE_TAKING_FLAGS``) — that is
+    what tells us where the value starts. Otherwise the flag is left alone, since
+    guessing wrong would corrupt it. Without this, ``--comment "my job"`` typed in
+    the custom-flags box became ``#SBATCH --comment my job``, which Slurm splits
+    into ``--comment=my`` plus a stray ``job`` — the same defect the ``=`` form
+    was already protected against.
     """
-    if "=" not in flag:
-        return flag
-    name, value = flag.split("=", 1)
+    if "=" in flag:
+        name, value = flag.split("=", 1)
+        sep = "="
+    else:
+        parts = flag.split(None, 1)
+        if len(parts) != 2 or parts[0] not in _VALUE_TAKING_FLAGS:
+            return flag
+        name, value = parts
+        sep = " "
     if not value or not any(ch.isspace() for ch in value):
         return flag
     # Already wrapped in matching quotes — don't double-quote it.
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return flag
-    return f"{name}={_quote_sbatch_value(value)}"
+    return f"{name}{sep}{_quote_sbatch_value(value)}"
+
+
+# sbatch options that take a value, so a bare token following one of them is
+# that value (``-C bigmem``, ``--reservation abc``) rather than a new option.
+# Without this, every space-separated Slurm option was shredded into a valueless
+# flag plus a nonsense ``--<value>`` one — ``-o /logs/x.out`` became
+# ``['-o', '--/logs/x.out']``, a script sbatch rejects outright.
+_VALUE_TAKING_FLAGS = frozenset({
+    # short forms
+    "-a", "-A", "-b", "-c", "-C", "-d", "-D", "-e", "-F", "-G", "-i", "-J", "-L",
+    "-m", "-M", "-n", "-N", "-o", "-p", "-q", "-S", "-t", "-w", "-x",
+    # long forms plausibly typed by hand (boolean options are deliberately absent:
+    # --exclusive, --hold, --requeue, --spread-job, --contiguous, … keep the
+    # "next bare word is its own option" behaviour)
+    "--account", "--acctg-freq", "--array", "--batch", "--begin", "--chdir",
+    "--cluster", "--clusters", "--comment", "--constraint", "--container",
+    "--core-spec", "--cpu-freq", "--cpus-per-gpu", "--cpus-per-task", "--deadline",
+    "--delay-boot", "--dependency", "--distribution", "--error", "--exclude",
+    "--export", "--extra-node-info", "--gid", "--gpu-bind", "--gpu-freq", "--gpus",
+    "--gpus-per-node", "--gpus-per-socket", "--gpus-per-task", "--gres",
+    "--gres-flags", "--hint", "--input", "--job-name", "--licenses", "--mail-type",
+    "--mail-user", "--mem", "--mem-bind", "--mem-per-cpu", "--mem-per-gpu",
+    "--mincpus", "--network", "--nodefile", "--nodelist", "--nodes", "--ntasks",
+    "--ntasks-per-core", "--ntasks-per-gpu", "--ntasks-per-node",
+    "--ntasks-per-socket", "--open-mode", "--output", "--partition", "--prefer",
+    "--priority", "--profile", "--qos", "--reservation", "--signal",
+    "--sockets-per-node", "--switches", "--thread-spec", "--threads-per-core",
+    "--time", "--time-min", "--tmp", "--tres-per-task", "--uid",
+    "--wait-all-nodes", "--wckey", "--wrap",
+})
+
+# What a plausible option *name* looks like, for the "did the user forget the
+# dashes?" fallback. A path, pattern or list (``/logs/%j.out``, ``n[01-04]``,
+# ``2G``) can never be one, so such a token is treated as the preceding option's
+# value even when that option isn't in the set above.
+_OPTION_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
+
+
+def _join_flag_values(tokens: list[str]) -> list[str]:
+    """Turn a token list into flags, attaching space-separated values.
+
+    One implementation shared by the free-form parser (:func:`~slurmate.tui.
+    _parse_custom_flags`) and the list/API path (:func:`_normalize_custom_flags`),
+    so ``--custom-sbatch="-o /p"``, ``custom_sbatch = ["-o /p"]`` and
+    ``custom_sbatch = ["-o", "/p"]`` all end up as the same single directive.
+    """
+    flags: list[str] = []
+    for raw in tokens:
+        tok = raw.strip()
+        if not tok:
+            continue
+        if not tok.startswith("-"):
+            prev = flags[-1] if flags else ""
+            # An option is still "open" for a value while it has neither an "="
+            # nor an already-attached space-separated value.
+            prev_open = bool(prev) and "=" not in prev and " " not in prev
+            if prev_open and (prev in _VALUE_TAKING_FLAGS
+                              or not _OPTION_NAME_RE.match(tok)):
+                flags[-1] = f"{prev} {tok}"
+                continue
+            tok = f"--{tok}"
+        flags.append(tok)
+    return flags
+
+
+def _normalize_custom_flags(custom_sbatch: Any) -> list[str]:
+    """Coerce ``custom_sbatch`` (list | str | None) into a clean list of flags.
+
+    Single place that (a) tolerates a bare string from a direct API caller — which
+    would otherwise be iterated character-by-character — (b) folds CR/LF in an
+    entry to a space so one entry can never become two script lines, and (c)
+    rejoins an option that was split from its value across two list elements
+    (a TOML ``custom_sbatch = ["-o", "/logs/%j.out"]`` used to emit a valueless
+    ``#SBATCH -o`` plus a bare path line). Every consumer — the memory override,
+    the constraint merge, the output/error dedup, the emit loop and
+    ``job_summary_rows`` — works from this same list, so the summary and the
+    script can't disagree about what the custom flags say.
+    """
+    if not custom_sbatch:
+        return []
+    if isinstance(custom_sbatch, str):
+        from .tui import _parse_custom_flags
+        custom_sbatch = _parse_custom_flags(custom_sbatch)
+    cleaned = [
+        str(raw).replace("\r", " ").replace("\n", " ").strip() for raw in custom_sbatch
+    ]
+    return _join_flag_values([c for c in cleaned if c])
+
+
+def _split_flag(flag: str) -> tuple[str, str]:
+    """Split a custom flag into ``(name, value)``, however it was written.
+
+    Handles ``--mem=16G``, ``--mem 16G`` and ``-C bigmem`` alike, and strips a
+    quote pair the caller left around the value, so callers can compare values
+    without caring about the spelling.
+    """
+    parts = re.split(r"[=\s]", flag, maxsplit=1)
+    name = parts[0].strip()
+    value = parts[1].strip() if len(parts) > 1 else ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return name, value
+
+
+# Custom-flag names that collide with a directive the builder emits itself.
+_MEM_FLAG_NAMES = ("--mem",)
+_MEM_PER_CPU_FLAG_NAMES = ("--mem-per-cpu",)
+_CONSTRAINT_FLAG_NAMES = ("--constraint", "-C")
+_OUTPUT_FLAG_NAMES = ("--output", "-o")
+_ERROR_FLAG_NAMES = ("--error", "-e")
+
+
+def _custom_mem_override(flags: list[str]) -> tuple[str | None, str | None]:
+    """``(mem, mem_per_cpu)`` as supplied by custom flags, or ``(None, None)``.
+
+    Last occurrence wins, mirroring Slurm's own "later option overrides earlier"
+    behaviour, and both the ``=`` and space spellings count.
+    """
+    mem: str | None = None
+    mem_per_cpu: str | None = None
+    for flag in flags:
+        name, value = _split_flag(flag)
+        if name in _MEM_FLAG_NAMES:
+            mem = value
+        elif name in _MEM_PER_CPU_FLAG_NAMES:
+            mem_per_cpu = value
+    return mem, mem_per_cpu
+
+
+def _has_custom_flag(flags: list[str], names: tuple[str, ...]) -> bool:
+    return any(_split_flag(f)[0] in names for f in flags)
+
+
+def _clean_constraint(value: str) -> str:
+    """Strip all whitespace from a node-feature expression.
+
+    Slurm's feature grammar has no room for spaces: ``-C "a100 & 384g"`` is
+    rejected outright ("Invalid feature specification") while ``-C "a100&384g"``
+    schedules — measured against a live sbatch. A user typing the spaced form (or
+    a stray leading space, which produced ``--constraint= a100``) would otherwise
+    get a job Slurm refuses, so normalize instead of passing it through. Feature
+    names cannot contain whitespace, so nothing legitimate is lost.
+    """
+    return re.sub(r"\s+", "", _fold_directive(str(value)))
+
+
+def _auto_gpu_flag_name(gpu_format: str | None) -> str:
+    """The sbatch option the chosen GPU format makes the builder emit.
+
+    Used to spot a custom flag that overrides that exact option (so the auto one
+    is suppressed rather than emitted alongside it) and to report the override in
+    the summary. Deliberately keyed on the option *name*: ``--gres=gpu:2`` and
+    ``--gpus=2`` are different requests to Slurm, so a custom ``--gpus`` must not
+    suppress an auto ``--gres``.
+    """
+    fmt = (gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")).lower()
+    return {
+        "gpus": "--gpus",
+        "gpus_per_node": "--gpus-per-node",
+        "gpus_per_task": "--gpus-per-task",
+    }.get(fmt, "--gres")
+
+
+def _constraint_term(value: str) -> str:
+    """Wrap an OR-expression in parentheses so ``&``-joining keeps its meaning.
+
+    ``a|b`` merged into ``gpu&a|b`` is ambiguous; ``gpu&(a|b)`` is what the user
+    meant. A value that is already grouped (``(…)``) or is a Slurm count-bracket
+    expression (``[…]``) is left alone.
+    """
+    v = value.strip()
+    if "|" in v and (v[:1], v[-1:]) not in (("(", ")"), ("[", "]")):
+        return f"({v})"
+    return v
 
 
 def _gpus_int(answers: dict[str, Any]) -> int:
@@ -124,8 +311,19 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     if qos and qos != "Default (none)":
         add("QoS", qos)
     add("CPUs", answers.get("cpus"))
-    # Mirror the builder: --mem-per-cpu takes precedence over --mem when set.
-    if answers.get("mem_per_cpu"):
+    # Memory must reflect what the SCRIPT will actually request, not what the
+    # answers dict happens to hold: a custom --mem / --mem-per-cpu flag suppresses
+    # the auto directive in the builder, so showing the (now unused) answer value
+    # here made the summary and the generated script disagree.
+    custom_flags = _normalize_custom_flags(answers.get("custom_sbatch"))
+    custom_mem, custom_mem_per_cpu = _custom_mem_override(custom_flags)
+    if custom_mem_per_cpu or custom_mem:
+        # A custom flag wins. Both can be present (Slurm would reject that, but
+        # it's the user's script) — show whatever the script really says.
+        add("Mem per CPU", custom_mem_per_cpu)
+        add("Memory", custom_mem)
+    elif answers.get("mem_per_cpu"):
+        # Mirror the builder: --mem-per-cpu takes precedence over --mem when set.
         add("Mem per CPU", answers.get("mem_per_cpu"))
     else:
         add("Memory", answers.get("memory"))
@@ -136,8 +334,29 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     if answers.get("ntasks_per_node"):
         add("Tasks per node", answers.get("ntasks_per_node"))
     if _gpus_int(answers) > 0:
-        add("GPUs", f"{answers.get('gpus')} × {answers.get('gpu_type') or 'any'}")
-        add("GPU format", answers.get("gpu_format"))
+        # Same rule as memory above: report the request the SCRIPT makes. A custom
+        # flag on the option the chosen format would emit overrides it, so showing
+        # "2 × a100" while the script says --gres=gpu:h100:4 would be a plain lie.
+        auto_gpu = _auto_gpu_flag_name(answers.get("gpu_format"))
+        gpus_n = _gpus_int(answers)
+        gpu_t = answers.get("gpu_type")
+        typed = bool(gpu_t and str(gpu_t).lower() != "any")
+        if auto_gpu == "--gres":
+            auto_val = f"gpu:{gpu_t}:{gpus_n}" if (
+                typed and (answers.get("gpu_format") or "gres_type") == "gres_type"
+            ) else f"gpu:{gpus_n}"
+        else:
+            auto_val = f"{gpu_t}:{gpus_n}" if typed else f"{gpus_n}"
+        override = next(
+            (f for f in custom_flags
+             for n, v in [_split_flag(f)] if n == auto_gpu and v and v != auto_val),
+            None,
+        )
+        if override:
+            add("GPUs", f"{override} (custom flag)")
+        else:
+            add("GPUs", f"{answers.get('gpus')} × {answers.get('gpu_type') or 'any'}")
+            add("GPU format", answers.get("gpu_format"))
     add("Constraint", answers.get("constraint"))
     add("Array specification", answers.get("array_spec"))
     add("Output directory", answers.get("output_dir"))
@@ -162,12 +381,15 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
     # Expand ~ / ~user in log paths at build time: neither Slurm nor
     # os.makedirs expands a leading "~", so an unexpanded "~/logs" would create a
     # literal "./~" directory and send logs to the wrong place.
+    # strip() FIRST: expanduser() only acts on a value that *starts* with "~", so
+    # a config/CLI value written as " ~/logs" (leading space) would otherwise be
+    # stripped later and emitted with a literal "~" still attached.
     output_dir = answers.get("output_dir")
     if output_dir:
-        output_dir = os.path.expanduser(output_dir)
+        output_dir = os.path.expanduser(str(output_dir).strip())
     output_file = answers.get("output_file")
     if output_file:
-        output_file = os.path.expanduser(output_file)
+        output_file = os.path.expanduser(str(output_file).strip())
     job_name = sanitize_job_name(answers.get("job_name", ""))
     prefix = job_name if job_name else "slurm"
 
@@ -335,16 +557,15 @@ def build_sbatch_script(
     # callers of the builder API that bypass the CLI/TUI validators.
     if cpus is not None:
         lines.append(f"#SBATCH --cpus-per-task={_fold_directive(str(cpus))}")
+    # Normalize the custom flags once, up front: the memory override, the
+    # constraint merge and the output/error dedup below all consult this list
+    # before their own directive is emitted.
+    custom_flags = _normalize_custom_flags(custom_sbatch)
     # If the user supplied their own memory directive via custom flags, don't also
     # emit the auto one: Slurm rejects a script that sets both --mem and
     # --mem-per-cpu, so a user override wins (mirrors the GPU-flag dedup below).
-    _cs_for_mem = custom_sbatch if isinstance(custom_sbatch, list) else []
-    if isinstance(custom_sbatch, str):
-        from .tui import _parse_custom_flags
-        _cs_for_mem = _parse_custom_flags(custom_sbatch)
-    _custom_mem = any(
-        str(f).strip().startswith(("--mem=", "--mem-per-cpu=")) for f in _cs_for_mem
-    )
+    _cm, _cmpc = _custom_mem_override(custom_flags)
+    _custom_mem = bool(_cm or _cmpc)
     # Memory: --mem-per-cpu takes precedence over --mem when set (Slurm treats the
     # two as mutually exclusive). A blank memory omits the directive entirely — what
     # whole-node/exclusive sites need: e.g. TACC rejects any script that sets --mem.
@@ -370,7 +591,24 @@ def build_sbatch_script(
     # otherwise keep only the last one, silently dropping the node feature).
     constraint_parts: list[str] = []
     if constraint:
-        constraint_parts.append(_fold_directive(str(constraint)))
+        constraint_parts.append(_clean_constraint(constraint))
+
+    # A custom --constraint / -C is merged into the SAME directive rather than
+    # appended as a second one. Slurm keeps only the last --constraint it sees and
+    # silently discards the earlier one (measured: an invalid feature placed first
+    # schedules fine, placed last it fails with "Invalid feature specification"),
+    # and because the custom-flag loop runs last, the directive being discarded was
+    # always slurmate's own — dropping the GPU type or the node feature the user
+    # asked for, with no error. Merging with "&" (AND) keeps both requirements.
+    # Collected here, appended after the GPU block (so the merged value reads
+    # param → GPU type → custom), and skipped in the emit loop below.
+    custom_constraints: list[str] = []
+    consumed_custom: set[int] = set()
+    for _i, _flag in enumerate(custom_flags):
+        _name, _value = _split_flag(_flag)
+        if _name in _CONSTRAINT_FLAG_NAMES and _value:
+            custom_constraints.append(_clean_constraint(_value))
+            consumed_custom.add(_i)
 
     gpu_fmt = (gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")).lower()
     gpu_any = gpu_type is not None and gpu_type.lower() == "any"
@@ -384,54 +622,87 @@ def build_sbatch_script(
     emitted_gpus_per_task: str | None = None
     if gpus > 0:
         typed = bool(gpu_type and not gpu_any)
-        if gpu_fmt == "gpus":
-            emitted_gpus = f"{gpu_type}:{gpus}" if typed else f"{gpus}"
-            lines.append(f"#SBATCH --gpus={emitted_gpus}")
-        elif gpu_fmt == "gpus_per_node":
-            emitted_gpus_per_node = f"{gpu_type}:{gpus}" if typed else f"{gpus}"
-            lines.append(f"#SBATCH --gpus-per-node={emitted_gpus_per_node}")
-        elif gpu_fmt == "gpus_per_task":
-            emitted_gpus_per_task = f"{gpu_type}:{gpus}" if typed else f"{gpus}"
-            lines.append(f"#SBATCH --gpus-per-task={emitted_gpus_per_task}")
+        # The value the chosen format would request, computed before emitting so a
+        # custom flag on the same option can be compared against it.
+        if gpu_fmt in ("gpus", "gpus_per_node", "gpus_per_task"):
+            auto_value = f"{gpu_type}:{gpus}" if typed else f"{gpus}"
         elif gpu_fmt == "gres_type" and typed:
-            emitted_gres = f"gpu:{gpu_type}:{gpus}"
-            lines.append(f"#SBATCH --gres={emitted_gres}")
+            auto_value = f"gpu:{gpu_type}:{gpus}"
         else:  # "constraint" (also gres_type with no/any type)
-            emitted_gres = f"gpu:{gpus}"
-            lines.append(f"#SBATCH --gres={emitted_gres}")
-            if typed:
-                constraint_parts.append(str(gpu_type))
+            auto_value = f"gpu:{gpus}"
+        # A custom flag on the SAME option, with a DIFFERENT value, suppresses the
+        # auto directive — exactly as a custom --mem/--output does. Slurm honours
+        # the last option, so the override already won; leaving the auto directive
+        # in the script merely contradicted it, and made the summary describe a GPU
+        # request the job doesn't make. An *exact* duplicate is handled the other way
+        # round (auto kept, custom dropped by the loop below) so the script keeps
+        # slurmate's canonical `=` spelling. Only the option's own name counts:
+        # --gres and --gpus are different requests to Slurm.
+        auto_flag = _auto_gpu_flag_name(gpu_fmt)
+        custom_value = next(
+            (v for f in custom_flags
+             for n, v in [_split_flag(f)] if n == auto_flag and v),
+            None,
+        )
+        overridden = custom_value is not None and custom_value != auto_value
+        if not overridden:
+            if gpu_fmt == "gpus":
+                emitted_gpus = auto_value
+                lines.append(f"#SBATCH --gpus={emitted_gpus}")
+            elif gpu_fmt == "gpus_per_node":
+                emitted_gpus_per_node = auto_value
+                lines.append(f"#SBATCH --gpus-per-node={emitted_gpus_per_node}")
+            elif gpu_fmt == "gpus_per_task":
+                emitted_gpus_per_task = auto_value
+                lines.append(f"#SBATCH --gpus-per-task={emitted_gpus_per_task}")
+            else:
+                emitted_gres = auto_value
+                lines.append(f"#SBATCH --gres={emitted_gres}")
+        # The GPU type is a *separate* requirement from the GRES count under the
+        # constraint format, so it is recorded either way (the merge above keeps it
+        # alongside any node -C).
+        if gpu_fmt == "constraint" and typed:
+            constraint_parts.append(str(gpu_type))
 
-    # Emit the merged node/GPU constraint as a single directive.
+    constraint_parts.extend(custom_constraints)
+
+    # Emit the merged node/GPU/custom constraint as a single directive. De-dup
+    # case-SENSITIVELY: Slurm node features are case-sensitive (measured — a node
+    # advertising "a100" is not matched by "-C A100"), so "A100" and "a100" are
+    # different requirements and must not be folded together.
     if constraint_parts:
-        lines.append(f"#SBATCH --constraint={'&'.join(constraint_parts)}")
+        merged: list[str] = []
+        for part in constraint_parts:
+            if part and part not in merged:
+                merged.append(part)
+        joined = "&".join(_constraint_term(p) for p in merged) if len(merged) > 1 else merged[0]
+        lines.append(f"#SBATCH --constraint={joined}")
 
     if array_spec:
         lines.append(f"#SBATCH --array={_fold_directive(array_spec)}")
 
     # Output/error are auto-derived. In a partial preview, only show them once
     # the user has actually configured an output dir/file (output_path is set).
+    # A custom --output/-o (or --error/-e) SUPPRESSES the matching auto directive,
+    # exactly as a custom --mem does above: Slurm honours the last one, so emitting
+    # both left a contradictory directive in the script and made every consumer that
+    # reads the script (the "Log path:"/tail -f hint, the log-dir pre-creation) pick
+    # the wrong file. Each stream is handled independently, so overriding only
+    # stdout keeps the derived stderr path.
     if not partial or output_path:
         prefix = job_name if job_name else "slurm"
         tag = "%A_%a" if array_spec else "%j"
         out = output_path or f"{prefix}-{tag}.out"
         err = error_path or f"{prefix}-{tag}.err"
-        lines.append(f"#SBATCH --output={_quote_sbatch_value(out)}")
-        lines.append(f"#SBATCH --error={_quote_sbatch_value(err)}")
+        if not _has_custom_flag(custom_flags, _OUTPUT_FLAG_NAMES):
+            lines.append(f"#SBATCH --output={_quote_sbatch_value(out)}")
+        if not _has_custom_flag(custom_flags, _ERROR_FLAG_NAMES):
+            lines.append(f"#SBATCH --error={_quote_sbatch_value(err)}")
 
-    if custom_sbatch:
-        # Defensive: a bare string here would be iterated character-by-character
-        # (#SBATCH m, #SBATCH i, …). Callers should pass a list; coerce just in
-        # case by splitting on commas.
-        if isinstance(custom_sbatch, str):
-            from .tui import _parse_custom_flags
-            custom_sbatch = _parse_custom_flags(custom_sbatch)
-        for flag in custom_sbatch:
-            # A newline inside a list entry would inject a second, non-#SBATCH
-            # line into the script body; fold any newline into a space so the
-            # entry stays a single directive.
-            flag = str(flag).replace("\n", " ").replace("\r", " ").strip()
-            if not flag:
+    if custom_flags:
+        for idx, flag in enumerate(custom_flags):
+            # Already merged into the single --constraint directive above.
+            if idx in consumed_custom:
                 continue
             if gpus > 0:
                 # Derive the flag name whether written with '=' or a space, and
@@ -441,9 +712,7 @@ def build_sbatch_script(
                 # wizard's a100) is a deliberate override and must be kept, so it
                 # isn't silently discarded (previously any gpu: --gres and any
                 # --gpus were stripped, dropping user overrides).
-                name_val = re.split(r"[=\s]", flag, maxsplit=1)
-                flag_name = name_val[0].strip()
-                flag_val = name_val[1].strip() if len(name_val) > 1 else ""
+                flag_name, flag_val = _split_flag(flag)
                 if flag_name == "--gres" and emitted_gres is not None \
                         and flag_val == emitted_gres:
                     continue
@@ -456,9 +725,9 @@ def build_sbatch_script(
                 if flag_name == "--gpus-per-task" and emitted_gpus_per_task is not None \
                         and flag_val == emitted_gpus_per_task:
                     continue
-                if gpu_fmt == "constraint" and flag_name == "--constraint" \
-                        and gpu_type and not gpu_any and flag_val == gpu_type:
-                    continue
+                # (A custom --constraint needs no dedup here: every one of them was
+                # merged into the single --constraint directive above, which drops
+                # an exact duplicate of the GPU type as part of the merge.)
             lines.append(f"#SBATCH {_quote_custom_flag(flag)}")
 
     # Defensive: a bare string here (from a direct API caller) would be iterated
@@ -496,7 +765,20 @@ def build_sbatch_script(
             # case — leaving the job in the base/system Python.
             lines.append("")
             lines.append('source "$(conda info --base)/etc/profile.d/conda.sh"')
-            lines.append(f"{strategy} activate {shlex.quote(env_name)}")
+            quoted = shlex.quote(env_name)
+            if strategy == "mamba":
+                # conda.sh defines the `conda` hook only. mamba >= 2 (miniforge's
+                # current default) needs its OWN hook, so a bare `mamba activate`
+                # here dies with "critical libmamba Shell not initialized" — and,
+                # crucially, the script keeps going, so the job silently runs in
+                # whatever interpreter it inherited. Fall back to `conda activate`,
+                # which activates a mamba-created env identically (verified on
+                # miniforge 25.3 / mamba 2.x: the bare form exits 1, this form
+                # exits 0 with the right sys.prefix).
+                lines.append("# mamba >= 2 needs its own shell hook; conda activates the same env")
+                lines.append(f"mamba activate {quoted} >/dev/null 2>&1 || conda activate {quoted}")
+            else:
+                lines.append(f"conda activate {quoted}")
         elif strategy in ("virtualenv (venv)", "venv"):
             lines.append("")
             # rstrip a trailing "/" so "/venv/" doesn't become "/venv//bin/activate".
@@ -544,8 +826,45 @@ def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
     hours = minutes / 60.0
     tasks = ntasks_per_node if (ntasks_per_node and ntasks_per_node > 0) else 1
     su = cpus * tasks * hours * nodes
-    if su < 1:
-        return f"{su:.2f}"
-    if su < 100:
-        return f"{su:.1f}"
-    return f"{su:,.0f}"
+    return _fmt_estimate(su)
+
+
+def _fmt_estimate(value: float) -> str:
+    if value < 1:
+        return f"{value:.2f}"
+    if value < 100:
+        return f"{value:.1f}"
+    return f"{value:,.0f}"
+
+
+def estimate_gpu_hours(gpus: int, time_limit: str, nodes: int = 1,
+                       gpu_format: str | None = None,
+                       ntasks_per_node: int | None = None) -> str:
+    """Estimate a job's GPU cost in GPU-hours, or "" for a CPU-only job.
+
+    GPU allocation is per-node for ``--gres``/``--gpus-per-node`` (and the
+    constraint form), per-task for ``--gpus-per-task``, and job-wide for
+    ``--gpus`` — so the multiplier has to follow the chosen ``gpu_format``, not
+    just the raw count. Reported next to the CPU-hours figure because on nearly
+    every GPU site it is the GPU, not the core, that drives the bill.
+    """
+    try:
+        gpus = int(gpus)
+    except (TypeError, ValueError):
+        return ""
+    if gpus <= 0:
+        return ""
+    nodes = max(1, nodes or 1)
+    minutes = _parse_slurm_time_to_minutes(time_limit) if time_limit else 120.0
+    if minutes <= 0:
+        minutes = 120.0
+    hours = minutes / 60.0
+    fmt = (gpu_format or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")).lower()
+    if fmt == "gpus":
+        total = gpus                                    # job-wide total
+    elif fmt == "gpus_per_task":
+        tasks = ntasks_per_node if (ntasks_per_node and ntasks_per_node > 0) else 1
+        total = gpus * tasks * nodes
+    else:                                               # gres_type / constraint / gpus_per_node
+        total = gpus * nodes
+    return _fmt_estimate(total * hours)

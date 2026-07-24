@@ -71,7 +71,7 @@ pip install -e ".[dev]"     # editable + dev tools (pytest, ruff, mypy)
 ### Interactive mode (the TUI)
 
 ```bash
-slurmate
+slurmate            # or: python -m slurmate
 ```
 
 A full-screen wizard walks you through name → resources → environment →
@@ -141,7 +141,7 @@ Run `slurmate --help` for the full flag list.
 | 📁 **Path autocomplete** | `Tab`-complete file paths while typing your command, virtualenv path, or output files — no more retyping long project paths. |
 | ↩️ **Skip & come back** | Leave steps blank, navigate freely with `Esc`, and get reminded of anything missing before submit. |
 | 📋 **Copy-friendly** | Mouse capture is off so you can select/copy the preview natively; navigation is fully keyboard-driven. |
-| 🧩 **Cluster-agnostic GPU syntax** | Choose `--gres=gpu:type:N`, `--gres` + `--constraint`, or `--gpus` to match your site. |
+| 🧩 **Cluster-agnostic GPU syntax** | Five formats — `--gres=gpu:type:N`, `--gres` + `--constraint`, `--gpus`, `--gpus-per-node`, `--gpus-per-task` — and slurmate flags a GPU model that a site only exposes as a node feature, where a typed `--gres` would be rejected. |
 | 🐍 **Env activation** | Conda, Mamba, virtualenv, or none — generated automatically. |
 | 🗂️ **Smart output paths** | Set a custom log name/pattern (`%j` = job ID, `%A`/`%a` = array job/task); error path is derived and log dirs are auto-created. Array jobs default to the `%A_%a` pattern. |
 | ♻️ **Reproducible** | Every submission is saved locally as `<job>-<job-id>.sh`; you can also save manually or edit in `$EDITOR` before submitting. |
@@ -167,16 +167,21 @@ partition   = "gpu-shared"
 cpus        = 8
 memory      = "32G"
 time_limit  = "04:00:00"
-gpu_format  = "gres_type"            # gres_type | constraint | gpus
+gpu_format  = "gres_type"            # gres_type | constraint | gpus | gpus_per_node | gpus_per_task
+constraint  = "gpu"                  # node feature / Slurm -C (e.g. Perlmutter's cpu|gpu)
+mem_per_cpu = "2G"                   # --mem-per-cpu; overrides `memory` when set
 env_type    = "conda"                # conda | mamba | venv | none
 modules     = ["cuda/12.1", "gcc/9.3.0"]
 output_dir  = "logs"
 ```
 
 **Recognized keys:** `job_name`, `account`, `partition`, `qos`, `cpus`, `memory`,
-`time_limit`, `nodes`, `ntasks_per_node`, `gpus`, `gpu_type`, `gpu_format`,
-`array_spec`, `modules`, `env_type`, `env_name`, `output_dir`, `output_file`,
-`command`, `custom_sbatch`.
+`mem_per_cpu`, `time_limit`, `nodes`, `ntasks_per_node`, `gpus`, `gpu_type`,
+`gpu_format`, `constraint`, `array_spec`, `modules`, `env_type`, `env_name`,
+`output_dir`, `output_file`, `command`, `custom_sbatch`.
+
+Every one of them is also a wizard step, so a config file prefills the
+interactive flow and batch mode identically.
 
 Keys may sit at the top level or under a `[defaults]` or `[slurmate]` table.
 When the same key appears in more than one place, the effective precedence is
@@ -194,14 +199,15 @@ flags always override the file.
 | Variable | Effect |
 |---|---|
 | `SLURMATE_MOCK=1` | Force mock mode even when Slurm is installed (great for demos/tests). |
-| `SLURMATE_GPU_FORMAT` | Default GPU syntax: `gres_type` (default) · `constraint` · `gpus`. |
+| `SLURMATE_GPU_FORMAT` | Default GPU syntax: `gres_type` (default) · `constraint` · `gpus` · `gpus_per_node` · `gpus_per_task`. |
 | `SLURMATE_LOG_DIR=…` | Save the submitted script there (instead of the working dir) for reproducibility. |
 | `SLURMATE_NO_SAVE=1` | Don't auto-save a `<job>-<id>.sh` copy on submit (same as `--no-save-script`). |
 | `SLURMATE_NO_BANNER=1` | Hide the startup banner. |
-| `SLURMATE_BANNER_ANIMATE=1` | Force the animated banner even when not a TTY. |
+| `SLURMATE_BANNER_ANIMATE=1` | Animate the startup banner (needs a real TTY; ignored when output is piped). |
 | `SLURMATE_DEBUG=1` | Verbose debug logging. |
 
-`NO_COLOR` and non-TTY output are respected automatically.
+`NO_COLOR` and non-TTY output are respected automatically; `FORCE_COLOR=1`
+forces colour on for both the `rich` panels and the plain status lines.
 
 ---
 

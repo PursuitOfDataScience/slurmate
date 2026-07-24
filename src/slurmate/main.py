@@ -15,9 +15,16 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .builder import build_from_answers, estimate_su, job_summary_rows, sanitize_job_name
+from .builder import (
+    build_from_answers,
+    estimate_gpu_hours,
+    estimate_su,
+    job_summary_rows,
+    sanitize_job_name,
+)
 from .system_utils import (
-    fetch_gpu_types_for_partition,
+    effective_log_path,
+    fetch_gpu_type_sources,
     fetch_partitions,
     fetch_queue_eta,
     load_config,
@@ -312,13 +319,18 @@ def _partition_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
     A GPU model the partition doesn't statically list may still be valid \u2014 a live
     ``sinfo`` lookup can surface types the cached partition object missed, so widen
     the known set with a one-shot query (only when there's an unrecognized type, to
-    avoid a needless call). Single source of truth shared by the CLI summary and the
-    pre-submit guard.
+    avoid a needless call). The same query also reports *how* each model can be
+    requested (typed GRES vs. node feature only), which is what catches a
+    ``--gres=gpu:<model>:N`` request on a count-only-GRES partition. A model that
+    IS in the static list came from a typed ``gpu:MODEL:N`` by construction (that is
+    all ``fetch_partitions`` records), so skipping the lookup for it is safe.
+    Single source of truth shared by the CLI summary and the pre-submit guard.
     """
     part = answers.get("_partition_obj")
     if not part:
         return []
     extra_gpu_types: list[str] = []
+    feature_only: list[str] = []
     gpu_type = answers.get("gpu_type")
     if gpu_type and str(gpu_type).lower() != "any":
         static = {str(g).lower() for g in part.get("gpu_types", [])}
@@ -326,10 +338,17 @@ def _partition_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
             part_name = part.get("name", "")
             if part_name:
                 try:
-                    extra_gpu_types = fetch_gpu_types_for_partition(part_name)
+                    sources = fetch_gpu_type_sources(part_name)
+                    extra_gpu_types = sorted(
+                        set(sources["typed"]) | set(sources["feature"])
+                    )
+                    feature_only = list(sources["feature"])
                 except Exception:
                     extra_gpu_types = []
-    return validate_job_config(answers, extra_gpu_types=extra_gpu_types)
+                    feature_only = []
+    return validate_job_config(
+        answers, extra_gpu_types=extra_gpu_types, feature_only_gpu_types=feature_only
+    )
 
 
 def _validate_partition_limits(answers: dict[str, Any], console: Console) -> None:
@@ -425,6 +444,18 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         # is still in the script panel) so the panel width stays correct.
         rows.append((f"{label}:", val.replace("\n", " \u21b5 "), style))
     rows.append(("Estimated CPU-hours:", f"{su_estimate}", "#ffaa00"))
+    # GPU-hours too, when the job asks for GPUs: core-hours are honest but on a GPU
+    # site they are not the number that gets billed. The multiplier follows the
+    # chosen gpu_format (per-node vs per-task vs job-wide).
+    gpu_hours = estimate_gpu_hours(
+        answers.get("gpus", 0) or 0,
+        answers.get("time_limit", "02:00:00"),
+        answers.get("nodes", 1) or 1,
+        answers.get("gpu_format"),
+        answers.get("ntasks_per_node"),
+    )
+    if gpu_hours:
+        rows.append(("Estimated GPU-hours:", gpu_hours, "#ffaa00"))
     if queue_info:
         rows.append(("Queue:", f"{queue_info['running']} running / {queue_info['pending']} pending", "white"))
         eta_color = "green" if queue_info["eta_seconds"] < 3600 else "#ffaa00"
@@ -584,11 +615,11 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
             print(f"  {c.GRAY}Script saved: {saved}{c.RESET}")
 
     # Read the actual --output path from the generated script (source of truth).
-    log_path = f"{answers.get('job_name', '') or 'slurm'}-%j.out"
-    for line in script.splitlines():
-        if line.startswith("#SBATCH --output="):
-            log_path = line.split("=", 1)[1].strip().strip('"').strip("'")
-            break
+    # effective_log_path takes the LAST output directive (what Slurm honours) and
+    # understands the short/space spellings, so a hand-edited or custom-flag
+    # `-o`/`--output PATH` no longer makes this point at a file the job never wrote.
+    log_path = (effective_log_path(script, "output")
+                or f"{answers.get('job_name', '') or 'slurm'}-%j.out")
     # Resolve the job-id patterns we can (%j and %A → this job id); leave the
     # per-task %a literal for array jobs since there's no single task to point at.
     resolved_log = log_path.replace("%A", job_id).replace("%j", job_id)
@@ -633,7 +664,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Output log file name/pattern (%%j = job ID); error derives .err")
     parser.add_argument("--command", default=None, help="Command to run")
     parser.add_argument("--custom-sbatch", default=None,
-                        help="Comma-separated extra #SBATCH flags (e.g. --exclusive,--reservation=abc)")
+                        help="Extra #SBATCH flags, space- or comma-separated (e.g. "
+                             "--exclusive,--reservation=abc). A value may use '=' or a "
+                             "space (-C bigmem); quote one that contains a space "
+                             "(--comment=\"my run\")")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation and submit")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show the full summary (script, limit warnings, CPU-hours/ETA, "
@@ -749,7 +783,10 @@ def main() -> None:
 
     from .theme import questionary_style
     QS = questionary_style()
-    editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vim"))
+    # Label the menu with the command that will actually be launched — the raw
+    # env lookup disagreed with _editor_command() whenever EDITOR was set but
+    # empty (menu said "Open script in ", vim was launched).
+    editor = " ".join(_editor_command())
     default_name = f"{answers.get('job_name', '') or 'slurm'}.sh"
 
     def _resummarize() -> None:

@@ -121,9 +121,12 @@ def validate_memory(value: str) -> bool:
     # Accepts plain digits — reject a zero magnitude.
     if v.isdigit():
         return int(v) > 0
-    # Accepts with unit suffix (KMGTP) and optional Slurm N/C — but reject a
-    # zero magnitude regardless of unit ("0G"/"0M" are not valid sizes).
-    m = re.match(r"^(\d+(?:\.\d+)?)([KMGTP])(?:[NC])?$", v.upper())
+    # Accepts a unit suffix and optional Slurm N/C — but reject a zero magnitude
+    # regardless of unit ("0G"/"0M" are not valid sizes). Units are K/M/G/T only:
+    # that is all `sbatch --mem` documents, and it rejects anything else
+    # client-side ("sbatch: error: Invalid --mem specification" for 16P), so
+    # accepting "P" here only let a doomed value through to the submit call.
+    m = re.match(r"^(\d+(?:\.\d+)?)([KMGT])(?:[NC])?$", v.upper())
     if m:
         return float(m.group(1)) > 0
     return False
@@ -185,12 +188,48 @@ def normalize_memory(value: str) -> str:
     return v
 
 
-# A token shaped like a GPU model name: a known GPU-family letter prefix
-# immediately followed by a digit (a100, h100/h200, v100, l40s, t4, p100, k80,
-# b200, mi250, gh200, gb200, rtx6000/gtx…). Deliberately does NOT match bare CPU
-# tokens like "i7"/"gold6248"/"avx512" (their prefixes aren't GPU families).
+# Known GPU model names, checked before any shape heuristic. This is what makes
+# the short models (t4, l4, a30, a40, k80, mi50 …) recognizable without also
+# accepting two-character rack/chassis labels that happen to share their shape.
+_KNOWN_GPU_MODELS = frozenset({
+    # NVIDIA datacenter
+    "a2", "a10", "a16", "a30", "a40", "a100", "a800", "h20", "h100", "h200",
+    "h800", "b100", "b200", "gb200", "gh200", "v100", "v100s", "p100", "p40",
+    "p4", "k80", "k40", "k20", "l4", "l40", "l40s", "t4", "t10",
+    # NVIDIA workstation / consumer (as clusters label them)
+    "rtx4000", "rtx5000", "rtx6000", "rtx8000", "a4000", "a4500", "a5000",
+    "a6000", "rtx2080", "rtx3080", "rtx3090", "rtx4090", "titanv", "titanx",
+    "titanrtx",
+    # AMD Instinct
+    "mi25", "mi50", "mi60", "mi100", "mi210", "mi250", "mi250x", "mi300",
+    "mi300a", "mi300x", "mi325x",
+    # Intel
+    "pvc", "max1100", "max1550", "gaudi", "gaudi2", "gaudi3",
+})
+
+# A token *shaped* like a GPU model name: a known GPU-family letter prefix
+# followed by at least THREE digits (a100, h200, v100, p100, b200, mi250, gh200,
+# gb200, rtx6000, …), so an unreleased future model is still detected. The digit
+# run must be 3+ because two-character labels are ambiguous with the rack /
+# chassis / blade tags clusters put in node features ("b12", "t2", "p2") — those
+# used to win here purely by appearing earlier in the feature list than the real
+# model. Shorter real models are covered by _KNOWN_GPU_MODELS above.
 _GPU_MODEL_RE = re.compile(
-    r"^(?:a|h|v|l|t|p|k|b|rtx|gtx|mi|gh|gb|quadro|tesla)\d", re.IGNORECASE
+    r"^(?:a|h|v|l|t|p|k|b|rtx|gtx|mi|gh|gb|quadro|tesla)\d{3,}", re.IGNORECASE
+)
+
+# Infrastructure tokens that are not GPU models but pass a naive filter: network
+# fabric generations and adapters, rack/chassis/position labels, GPU *form
+# factors*, and cooling tags. The pre-existing blocklist already carried
+# "ib"/"opa"/"hdr" — these are the same convention's other spellings, which is
+# how a partition whose features read "gold6248,avx512,hdr100,768g" came back
+# with a GPU type of "hdr100".
+_INFRA_TOKEN_RE = re.compile(
+    r"^(?:sdr|ddr|qdr|fdr|edr|hdr|ndr|xdr)\d*$"          # InfiniBand generations
+    r"|^(?:ib|opa|omnipath|roce|eth|ether|bond|enp|eno|mlx|ofed)\d*$"  # fabrics/NICs
+    r"|^(?:rack|racks|row|rk|pod|cab|cabinet|chassis|blade|shelf|slot|island|zone|cell|unit)[\w-]*$"
+    r"|^(?:sxm|sxm2|sxm3|sxm4|sxm5|pcie|nvlink|nvswitch|mig|dlc|lc|air|water|oam)$",
+    re.IGNORECASE,
 )
 
 # CPU-generation tags that share a GPU-family letter prefix and would otherwise
@@ -210,11 +249,18 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
           a model seen in a typed GRES elsewhere in the partition. This
           disambiguates nodes whose features list rack/filesystem labels
           *before* the GPU (e.g. ``rack5,gpfs,a40`` → ``a40``).
-       b. Otherwise (no corroborating match, or no ``known_models``), fall back
-          to negative filtering: reject obvious CPU/arch/infra tokens and return
-          the first plausible one. This keeps detecting GPU types that only ever
-          appear in features and never in a typed GRES.
+       b. A token that is a *known* GPU model name (``_KNOWN_GPU_MODELS``).
+       c. A token *shaped* like a model name (family letter + 3-plus digits), so
+          a model too new for the list is still found.
+       d. Otherwise, fall back to negative filtering: reject obvious CPU / arch /
+          fabric / rack / form-factor tokens and return the first plausible one.
+          This keeps detecting GPU types that only ever appear in features and
+          never in a typed GRES.
     3. If GRES has no ``gpu:`` at all the node has no GPUs — return empty.
+
+    The token's original case is always preserved: Slurm node features are
+    case-sensitive (a node advertising ``a100`` is *not* matched by ``-C A100``),
+    so a lowercased "model" would produce a constraint that matches nothing.
     """
     text = f"{features},{gres}"
     gres_match = re.search(r"gpu:([a-z0-9._-]+):\d+", text, re.IGNORECASE)
@@ -235,10 +281,17 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
             if token.lower() in known_lower:
                 return token
 
-    # Positive match: a token shaped like a GPU model name (a100, h100, v100,
-    # l40s, t4, p100, k80, rtx6000, mi250, gh200, b200, quadro/tesla…). This is
-    # far more reliable than negative filtering and, crucially, wins over a CPU
-    # vendor/codename token that happens to appear first in the features list.
+    # Positive match, strongest first: an exact known model name anywhere in the
+    # feature list beats everything, so "b12,a100" resolves to a100 rather than to
+    # the rack label that merely appears earlier.
+    for token in tokens:
+        if len(token) < 15 and token.lower() in _KNOWN_GPU_MODELS:
+            return token
+
+    # Then a token shaped like a model name (family letter + 3-plus digits: a100,
+    # h200, v100, rtx6000, mi250, gh200, b200 …). Far more reliable than negative
+    # filtering and, crucially, wins over a CPU vendor/codename token that happens
+    # to appear first in the features list.
     for token in tokens:
         if token.lower() in _CPU_GEN_TOKENS:
             continue
@@ -246,6 +299,8 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
         # pathologically long feature token (e.g. a concatenated garbage string)
         # can't be returned verbatim as a GPU "model".
         if len(token) >= 15:
+            continue
+        if _INFRA_TOKEN_RE.match(token):
             continue
         if _GPU_MODEL_RE.match(token):
             return token
@@ -259,6 +314,9 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
         if token.lower() in _CPU_GEN_TOKENS:
             continue
         if len(token) >= 15:
+            continue
+        # Network fabric / rack position / form-factor / cooling labels: not GPUs.
+        if _INFRA_TOKEN_RE.match(token):
             continue
         if re.match(
             r"(?:gold|xeon|epyc|ryzen|atom|i[3579]|avx\d*|sse\d*|fma)",
@@ -316,6 +374,7 @@ def _parse_slurm_time_to_minutes(time_str: str) -> float:
 def validate_job_config(
     answers: dict[str, Any],
     extra_gpu_types: list[str] | None = None,
+    feature_only_gpu_types: list[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Validate a (possibly incomplete) answers dict against the selected
     partition's advertised capabilities.
@@ -337,36 +396,60 @@ def validate_job_config(
     calls — so the TUI can safely call it on every keystroke/redraw. Callers
     that can afford a live ``sinfo`` lookup (e.g. the one-shot CLI summary) may
     pass ``extra_gpu_types`` to widen the set of GPU models considered valid
-    beyond what ``_partition_obj`` statically lists.
+    beyond what ``_partition_obj`` statically lists, and
+    ``feature_only_gpu_types`` (from :func:`fetch_gpu_type_sources`) to have the
+    GPU *request format* checked against how each model can actually be asked for.
     """
     part = answers.get("_partition_obj")
     if not part:
         return []
     out: list[tuple[str, str]] = []
 
-    # CPUs — compare the per-node total (cpus-per-task x tasks-per-node) against
-    # the node's core count, so multi-task over-allocation is caught.
-    cpus = answers.get("cpus")
-    if cpus is not None and str(cpus).strip() != "":
-        try:
-            cores = int(cpus)
-            ntpn_raw = answers.get("ntasks_per_node")
-            ntpn = int(ntpn_raw) if ntpn_raw else 1
-            total = cores * max(1, ntpn)
+    # Cores requested per node (cpus-per-task x tasks-per-node), shared by the CPU
+    # check and the --mem-per-cpu total below.
+    cores_per_node = 0
+    try:
+        _cpus_raw = answers.get("cpus")
+        if _cpus_raw is not None and str(_cpus_raw).strip() != "":
+            _cores = int(_cpus_raw)
+            _ntpn_raw = answers.get("ntasks_per_node")
+            _ntpn = int(_ntpn_raw) if _ntpn_raw else 1
+            cores_per_node = _cores * max(1, _ntpn)
             limit = part.get("cpus_per_node", 0)
-            if limit and total > limit:
-                detail = f"{ntpn}×{cores}={total}" if ntpn > 1 else str(total)
+            if limit and cores_per_node > limit:
+                detail = f"{_ntpn}×{_cores}={cores_per_node}" if _ntpn > 1 else str(cores_per_node)
                 out.append(("warning", f"CPUs ({detail}) exceeds partition limit ({limit} per node)"))
-        except (ValueError, TypeError):
-            pass
+    except (ValueError, TypeError):
+        pass
 
-    # Memory vs the node's advertised memory.
-    memory = answers.get("memory")
-    if memory and validate_memory(str(memory)):
-        mb = _parse_mem_to_mb(str(memory))
-        limit = part.get("mem_per_node_mb", 0)
-        if limit and mb > limit:
-            out.append(("warning", f"Memory ({memory}) exceeds partition limit ({limit} MB per node)"))
+    # Memory vs the node's advertised memory — checked against what the SCRIPT will
+    # actually request, mirroring the builder's precedence: a custom --mem /
+    # --mem-per-cpu flag suppresses the auto directive, and --mem-per-cpu wins over
+    # --mem. Checking the raw `memory` answer regardless meant warning about a value
+    # the script doesn't request (and staying silent about the one it does).
+    from .builder import _custom_mem_override, _normalize_custom_flags
+    _c_mem, _c_mem_per_cpu = _custom_mem_override(
+        _normalize_custom_flags(answers.get("custom_sbatch"))
+    )
+    mem_limit = part.get("mem_per_node_mb", 0)
+    eff_mem_per_cpu = _c_mem_per_cpu or answers.get("mem_per_cpu")
+    eff_mem = _c_mem if (_c_mem or _c_mem_per_cpu) else answers.get("memory")
+    if eff_mem_per_cpu and validate_memory(str(eff_mem_per_cpu)):
+        # --mem-per-cpu is per core, so the per-node request is that x the cores
+        # requested on the node. Without this, --mem-per-cpu=64G on an 8-core task
+        # (512G/node) passed silently while the equivalent --mem=512G warned.
+        per_cpu_mb = _parse_mem_to_mb(str(eff_mem_per_cpu))
+        total_mb = per_cpu_mb * cores_per_node
+        if mem_limit and total_mb > mem_limit:
+            out.append((
+                "warning",
+                f"Memory ({eff_mem_per_cpu}/CPU × {cores_per_node} cores = {total_mb} MB) "
+                f"exceeds partition limit ({mem_limit} MB per node)",
+            ))
+    elif eff_mem and validate_memory(str(eff_mem)):
+        mb = _parse_mem_to_mb(str(eff_mem))
+        if mem_limit and mb > mem_limit:
+            out.append(("warning", f"Memory ({eff_mem}) exceeds partition limit ({mem_limit} MB per node)"))
 
     # Time vs the partition's max time.
     time_limit = answers.get("time_limit")
@@ -411,6 +494,46 @@ def validate_job_config(
         known = {str(g).lower() for g in all_types}
         if known and str(gpu_type).lower() not in known:
             out.append(("error", f"GPU type '{gpu_type}' not in partition list ({', '.join(all_types)})"))
+        elif known:
+            # Matched only case-insensitively. Slurm node features ARE
+            # case-sensitive — a node advertising "A100" is not matched by
+            # "-C a100" ("Invalid feature specification" / "Requested node
+            # configuration is not available") — so a case-only difference is a
+            # real, and otherwise invisible, way for a validated job to be
+            # rejected at submit.
+            exact = {str(g) for g in all_types}
+            if str(gpu_type) not in exact:
+                advertised = next(
+                    (str(g) for g in all_types if str(g).lower() == str(gpu_type).lower()), ""
+                )
+                out.append((
+                    "warning",
+                    f"GPU type '{gpu_type}' differs in case from the partition's "
+                    f"'{advertised}'; Slurm node features are case-sensitive",
+                ))
+
+        # Requestability: a model that only ever appears in a node's *feature*
+        # list (because the node's GRES is count-only, "gpu:4") is not a GRES
+        # type. Every format except "constraint" names the type inside the GRES
+        # request, which Slurm then rejects outright — measured on a count-only
+        # partition: `--gres=gpu:a100:1` → "Requested node configuration is not
+        # available", while `--gres=gpu:1 --constraint=a100` schedules. This is
+        # the default path (gres_type is the default format and the type comes
+        # from slurmate's own picker), so it has to be caught before submit.
+        feature_only = {str(t) for t in (feature_only_gpu_types or [])}
+        if gpus_val > 0 and str(gpu_type) in feature_only:
+            fmt = str(
+                answers.get("gpu_format")
+                or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")
+            ).lower()
+            if fmt != "constraint":
+                out.append((
+                    "error",
+                    f"GPU type '{gpu_type}' is a node feature on "
+                    f"'{part.get('name')}', not a GRES type (the nodes advertise a "
+                    f"count-only 'gpu:N'), so gpu_format '{fmt}' would emit a "
+                    f"request Slurm rejects — use gpu_format 'constraint'",
+                ))
 
     return out
 
@@ -568,22 +691,45 @@ def fetch_known_qos() -> list[str]:
 
 
 def fetch_gpu_types_for_partition(partition: str) -> list[str]:
+    """Every GPU model a partition offers, from typed GRES and node features."""
+    sources = fetch_gpu_type_sources(partition)
+    return sorted(set(sources["typed"]) | set(sources["feature"]))
+
+
+def fetch_gpu_type_sources(partition: str) -> dict[str, list[str]]:
+    """GPU models a partition offers, split by **how** they can be requested.
+
+    Returns ``{"typed": [...], "feature": [...]}``:
+
+    - ``typed``   — seen in a real ``gpu:MODEL:N`` GRES, so requestable as a GRES
+      type (``--gres=gpu:MODEL:N``, ``--gpus=MODEL:N``, …).
+    - ``feature`` — only found in the node's *feature* list, because the node's
+      GRES is count-only (``gpu:4``). Such a model is **not** a GRES type: asking
+      for it with ``--gres=gpu:MODEL:N`` makes Slurm reject the job outright
+      ("Requested node configuration is not available"). The only way to request
+      it is ``--gres=gpu:N`` plus ``--constraint=MODEL`` — i.e. ``gpu_format
+      "constraint"``.
+
+    Keeping the two apart is what lets callers warn about (or avoid) that
+    mismatch; ``fetch_gpu_types_for_partition`` flattens them for pickers.
+    """
     if not is_tool_available("sinfo"):
         if not _force_mock():
-            return []
+            return {"typed": [], "feature": []}
         # In mock mode, prefer the specific partition's GPU types so a demo
         # doesn't claim every partition offers all GPU models; fall back to the
-        # full list only for an unknown/manually-typed partition name.
+        # full list only for an unknown/manually-typed partition name. Mock types
+        # stand in for typed GRES, so demos/tests see no format mismatch.
         for p in MOCK_PARTITIONS:
             if p["name"] == partition:
-                return [str(g) for g in p["gpu_types"]]
-        return list(MOCK_GPU_TYPES)
+                return {"typed": [str(g) for g in p["gpu_types"]], "feature": []}
+        return {"typed": list(MOCK_GPU_TYPES), "feature": []}
 
     stdout, _, rc = _run_command(
         ["sinfo", "-h", "-N", "-p", partition, "-o", "%f|%G"]
     )
     if rc != 0:
-        return []
+        return {"typed": [], "feature": []}
 
     # Pass 1: collect typed GPU models from gpu:MODEL:N across all nodes,
     # and stash the raw lines for a second pass.
@@ -607,7 +753,8 @@ def fetch_gpu_types_for_partition(partition: str) -> list[str]:
     # than one, e.g. "gpu:a100:2,gpu:v100:2" — a single re.search would drop the
     # second). Only when a node has no typed model do we fall back to feature
     # scanning, preferring corroboration against the typed models seen elsewhere.
-    types: set[str] = set()
+    typed: set[str] = set()
+    feature: set[str] = set()
     for features, gres in lines_data:
         text = f"{features},{gres}"
         typed_here = [
@@ -616,12 +763,16 @@ def fetch_gpu_types_for_partition(partition: str) -> list[str]:
             if m.group(1).lower() not in {"gpu", "mps", "shard"}
         ]
         if typed_here:
-            types.update(typed_here)
+            typed.update(typed_here)
             continue
         gpu_type = _detect_gpu_type(features, gres, known_models=typed_models)
         if gpu_type and gpu_type != "gpu":
-            types.add(gpu_type)
-    return sorted(types)
+            feature.add(gpu_type)
+    # A model corroborated by a typed GRES somewhere in the partition is
+    # requestable as a GRES type, so it belongs in "typed" even when this node
+    # only advertised it as a feature.
+    feature -= typed
+    return {"typed": sorted(typed), "feature": sorted(feature)}
 
 
 def _extract_first_json(text: str) -> Any:
@@ -891,6 +1042,12 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
         - job_id_or_stdout: Job ID (integer as string) on success, stdout on failure
         - stderr: Error message on failure, empty string on success
     """
+    # Nothing is going to run, so don't touch the filesystem: creating the script's
+    # log directories before this check meant mock mode (and any host without
+    # sbatch) left stray "logs/" trees behind while reporting "no job submitted".
+    if not is_tool_available("sbatch"):
+        return 0, "", "sbatch not available (mock mode) — no job submitted"
+
     # Create the log directories the script's #SBATCH --output/--error point at,
     # so Slurm doesn't fail the job on a missing directory.
     for line in script_content.splitlines():
@@ -906,9 +1063,6 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
                 os.makedirs(dir_name, exist_ok=True)
             except OSError as e:
                 logger.debug(f"Failed to create log directory {dir_name}: {e}")
-
-    if not is_tool_available("sbatch"):
-        return 0, "", "sbatch not available (mock mode) — no job submitted"
 
     try:
         # Use --parsable for clean job ID output
@@ -933,22 +1087,56 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
     return result.returncode, result.stdout.strip(), ""
 
 
-def _sbatch_log_path(line: str) -> str:
-    """Extract the path from a ``#SBATCH --output=/-o`` or ``--error=/-e`` line.
+_LOG_FLAG_NAMES = {
+    "output": ("--output", "-o"),
+    "error": ("--error", "-e"),
+}
 
-    Handles both the long ``--output=PATH`` form and the short ``-o PATH`` form,
-    strips surrounding quotes, and returns "" for anything else (or a blank
-    short-form directive, which must not raise).
+_SBATCH_OPT_RE = re.compile(r"^(--?[A-Za-z][A-Za-z0-9-]*)(?:=|\s+)(.*)$")
+
+
+def _sbatch_log_path(line: str, kind: str | None = None) -> str:
+    """Extract the path from a ``#SBATCH`` output/error directive.
+
+    Handles every spelling ``sbatch`` itself accepts — ``--output=PATH``,
+    ``--output PATH`` (long option + space, previously missed, so the directory
+    went un-created and Slurm could fail the job), ``-o PATH`` and the ``--error``
+    /``-e`` equivalents — strips surrounding quotes, and returns "" for anything
+    else (or a valueless directive, which must not raise).
+
+    ``kind`` restricts the match to ``"output"`` or ``"error"``; the default
+    accepts either, which is what the log-directory pre-creation wants.
     """
     s = line.strip()
-    val = ""
-    if s.startswith("#SBATCH --output=") or s.startswith("#SBATCH --error="):
-        val = s.split("=", 1)[1].strip()
-    elif s.startswith("#SBATCH -o ") or s.startswith("#SBATCH -e "):
-        parts = s.split(None, 2)
-        val = parts[2].strip() if len(parts) > 2 else ""
+    if not s.startswith("#SBATCH"):
+        return ""
+    wanted = (
+        _LOG_FLAG_NAMES[kind] if kind in _LOG_FLAG_NAMES
+        else _LOG_FLAG_NAMES["output"] + _LOG_FLAG_NAMES["error"]
+    )
+    m = _SBATCH_OPT_RE.match(s[len("#SBATCH"):].strip())
+    if not m or m.group(1) not in wanted:
+        return ""
+    val = m.group(2).strip()
     if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
         val = val[1:-1]
+    return val
+
+
+def effective_log_path(script: str, kind: str = "output") -> str:
+    """The log path Slurm will actually use for ``kind``, or "".
+
+    Scans the whole script and keeps the **last** matching directive, because
+    that is the one Slurm honours when a script carries more than one (measured:
+    with two conflicting options, only the final one takes effect). Reading the
+    *first* match is how the submit report came to print — and offer a ``tail -f``
+    for — a file the job never wrote.
+    """
+    val = ""
+    for line in script.splitlines():
+        found = _sbatch_log_path(line, kind=kind)
+        if found:
+            val = found
     return val
 
 

@@ -1,6 +1,11 @@
 """Tests for the sbatch script builder."""
 
-from slurmate.builder import build_sbatch_script, estimate_su
+from slurmate.builder import (
+    build_from_answers,
+    build_sbatch_script,
+    estimate_su,
+    job_summary_rows,
+)
 
 
 class TestBuildSbatchScript:
@@ -119,8 +124,12 @@ class TestBuildSbatchScript:
             custom_sbatch=["--gres=gpu:2", "--constraint=a100", "--constraint=ssd"]
         )
         assert script.count("--gres=gpu:2") == 1
-        assert script.count("--constraint=a100") == 1
-        assert "#SBATCH --constraint=ssd" in script
+        # H1: a differing custom --constraint is MERGED into the single directive
+        # with "&" instead of being emitted as a second one. Slurm honours only the
+        # last --constraint it sees, so two directives silently dropped the GPU
+        # type; the exact duplicate ("a100") collapses into the merge.
+        assert script.count("#SBATCH --constraint=") == 1
+        assert "#SBATCH --constraint=a100&ssd" in script
 
     def test_env_activation_strategies(self):
         script_conda = build_sbatch_script(
@@ -482,10 +491,15 @@ class TestCustomFlagGpuDedup:
     def test_differing_gres_override_kept(self):
         # A custom --gres with a *different* value than the wizard emits is a
         # deliberate override and must survive (previously it was silently
-        # dropped by the over-broad "startswith('gpu')" dedup).
+        # dropped by the over-broad "startswith('gpu')" dedup)…
         s = self._base(custom_sbatch=["--gres=gpu:a100:8"])
         assert "#SBATCH --gres=gpu:a100:8" in s
-        assert "#SBATCH --gres=gpu:v100:2" in s
+        # …and P5: it now *replaces* the auto directive instead of sitting next to
+        # it. Slurm honours the last option, so the override already won; the auto
+        # line was dead weight that contradicted the script and made the summary
+        # report a GPU request the job doesn't make.
+        assert "#SBATCH --gres=gpu:v100:2" not in s
+        assert s.count("#SBATCH --gres") == 1
 
     def test_gpus_equals_kept_under_gres_type(self):
         # Under gres_type the builder emits no --gpus, so a custom --gpus must
@@ -794,3 +808,425 @@ class TestClusterAgnosticBuilder:
         assert s.count("#SBATCH --constraint=") == 1
         assert "#SBATCH --constraint=cpu&a100" in s
         assert "#SBATCH --gres=gpu:2" in s
+
+
+class TestCustomConstraintMerge:
+    """H1: a custom --constraint/-C must be MERGED, never emitted twice.
+
+    Slurm keeps only the LAST --constraint it sees and silently discards the
+    earlier one (measured against a real sbatch: an invalid feature placed first
+    schedules fine, placed last it fails with "Invalid feature specification").
+    Since the custom-flag loop runs last, the discarded directive was always the
+    one slurmate derived from the user's other answers.
+    """
+
+    def _b(self, **kw):
+        base = dict(job_name="t", partition="p", cpus=1, memory="16G",
+                    time_limit="01:00:00", command="x")
+        base.update(kw)
+        return build_sbatch_script(**base)
+
+    def test_custom_constraint_merges_with_gpu_type(self):
+        s = self._b(gpus=2, gpu_type="a100", gpu_format="constraint",
+                    custom_sbatch=["--constraint=bigmem"])
+        assert s.count("#SBATCH --constraint=") == 1
+        assert "#SBATCH --constraint=a100&bigmem" in s
+        assert "#SBATCH --gres=gpu:2" in s
+
+    def test_custom_constraint_merges_with_constraint_param(self):
+        s = self._b(constraint="cpu", custom_sbatch=["--constraint=bigmem"])
+        assert s.count("#SBATCH --constraint=") == 1
+        assert "#SBATCH --constraint=cpu&bigmem" in s
+
+    def test_short_and_space_forms_merge_too(self):
+        for flag in ("-C bigmem", "-C=bigmem", "--constraint bigmem"):
+            s = self._b(constraint="cpu", custom_sbatch=[flag])
+            assert s.count("#SBATCH --constraint=") == 1, flag
+            assert "#SBATCH --constraint=cpu&bigmem" in s, flag
+
+    def test_exact_duplicate_collapses(self):
+        s = self._b(gpus=2, gpu_type="a100", gpu_format="constraint",
+                    custom_sbatch=["--constraint=a100"])
+        assert s.count("#SBATCH --constraint=") == 1
+        assert "#SBATCH --constraint=a100\n" in s
+
+    def test_case_differing_values_are_kept_separate(self):
+        # Slurm node features are case-sensitive (measured: -C A100 does not match
+        # a node advertising a100), so these are two different requirements.
+        s = self._b(constraint="a100", custom_sbatch=["--constraint=A100"])
+        assert "#SBATCH --constraint=a100&A100" in s
+
+    def test_or_expression_is_parenthesized_when_merged(self):
+        s = self._b(constraint="gpu", custom_sbatch=["--constraint=a100|v100"])
+        assert "#SBATCH --constraint=gpu&(a100|v100)" in s
+
+    def test_lone_or_expression_is_untouched(self):
+        s = self._b(custom_sbatch=["--constraint=a100|v100"])
+        assert "#SBATCH --constraint=a100|v100" in s
+
+    def test_multiple_custom_constraints_all_merge(self):
+        s = self._b(custom_sbatch=["--constraint=a", "-C b", "--exclusive"])
+        assert "#SBATCH --constraint=a&b" in s
+        assert "#SBATCH --exclusive" in s
+
+
+class TestCustomLogFlagDedup:
+    """M1: a custom --output/-o (or --error/-e) suppresses the auto directive."""
+
+    def _b(self, custom):
+        return build_from_answers({"job_name": "j", "partition": "p",
+                                   "output_dir": "logs", "command": "x",
+                                   "custom_sbatch": custom})
+
+    def test_custom_output_suppresses_auto_output(self):
+        s = self._b(["--output=/real/place/%j.log"])
+        assert s.count("#SBATCH --output") == 1
+        assert "#SBATCH --output=/real/place/%j.log" in s
+        # stderr was not overridden, so its derived directive stays.
+        assert "#SBATCH --error=logs/j-%j.err" in s
+
+    def test_short_and_space_forms_also_suppress(self):
+        for flag in ("-o /real/place/%j.log", "--output /real/place/%j.log"):
+            s = self._b([flag])
+            # Only the user's directive survives; the auto one is gone.
+            assert "#SBATCH --output=logs/" not in s, flag
+            assert f"#SBATCH {flag}" in s, flag
+            assert sum(1 for ln in s.splitlines()
+                       if ln.startswith(("#SBATCH --output", "#SBATCH -o"))) == 1, flag
+
+    def test_custom_error_suppresses_auto_error_only(self):
+        s = self._b(["--error=/real/place/%j.err"])
+        assert s.count("#SBATCH --error") == 1
+        assert "#SBATCH --output=logs/j-%j.out" in s
+
+    def test_both_overridden(self):
+        s = self._b(["--output=/o/%j.out", "--error=/e/%j.err"])
+        assert s.count("#SBATCH --output") == 1
+        assert s.count("#SBATCH --error") == 1
+
+
+class TestSummaryMemoryMatchesScript:
+    """M3: the summary must report the memory the SCRIPT requests."""
+
+    def test_custom_mem_per_cpu_replaces_memory_row(self):
+        ans = {"job_name": "j", "partition": "p", "memory": "16G",
+               "custom_sbatch": ["--mem-per-cpu=2G"], "command": "x"}
+        rows = dict(job_summary_rows(ans))
+        assert rows.get("Mem per CPU") == "2G"
+        assert "Memory" not in rows
+        script = build_from_answers(ans)
+        assert "#SBATCH --mem=" not in script
+        assert "#SBATCH --mem-per-cpu=2G" in script
+
+    def test_custom_mem_replaces_memory_row(self):
+        ans = {"job_name": "j", "partition": "p", "memory": "16G",
+               "custom_sbatch": ["--mem=32G"], "command": "x"}
+        assert dict(job_summary_rows(ans)).get("Memory") == "32G"
+
+    def test_space_form_counts_too(self):
+        ans = {"job_name": "j", "partition": "p", "memory": "16G",
+               "custom_sbatch": ["--mem 32G"], "command": "x"}
+        assert dict(job_summary_rows(ans)).get("Memory") == "32G"
+        assert "#SBATCH --mem=16G" not in build_from_answers(ans)
+
+    def test_unrelated_mem_flag_does_not_suppress(self):
+        # --mem-bind is not --mem; the auto directive must survive.
+        ans = {"job_name": "j", "partition": "p", "memory": "16G",
+               "custom_sbatch": ["--mem-bind=local"], "command": "x"}
+        assert dict(job_summary_rows(ans)).get("Memory") == "16G"
+        assert "#SBATCH --mem=16G" in build_from_answers(ans)
+
+
+class TestTildeWithLeadingWhitespace:
+    """L2: expanduser must run on the STRIPPED value."""
+
+    def test_output_dir_leading_space(self):
+        import os
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": " ~/logs"})
+        assert f"#SBATCH --output={os.path.expanduser('~')}/logs/j-%j.out" in s
+        assert "~/logs" not in s
+
+    def test_output_file_leading_space(self):
+        import os
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                               "output_file": " ~/logs/x.out"})
+        assert f"#SBATCH --output={os.path.expanduser('~')}/logs/x.out" in s
+
+
+class TestMambaActivationPortable:
+    """L10: `mamba activate` alone dies on mamba >= 2 (no shell hook from conda.sh)."""
+
+    def _b(self, env_type):
+        return build_sbatch_script(job_name="t", partition="p", cpus=1,
+                                   memory="1G", time_limit="01:00:00",
+                                   env_name="myenv", env_type=env_type, command="x")
+
+    def test_mamba_falls_back_to_conda(self):
+        s = self._b("Mamba")
+        assert 'source "$(conda info --base)/etc/profile.d/conda.sh"' in s
+        assert "mamba activate myenv >/dev/null 2>&1 || conda activate myenv" in s
+
+    def test_conda_path_unchanged(self):
+        s = self._b("Conda")
+        assert "conda activate myenv" in s
+        assert "mamba" not in s
+
+
+class TestGpuHours:
+    def test_zero_gpus_is_blank(self):
+        from slurmate.builder import estimate_gpu_hours
+        assert estimate_gpu_hours(0, "02:00:00") == ""
+
+    def test_per_node_formats_multiply_by_nodes(self):
+        from slurmate.builder import estimate_gpu_hours
+        # 4 GPUs/node x 2 nodes x 2h = 16
+        assert estimate_gpu_hours(4, "02:00:00", 2, "gres_type") == "16.0"
+        assert estimate_gpu_hours(4, "02:00:00", 2, "gpus_per_node") == "16.0"
+
+    def test_total_format_does_not_multiply_by_nodes(self):
+        from slurmate.builder import estimate_gpu_hours
+        # --gpus=4 is job-wide: 4 x 2h = 8
+        assert estimate_gpu_hours(4, "02:00:00", 2, "gpus") == "8.0"
+
+    def test_per_task_format_multiplies_by_tasks(self):
+        from slurmate.builder import estimate_gpu_hours
+        # 1 GPU/task x 4 tasks/node x 2 nodes x 1h = 8
+        assert estimate_gpu_hours(1, "01:00:00", 2, "gpus_per_task", 4) == "8.0"
+
+
+class TestSplitListElementFlags:
+    """M5/M1: a TOML/API list that split an option from its value still works.
+
+    ``custom_sbatch = ["-o", "/logs/%j.out"]`` used to emit a valueless
+    ``#SBATCH -o`` plus a bare ``#SBATCH /logs/%j.out`` line — a script sbatch
+    rejects. All three spellings now converge on one directive.
+    """
+
+    def test_normalize_rejoins_option_and_value(self):
+        from slurmate.builder import _normalize_custom_flags
+        assert _normalize_custom_flags(["-o", "/logs/%j.out"]) == ["-o /logs/%j.out"]
+        assert _normalize_custom_flags(["-C", "bigmem"]) == ["-C bigmem"]
+        assert _normalize_custom_flags(["--reservation", "abc"]) == ["--reservation abc"]
+
+    def test_boolean_flags_stay_separate(self):
+        from slurmate.builder import _normalize_custom_flags
+        assert _normalize_custom_flags(["--exclusive", "--hold"]) == [
+            "--exclusive", "--hold"]
+
+    def test_all_three_spellings_agree(self):
+        from slurmate.builder import _normalize_custom_flags
+        from slurmate.tui import _parse_custom_flags
+        expected = ["-o /logs/%j.out"]
+        assert _parse_custom_flags("-o /logs/%j.out") == expected
+        assert _normalize_custom_flags(["-o /logs/%j.out"]) == expected
+        assert _normalize_custom_flags(["-o", "/logs/%j.out"]) == expected
+
+    def test_split_constraint_still_merges(self):
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "constraint": "cpu", "command": "x",
+                                "custom_sbatch": ["-C", "bigmem"]})
+        assert "#SBATCH --constraint=cpu&bigmem" in s
+        assert s.count("#SBATCH --constraint") == 1
+
+    def test_split_output_suppresses_auto_and_stays_one_directive(self):
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_dir": "logs", "command": "x",
+                                "custom_sbatch": ["-o", "/real/%j.log"]})
+        assert "#SBATCH -o /real/%j.log" in s
+        assert "#SBATCH --output=logs/" not in s
+        # The value is not orphaned onto its own line any more.
+        assert not any(ln == "#SBATCH /real/%j.log" for ln in s.splitlines())
+
+    def test_newline_in_a_list_entry_is_still_folded(self):
+        # Regression guard: the rejoin pass must not reintroduce a second line.
+        s = build_from_answers({"job_name": "j", "partition": "p", "command": "x",
+                                "custom_sbatch": ["--comment=a\nb"]})
+        assert "#SBATCH --comment=\"a b\"" in s
+        assert all(ln.startswith(("#", "x", "")) for ln in s.splitlines())
+
+
+class TestSpaceFormValueQuoting:
+    """P1: a space-form value that itself contains a space must be quoted.
+
+    ``--comment "my job"`` reaches the builder as ``--comment my job`` (the parser
+    consumes the user's quotes). Emitted bare, Slurm's directive parser splits it
+    into ``--comment=my`` plus a stray ``job`` — the same defect the ``=`` form was
+    already protected against.
+    """
+
+    def _flag_lines(self, raw):
+        from slurmate.tui import _parse_custom_flags
+        s = build_from_answers({"job_name": "j", "partition": "p", "command": "x",
+                                "custom_sbatch": _parse_custom_flags(raw)})
+        return [ln for ln in s.splitlines() if ln.startswith("#SBATCH")]
+
+    def test_space_form_value_with_space_is_quoted(self):
+        assert '#SBATCH --comment "my job"' in self._flag_lines('--comment "my job"')
+
+    def test_equals_form_still_quoted(self):
+        assert '#SBATCH --comment="my job"' in self._flag_lines('--comment="my job"')
+
+    def test_space_form_without_whitespace_is_untouched(self):
+        assert "#SBATCH -o /p/x.log" in self._flag_lines("-o /p/x.log")
+        assert "#SBATCH -C bigmem" not in self._flag_lines("-C bigmem")  # merged by H1
+
+    def test_unknown_option_is_left_alone(self):
+        from slurmate.builder import _quote_custom_flag
+        # We can't tell where the value starts, so guessing would corrupt it.
+        assert _quote_custom_flag("--madeup a b") == "--madeup a b"
+
+    def test_already_quoted_value_not_double_quoted(self):
+        from slurmate.builder import _quote_custom_flag
+        assert _quote_custom_flag('--comment "my job"') == '--comment "my job"'
+
+    def test_bare_flag_untouched(self):
+        from slurmate.builder import _quote_custom_flag
+        assert _quote_custom_flag("--exclusive") == "--exclusive"
+
+
+class TestConstraintWhitespace:
+    """P4: Slurm's feature grammar has no spaces — measured.
+
+    `sbatch -C "a100 & 384g"` fails with "Invalid feature specification" while
+    `-C "a100&384g"` schedules, so a spaced expression has to be normalized rather
+    than passed through.
+    """
+
+    def _c(self, **kw):
+        a = {"job_name": "j", "partition": "p", "command": "x"}
+        a.update(kw)
+        return [ln for ln in build_from_answers(a).splitlines() if "constraint" in ln]
+
+    def test_spaces_around_operators_removed(self):
+        assert self._c(constraint="a100 & 384g") == ["#SBATCH --constraint=a100&384g"]
+        assert self._c(constraint="a100 | v100") == ["#SBATCH --constraint=a100|v100"]
+
+    def test_surrounding_whitespace_removed(self):
+        # Used to emit "#SBATCH --constraint= a100 " — broken twice over.
+        assert self._c(constraint=" a100 ") == ["#SBATCH --constraint=a100"]
+
+    def test_custom_constraint_is_cleaned_too(self):
+        assert self._c(custom_sbatch=["--constraint=a100 & 384g"]) == [
+            "#SBATCH --constraint=a100&384g"]
+
+    def test_merged_value_stays_clean(self):
+        assert self._c(constraint="cpu ", custom_sbatch=["-C bigmem"]) == [
+            "#SBATCH --constraint=cpu&bigmem"]
+
+    def test_tight_expression_unchanged(self):
+        assert self._c(constraint="a100|v100") == ["#SBATCH --constraint=a100|v100"]
+
+
+class TestCustomGpuFlagReplacesAuto:
+    """P5: a differing custom GPU flag replaces the auto directive, not duplicates it."""
+
+    def _s(self, fmt, custom):
+        return build_from_answers({"job_name": "j", "partition": "p", "gpus": 2,
+                                   "gpu_type": "v100", "gpu_format": fmt,
+                                   "custom_sbatch": custom, "command": "x"})
+
+    def test_gres_override_replaces(self):
+        s = self._s("gres_type", ["--gres=gpu:a100:8"])
+        assert s.count("#SBATCH --gres") == 1
+        assert "#SBATCH --gres=gpu:a100:8" in s
+
+    def test_every_format_replaces_its_own_option(self):
+        for fmt, flag, val in (
+            ("gpus", "--gpus", "a100:8"),
+            ("gpus_per_node", "--gpus-per-node", "a100:8"),
+            ("gpus_per_task", "--gpus-per-task", "a100:8"),
+            ("constraint", "--gres", "gpu:8"),
+        ):
+            s = self._s(fmt, [f"{flag}={val}"])
+            assert s.count(f"#SBATCH {flag}") == 1, fmt
+            assert f"#SBATCH {flag}={val}" in s, fmt
+
+    def test_exact_duplicate_keeps_canonical_form(self):
+        # No information in the user's spelling, so keep slurmate's `=` form.
+        s = self._s("gres_type", ["--gres gpu:v100:2"])
+        assert s.count("#SBATCH --gres") == 1
+        assert "#SBATCH --gres=gpu:v100:2" in s
+
+    def test_different_option_name_does_not_suppress(self):
+        # --gres and --gpus are different requests to Slurm; a custom --gpus must
+        # not silently remove the auto --gres.
+        s = self._s("gres_type", ["--gpus=8"])
+        assert "#SBATCH --gres=gpu:v100:2" in s
+        assert "#SBATCH --gpus=8" in s
+
+    def test_constraint_format_keeps_the_type_constraint(self):
+        # The GPU type is a separate requirement from the GRES count.
+        s = self._s("constraint", ["--gres=gpu:8"])
+        assert "#SBATCH --constraint=v100" in s
+        assert "#SBATCH --gres=gpu:8" in s
+
+    def test_summary_reports_the_override(self):
+        a = {"job_name": "j", "partition": "p", "gpus": 2, "gpu_type": "v100",
+             "custom_sbatch": ["--gres=gpu:a100:8"], "command": "x"}
+        rows = dict(job_summary_rows(a))
+        assert rows["GPUs"] == "--gres=gpu:a100:8 (custom flag)"
+        assert "GPU format" not in rows
+
+    def test_summary_unchanged_without_an_override(self):
+        a = {"job_name": "j", "partition": "p", "gpus": 2, "gpu_type": "v100",
+             "gpu_format": "gres_type", "command": "x"}
+        rows = dict(job_summary_rows(a))
+        assert rows["GPUs"] == "2 × v100"
+        assert rows["GPU format"] == "gres_type"
+
+
+class TestNoDuplicateOrMalformedDirectives:
+    """Property sweep: the defect class behind H1, M1 and P5.
+
+    Slurm silently honours only the last of a repeated option, so a duplicate
+    directive is never harmless — it either contradicts slurmate's own request or
+    lies to the reader. This walks a matrix of answer combinations and asserts that
+    no #SBATCH option is emitted twice and every directive is well-formed.
+    """
+
+    import re as _re
+    _OPT = _re.compile(r'^--?[A-Za-z][A-Za-z0-9-]*([= ]("[^"]*"|\S+))?$')
+
+    def _scan(self, script):
+        import re
+        counts, malformed = {}, []
+        for ln in script.splitlines():
+            if not ln.startswith("#SBATCH "):
+                continue
+            body = ln[len("#SBATCH "):]
+            name = re.split(r"[=\s]", body.strip(), maxsplit=1)[0]
+            counts[name] = counts.get(name, 0) + 1
+            if not self._OPT.match(body):
+                malformed.append(ln)
+        return {k: v for k, v in counts.items() if v > 1}, malformed
+
+    def test_matrix_has_no_duplicates_or_malformed_lines(self):
+        import itertools
+        matrix = {
+            "gpus": [0, 2],
+            "gpu_type": [None, "a100"],
+            "gpu_format": [None, "gres_type", "constraint", "gpus_per_task"],
+            "constraint": [None, "cpu", "a|b"],
+            "mem_per_cpu": [None, "2G"],
+            "output_dir": [None, "logs"],
+            "array_spec": [None, "1-4"],
+            "custom_sbatch": [None, ["--exclusive"], ["--constraint=bigmem"],
+                              ["--mem=8G"], ["--mem-per-cpu=1G"],
+                              ["--output=/o/%j.out"], ["-o /o/%j.out"],
+                              ["-e", "/e/%j.err"], ["-C", "bigmem"],
+                              ["--comment=my job"], ["--gres=gpu:h100:4"],
+                              ["--gpus-per-task=4"]],
+        }
+        keys = list(matrix)
+        checked = 0
+        for combo in itertools.product(*(matrix[k] for k in keys)):
+            answers = dict(zip(keys, combo))
+            answers.update(job_name="j", partition="p", cpus=4, memory="16G",
+                           command="x")
+            script = build_from_answers(answers)
+            dupes, malformed = self._scan(script)
+            assert not dupes, f"duplicate {dupes} for {answers}"
+            assert not malformed, f"malformed {malformed} for {answers}"
+            checked += 1
+        assert checked > 2000
