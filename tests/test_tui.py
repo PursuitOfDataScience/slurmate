@@ -858,7 +858,7 @@ class TestQueueEtaTracksNodes:
         import slurmate.system_utils as su
         calls = []
 
-        def spy(part, req_nodes=1):
+        def spy(part, req_nodes=1, **kw):
             calls.append((part, req_nodes))
             return dict(su.MOCK_QUEUE_INFO)
 
@@ -877,7 +877,7 @@ class TestQueueEtaTracksNodes:
         import slurmate.system_utils as su
         calls = []
         monkeypatch.setattr(su, "fetch_queue_eta",
-                            lambda part, req_nodes=1: calls.append((part, req_nodes))
+                            lambda part, req_nodes=1, **kw: calls.append((part, req_nodes))
                             or dict(su.MOCK_QUEUE_INFO))
         w = Wizard()
         w.answers.update({"partition": "cpu-shared", "_partition_obj": None, "nodes": 2})
@@ -885,6 +885,26 @@ class TestQueueEtaTracksNodes:
             w.idx = _idx(key)
             w._on_enter_step("forward")
         assert calls == [("cpu-shared", 2)]
+
+    def test_gpu_change_refetches(self, monkeypatch):
+        # The ETA now depends on the whole request: changing the GPU count must
+        # invalidate the cache, or a GPU job keeps showing the CPU-only estimate.
+        import slurmate.system_utils as su
+        calls = []
+
+        def spy(part, req_nodes=1, **kw):
+            calls.append((part, req_nodes, kw.get("gpus_per_node", 0)))
+            return dict(su.MOCK_QUEUE_INFO)
+
+        monkeypatch.setattr(su, "fetch_queue_eta", spy)
+        w = Wizard()
+        w.answers.update({"partition": "gpu-shared", "_partition_obj": None, "nodes": 1})
+        w.idx = _idx("account")
+        w._on_enter_step("forward")
+        w.answers["gpus"] = 4
+        w.idx = _idx("modules")
+        w._on_enter_step("forward")
+        assert calls == [("gpu-shared", 1, 0), ("gpu-shared", 1, 4)]
 
 
 class TestReviewColumnAlignment:

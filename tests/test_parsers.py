@@ -49,6 +49,12 @@ def mock_run_command(cmd: list[str], timeout: int = 30) -> tuple[str, str, int]:
     # Match sinfo queue status
     if "sinfo" in cmd and "%D|%a|%t" in cmd:
         return read_fixture("sinfo_queue.txt"), "", 0
+    # Node-level free resources: 5 idle + 3 mixed with free cores + 2 fully allocated.
+    if "sinfo" in cmd and "-N" in cmd:
+        return read_fixture("sinfo_nodes.txt"), "", 0
+    # No sbatch in the router, so --test-only yields no start time and
+    # fetch_queue_eta falls through to the resource tier — which is what these
+    # fixture-driven parser tests are exercising.
 
     return "", "Unknown mock command", 1
 
@@ -98,19 +104,33 @@ class TestRealParsers:
         assert gpu_types == ["a100", "v100"]
 
     def test_fetch_queue_eta_real(self):
-        queue_info = fetch_queue_eta("gpu-shared", req_nodes=2)
+        queue_info = fetch_queue_eta("gpu-shared", req_nodes=2, cpus=8)
         # squeue has 2 running, 2 pending
         assert queue_info["running"] == 2
         assert queue_info["pending"] == 2
-        # sinfo_queue says 5 idle, 3 mix, 2 alloc nodes.
-        # since req_nodes=2 and idle_nodes=5 >= 2, ETA should be 0 (labeled "now")
+        # sinfo_nodes has 5 idle + 3 mixed with >=4 free cores; 2 nodes of 8 cores
+        # each is available now. Counted from free cores, not the state label.
         assert queue_info["eta_seconds"] == 0
         assert queue_info["eta_label"] == "now"
+        assert queue_info["source"] == "resources"
 
-        # If req_nodes=6, idle_nodes=5 < 6, but (idle+mix)=8 >= 6, ETA is 60 (labeled "~60s")
-        queue_info_large = fetch_queue_eta("gpu-shared", req_nodes=6)
-        assert queue_info_large["eta_seconds"] == 60
-        assert queue_info_large["eta_label"] == "~60s"
+        # An 8-core share fits the 5 idle nodes and the 2 mixed ones with 16 and 8
+        # free cores — 7 in all. The third mixed node has only 4 free, and the 2
+        # fully-allocated ones none, so neither counts.
+        assert fetch_queue_eta("gpu-shared", req_nodes=7, cpus=56)["eta_seconds"] == 0
+        assert fetch_queue_eta("gpu-shared", req_nodes=8, cpus=64)["eta_seconds"] > 0
+
+        # Per-node share, not the total: 3 mixed nodes have <32 free cores, so a
+        # request needing a whole 32-core node only fits the 5 idle ones.
+        assert fetch_queue_eta("gpu-shared", req_nodes=5, cpus=160)["eta_seconds"] == 0
+        assert fetch_queue_eta("gpu-shared", req_nodes=6, cpus=192)["eta_seconds"] > 0
+
+    def test_fetch_queue_eta_never_says_now_for_unavailable_gpus(self):
+        # gpu:0 on every fixture node: a GPU request cannot start, however many
+        # cores are free. The old state-label tally reported "now" here.
+        info = fetch_queue_eta("gpu-shared", req_nodes=1, cpus=8, gpus_per_node=1)
+        assert info["eta_seconds"] > 0
+        assert info["eta_label"] != "now"
 
 
 class TestSubmitSbatchReal:

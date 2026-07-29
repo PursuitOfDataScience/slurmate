@@ -29,6 +29,7 @@ from .system_utils import (
     fetch_queue_eta,
     load_config,
     normalize_memory,
+    resolve_request_mem_mb,
     submit_sbatch,
     validate_job_config,
     validate_memory,
@@ -391,9 +392,19 @@ def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict
         answers.get("ntasks_per_node"),
     )
 
+    # Pass the whole request, not just the node count: an ETA computed from node
+    # states alone reports "immediate" for a GPU job on a partition whose GPUs are
+    # all allocated. fetch_queue_eta needs the resources to ask the scheduler.
     queue_info = fetch_queue_eta(
         answers.get("partition", ""),
         req_nodes=answers.get("nodes", 1),
+        cpus=answers.get("cpus", 0) or 0,
+        mem_mb=resolve_request_mem_mb(answers),
+        gpus_per_node=answers.get("gpus", 0) or 0,
+        gpu_type=answers.get("gpu_type", "") or "",
+        time_limit=answers.get("time_limit", "") or "",
+        account=answers.get("account", "") or "",
+        qos=answers.get("qos", "") or "",
     )
 
     _validate_partition_limits(answers, console)

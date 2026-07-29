@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -957,14 +958,210 @@ MOCK_QUEUE_INFO = {
 }
 
 
-def fetch_queue_eta(partition: str, req_nodes: int = 1) -> dict[str, Any]:
-    """Estimate queue wait time for a partition based on squeue / sinfo data."""
+# `sbatch --test-only` prints its verdict on stderr, ending with the scheduler's
+# own placement: "Job 123 to start at 2026-07-29T18:07:28 using 1 processors on
+# nodes midway3-0008 in partition caslake".
+_TEST_ONLY_START_RE = re.compile(r"to start at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+# `sinfo -O CPUsState` renders as allocated/idle/other/total.
+_CPUS_STATE_RE = re.compile(r"^\s*(\d+)/(\d+)/(\d+)/(\d+)\s*$")
+
+# A node's GRES value: sum every `gpu[:type]:N`, ignoring the `(IDX:0-3)` suffix
+# that GresUsed appends, and skipping mps/shard entries.
+_NODE_GPU_RE = re.compile(r"(?:^|,)\s*(?:gres/)?gpu(?::[a-zA-Z0-9._-]+)?[:=](\d+)", re.IGNORECASE)
+
+# State flags marking nodes that will not take a normal job now: * not responding,
+# $ maintenance reservation, % powering down, @ pending reboot, ! pending power-down.
+# ~ (power-save) and # (powering-up) are kept — those will run.
+_UNSCHEDULABLE_FLAGS = ("*", "$", "%", "@", "!")
+
+
+def _sum_node_gpus(gres: str) -> int:
+    if not gres or gres.strip().lower() in ("(null)", "null", "n/a", ""):
+        return 0
+    return sum(int(n) for n in _NODE_GPU_RE.findall(gres))
+
+
+def _scheduler_start_estimate(
+    partition: str,
+    req_nodes: int,
+    cpus: int,
+    mem_mb: int,
+    gpus_per_node: int,
+    gpu_type: str,
+    time_limit: str,
+    account: str,
+    qos: str,
+) -> int | None:
+    """Seconds until the scheduler says this request would start, or ``None``.
+
+    Asks Slurm rather than modelling it. ``sbatch --test-only`` queues nothing but
+    returns the backfill placement *and* runs the site's ``job_submit`` plugin,
+    whose rules are not published anywhere — so this is the only estimate that can
+    account for QOS caps, account limits and local policy. Everything below it in
+    :func:`fetch_queue_eta` is a fallback for when it cannot be reached.
+
+    ``None`` on any doubt (no sbatch, rejected request, unparsable output) so the
+    caller falls through rather than showing a fabricated number.
+    """
+    if not is_tool_available("sbatch"):
+        return None
+    cmd = ["sbatch", "--test-only", "--parsable"]
+    if partition:
+        cmd += ["-p", partition]
+    if qos:
+        cmd += ["-q", qos]
+    if account:
+        cmd += ["-A", account]
+    if req_nodes > 0:
+        cmd += ["-N", str(req_nodes)]
+    if cpus > 0:
+        cmd += ["-c", str(cpus)]
+    if mem_mb > 0:
+        cmd += [f"--mem={mem_mb}M"]
+    if gpus_per_node > 0:
+        cmd += [f"--gres=gpu:{gpu_type}:{gpus_per_node}" if gpu_type else f"--gres=gpu:{gpus_per_node}"]
+    if time_limit:
+        cmd += ["-t", time_limit]
+    cmd += ["--wrap", "true"]
+
+    stdout, stderr, _ = _run_command(cmd, timeout=20)
+    match = _TEST_ONLY_START_RE.search(f"{stderr}\n{stdout}")
+    if not match:
+        return None
+    try:
+        start = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return max(0, int((start - datetime.now()).total_seconds()))
+
+
+def _nodes_that_fit(
+    partition: str, cpus_per_node: int, mem_mb_per_node: int, gpus_per_node: int
+) -> int | None:
+    """Nodes in ``partition`` with enough *free* CPU, memory and GPU right now.
+
+    The node-centric ``-O`` fields give what the aggregate ``%t`` state cannot:
+    ``CPUsState`` (allocated/idle/other/total), ``Memory`` minus ``AllocMem``, and
+    ``Gres`` minus ``GresUsed``. Counting node *states* instead treats a MIXED node
+    with every GPU allocated as available, which is the bug this replaces.
+
+    ``None`` when the query fails, so the caller can fall back rather than read a
+    failure as "nothing fits".
+    """
+    stdout, _, rc = _run_command(
+        [
+            "sinfo",
+            "-h",
+            "-N",
+            "-p",
+            partition,
+            "-O",
+            "StateLong:20,CPUsState:24,Memory:16,AllocMem:16,Gres:48,GresUsed:48",
+        ]
+    )
+    if rc != 0 or not stdout.strip():
+        return None
+    fits = 0
+    saw_node = False
+    for line in stdout.splitlines():
+        fields = [f.strip() for f in re.split(r"\s{2,}", line.strip()) if f.strip()]
+        if len(fields) < 4:
+            continue
+        saw_node = True
+        state = fields[0].lower()
+        if any(flag in state for flag in _UNSCHEDULABLE_FLAGS):
+            continue
+        base = re.sub(r"[^a-z]", "", state)
+        if not base.startswith(("idle", "mix")):
+            continue
+        cpu_match = _CPUS_STATE_RE.match(fields[1])
+        idle_cpus = int(cpu_match.group(2)) if cpu_match else 0
+        # With no CPU count supplied, still require one free core: a MIXED node with
+        # every core allocated can take nothing, and counting it is the same class
+        # of error as trusting the state label.
+        if idle_cpus < max(cpus_per_node, 1):
+            continue
+        total_mem = _safe_int(fields[2])
+        alloc_mem = _safe_int(fields[3])
+        if mem_mb_per_node > 0 and (total_mem - alloc_mem) < mem_mb_per_node:
+            continue
+        if gpus_per_node > 0:
+            gres = fields[4] if len(fields) > 4 else ""
+            gres_used = fields[5] if len(fields) > 5 else ""
+            if (_sum_node_gpus(gres) - _sum_node_gpus(gres_used)) < gpus_per_node:
+                continue
+        fits += 1
+    return fits if saw_node else None
+
+
+def resolve_request_mem_mb(answers: dict[str, Any]) -> int:
+    """Per-node memory the built script will request, in MB; 0 when unset.
+
+    Mirrors the builder's precedence — a custom ``--mem`` / ``--mem-per-cpu`` flag
+    suppresses the auto directive, and ``--mem-per-cpu`` wins over ``--mem`` — so
+    the ETA is computed against the request the script actually makes.
+    """
+    try:
+        from .builder import _custom_mem_override, _normalize_custom_flags
+
+        custom_mem, custom_per_cpu = _custom_mem_override(
+            _normalize_custom_flags(answers.get("custom_sbatch"))
+        )
+    except Exception:  # pragma: no cover - builder import is not worth failing an ETA
+        custom_mem, custom_per_cpu = None, None
+
+    per_cpu = custom_per_cpu or answers.get("mem_per_cpu")
+    flat = custom_mem if (custom_mem or custom_per_cpu) else answers.get("memory")
+    if per_cpu and validate_memory(str(per_cpu)):
+        cores = answers.get("cpus") or 1
+        try:
+            cores = max(1, int(cores))
+        except (TypeError, ValueError):
+            cores = 1
+        return _parse_mem_to_mb(str(per_cpu)) * cores
+    if flat and validate_memory(str(flat)):
+        return _parse_mem_to_mb(str(flat))
+    return 0
+
+
+def fetch_queue_eta(
+    partition: str,
+    req_nodes: int = 1,
+    *,
+    cpus: int = 0,
+    mem_mb: int = 0,
+    gpus_per_node: int = 0,
+    gpu_type: str = "",
+    time_limit: str = "",
+    account: str = "",
+    qos: str = "",
+) -> dict[str, Any]:
+    """Estimate when a request would start in ``partition``.
+
+    Three tiers, best first, with ``source`` in the result naming which one
+    answered so the caller can qualify what it shows:
+
+    ``scheduler``   ``sbatch --test-only`` — Slurm's own backfill placement.
+    ``resources``   nodes with enough free CPU/memory/GPU, counted per node.
+    ``pressure``    a queue-depth heuristic; the last resort.
+
+    The resource arguments are optional for backwards compatibility, but omitting
+    them makes the answer worse: a bare ``(partition, req_nodes)`` call cannot know
+    that every GPU on an otherwise-free node is already allocated.
+    """
     if not is_tool_available("squeue") or not is_tool_available("sinfo"):
         # Demo ETA only under SLURMATE_MOCK; on a real cluster missing squeue/sinfo
         # report "unknown" rather than a fabricated queue depth / wait time.
         if _force_mock():
             return dict(MOCK_QUEUE_INFO)
-        return {"running": 0, "pending": 0, "eta_seconds": 0, "eta_label": "unknown"}
+        return {
+            "running": 0,
+            "pending": 0,
+            "eta_seconds": 0,
+            "eta_label": "unknown",
+            "source": "unknown",
+        }
 
     stdout, _, _ = _run_command(
         ["squeue", "-p", partition, "-o", "%T|%M|%l|%D", "--noheader"]
@@ -983,50 +1180,43 @@ def fetch_queue_eta(partition: str, req_nodes: int = 1) -> dict[str, Any]:
         elif state in ("PENDING", "SUSPENDED", "WAITING"):
             pending += 1
 
-    # Get idle / mix / alloc node counts from sinfo
-    sinfo_out, _, _ = _run_command(
-        ["sinfo", "-p", partition, "-o", "%D|%a|%t", "--noheader"]
+    def _result(eta_sec: int, source: str) -> dict[str, Any]:
+        return {
+            "running": running,
+            "pending": pending,
+            "eta_seconds": eta_sec,
+            "eta_label": _format_eta(eta_sec),
+            "source": source,
+        }
+
+    # Tier 1 — ask the scheduler.
+    scheduled = _scheduler_start_estimate(
+        partition, req_nodes, cpus, mem_mb, gpus_per_node, gpu_type, time_limit, account, qos
     )
-    idle_nodes = 0
-    mix_nodes = 0
-    total_nodes = 0
-    for line in sinfo_out.splitlines():
-        parts = line.strip().split("|")
-        if len(parts) >= 3:
-            try:
-                nnodes = int(parts[0])
-            except ValueError:
-                nnodes = 0
-            total_nodes += nnodes
-            # sinfo %t can append status flags to the base state (idle*, idle~,
-            # mix#, …: not-responding / power-save / powering-up / maintenance
-            # etc.); strip them so nodes aren't dropped from the idle/mix tally.
-            state_flag = parts[2].strip().rstrip("*~#!%$@+")
-            if state_flag == "idle":
-                idle_nodes += nnodes
-            elif state_flag == "mix":
-                mix_nodes += nnodes
+    if scheduled is not None:
+        return _result(scheduled, "scheduler")
 
-    # Sensible ETA:
-    #   If enough idle/available nodes exist → immediate
-    #   Otherwise estimate from queue pressure
-    if idle_nodes >= req_nodes:
-        eta_sec = 0
-    elif (idle_nodes + mix_nodes) >= req_nodes:
-        eta_sec = 60  # ~1 min for scheduling shuffle
-    elif running == 0:
-        eta_sec = 300  # ~5 min conservative
-    else:
-        # Rough pressure estimate: pending jobs per running job × scheduling interval
+    # Tier 2 — count nodes that genuinely fit the per-node share of the request.
+    per_node_cpus = -(-cpus // max(req_nodes, 1)) if cpus > 0 else 0
+    per_node_mem = -(-mem_mb // max(req_nodes, 1)) if mem_mb > 0 else 0
+    fitting = _nodes_that_fit(partition, per_node_cpus, per_node_mem, gpus_per_node)
+    if fitting is not None:
+        if fitting >= req_nodes:
+            return _result(0, "resources")
+        # Nothing fits right now: fall through to a pressure estimate, but never
+        # back to "immediate" — the whole point is that state labels lied.
+        if running == 0:
+            return _result(300, "resources")
         pressure = pending / max(1, running)
-        eta_sec = int(min(pressure * 120, 7200))  # cap at 2 hours
-        # If the partition has any idle capacity, reduce estimate
-        if idle_nodes > 0 or mix_nodes > 0:
-            eta_sec = max(60, eta_sec // 2)
+        return _result(max(60, int(min(pressure * 120, 7200))), "resources")
 
-    eta_label = _format_eta(eta_sec)
-
-    return {"running": running, "pending": pending, "eta_seconds": eta_sec, "eta_label": eta_label}
+    # Tier 3 — neither the scheduler nor per-node data is available. A queue-depth
+    # guess is all that is left; it is deliberately never 0, because without
+    # resource data there is no evidence anything is actually free.
+    if running == 0:
+        return _result(300, "pressure")
+    pressure = pending / max(1, running)
+    return _result(max(60, int(min(pressure * 120, 7200))), "pressure")
 
 
 def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, str, str]:

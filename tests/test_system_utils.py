@@ -448,17 +448,92 @@ class TestParsingRobustness:
         assert su.fetch_gpu_types_for_partition("p") == ["a100", "v100"]
 
     def test_queue_eta_tolerates_state_flags(self, mocker):
+        # Power-save (~) nodes still run work and must count; not-responding (*)
+        # ones must not. Now checked against per-node free resources rather than
+        # a state-label tally, but the flag rule is unchanged.
         import slurmate.system_utils as su
         mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_scheduler_start_estimate", return_value=None)
 
         def run(cmd, timeout=30):
             if "squeue" in cmd:
                 return "", "", 0
-            return "5|up|idle~\n3|up|mix*\n", "", 0
+            # StateLong  CPUsState  Memory  AllocMem  Gres  GresUsed
+            return (
+                "idle~          0/48/0/48       192000    0        (null)  gpu:0\n"
+                "idle~          0/48/0/48       192000    0        (null)  gpu:0\n"
+                "mix*           0/48/0/48       192000    0        (null)  gpu:0\n"
+            ), "", 0
 
         mocker.patch.object(su, "_run_command", side_effect=run)
-        info = su.fetch_queue_eta("p", req_nodes=2)
-        assert info["eta_seconds"] == 0  # idle~ still counts as 5 idle nodes
+        info = su.fetch_queue_eta("p", req_nodes=2, cpus=8)
+        assert info["eta_seconds"] == 0  # the two idle~ nodes fit
+        assert info["source"] == "resources"
+        # Three nodes do not: the mix* one is not schedulable.
+        assert su.fetch_queue_eta("p", req_nodes=3, cpus=8)["eta_seconds"] > 0
+
+    def test_queue_eta_does_not_claim_immediate_when_gpus_are_all_allocated(self, mocker):
+        # The bug this replaces: every node MIXED with idle cores, so a state-label
+        # tally said "immediate" — while every GPU on them was already allocated.
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_scheduler_start_estimate", return_value=None)
+
+        def run(cmd, timeout=30):
+            if "squeue" in cmd:
+                return "RUNNING|1|2|1\nPENDING|0|2|1\n", "", 0
+            return (
+                "mixed          28/20/0/48      192000    130000   gpu:4   gpu:4\n"
+                "mixed          32/16/0/48      192000    120000   gpu:4   gpu:4\n"
+            ), "", 0
+
+        mocker.patch.object(su, "_run_command", side_effect=run)
+        gpu_job = su.fetch_queue_eta("p", req_nodes=1, cpus=8, gpus_per_node=1)
+        assert gpu_job["eta_seconds"] > 0, "no GPU is free — must not report 'now'"
+        assert gpu_job["eta_label"] != "now"
+        # The same nodes DO have spare cores, so a CPU-only job still starts now.
+        cpu_job = su.fetch_queue_eta("p", req_nodes=1, cpus=8)
+        assert cpu_job["eta_seconds"] == 0
+
+    def test_queue_eta_prefers_the_scheduler_when_available(self, mocker):
+        # sbatch --test-only is authoritative: it sees QOS/account limits and the
+        # site job_submit plugin, none of which sinfo can show.
+        from datetime import datetime, timedelta
+
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        start = (datetime.now() + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+
+        def run(cmd, timeout=30):
+            if "sbatch" in cmd:
+                return "", f"sbatch: Job 42 to start at {start} using 1 processors\n", 0
+            if "squeue" in cmd:
+                return "", "", 0
+            return "idle           0/48/0/48       192000    0        (null)  gpu:0\n", "", 0
+
+        mocker.patch.object(su, "_run_command", side_effect=run)
+        info = su.fetch_queue_eta("p", req_nodes=1, cpus=8, account="acct")
+        assert info["source"] == "scheduler"
+        # ~2 hours, not the "now" the free idle node would otherwise imply.
+        assert 7000 < info["eta_seconds"] <= 7200
+
+    def test_queue_eta_falls_back_when_scheduler_rejects(self, mocker):
+        # A rejected --test-only (bad account, QOS violation) yields no start time;
+        # that must fall through to the resource count, not fabricate one.
+        import slurmate.system_utils as su
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+
+        def run(cmd, timeout=30):
+            if "sbatch" in cmd:
+                return "", "sbatch: error: Account is not specified\n", 1
+            if "squeue" in cmd:
+                return "", "", 0
+            return "idle           0/48/0/48       192000    0        (null)  gpu:0\n", "", 0
+
+        mocker.patch.object(su, "_run_command", side_effect=run)
+        info = su.fetch_queue_eta("p", req_nodes=1, cpus=8)
+        assert info["source"] == "resources"
+        assert info["eta_seconds"] == 0
 
 
 class TestRunCommandOSError:

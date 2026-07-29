@@ -5,6 +5,48 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.5.3] — 2026-07-29
+
+### Fixed
+
+- **The queue ETA was computed from node *state labels* and ignored free
+  resources entirely, so it reported "~1 min" for jobs that could not start for
+  hours — or at all.** `fetch_queue_eta` counted `sinfo` `idle`/`mix` nodes and
+  returned "immediate" if that count reached `req_nodes`. A node's *state* says
+  nothing about what is left on it: a MIXED node with 44 idle cores and every GPU
+  allocated was counted as available for a 4-GPU job. Nor were CPUs, memory or
+  GRES ever consulted — `req_nodes` was the only part of the request that reached
+  the estimator.
+
+  Measured on a live cluster while fixing this:
+
+  | request | before | actual |
+  |---|---|---|
+  | `caslake`, 1 cpu, 30 min | "~1 min" | 5 h 55 m (`sbatch --test-only`) |
+  | `gpu`, 4 GPUs | "~1 min" | 0 of 44 GPUs free — could not start; now ~23 h |
+
+  The estimate now has three tiers, and reports which one answered in a new
+  `source` key:
+
+  - `scheduler` — `sbatch --test-only`, Slurm's own backfill placement. It queues
+    nothing, and it is the only tier that sees QOS caps, account limits and the
+    site `job_submit` plugin.
+  - `resources` — nodes with enough genuinely free CPU, memory and GPU, from the
+    per-node `CPUsState` / `Memory`−`AllocMem` / `Gres`−`GresUsed` fields.
+  - `pressure` — the previous queue-depth heuristic, now a last resort only, and
+    no longer able to return "now" (without resource data there is no evidence
+    anything is free).
+
+  `fetch_queue_eta` takes the rest of the request as keyword arguments
+  (`cpus`, `mem_mb`, `gpus_per_node`, `gpu_type`, `time_limit`, `account`,
+  `qos`); the old two-argument call still works but gives a weaker answer. Both
+  the wizard and batch mode now pass the full request, and the TUI's ETA cache
+  keys on all of it, so changing the GPU count refreshes the estimate.
+
+- **New:** `resolve_request_mem_mb(answers)` resolves the per-node memory the
+  built script will actually request, mirroring the builder's
+  `--mem-per-cpu` over `--mem` over auto-directive precedence.
+
 ## [0.5.2] — 2026-07-24
 
 A correctness release from a full-codebase audit that verified every

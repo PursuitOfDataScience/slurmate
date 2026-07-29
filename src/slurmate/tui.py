@@ -860,14 +860,39 @@ class Wizard:
             # first fetch happens on the step right after partition — before `nodes`
             # has been entered, so it always used req_nodes=1. A later nodes=8 then
             # never refreshed it (same partition) and the ETA stayed optimistic.
+            # The ETA depends on the whole request, not just the node count — a GPU
+            # job on a partition whose GPUs are all allocated must not read
+            # "immediate" — so the cache key covers every field fetch_queue_eta uses.
             nodes = self.answers.get("nodes", 1)
-            if self.transient.get("queue_info_key") != (part, nodes):
+            from .system_utils import fetch_queue_eta, resolve_request_mem_mb
+
+            eta_key = (
+                part,
+                nodes,
+                self.answers.get("cpus", 0) or 0,
+                resolve_request_mem_mb(self.answers),
+                self.answers.get("gpus", 0) or 0,
+                self.answers.get("gpu_type", "") or "",
+                self.answers.get("time_limit", "") or "",
+                self.answers.get("account", "") or "",
+                self.answers.get("qos", "") or "",
+            )
+            if self.transient.get("queue_info_key") != eta_key:
                 try:
-                    from .system_utils import fetch_queue_eta
-                    qinfo = fetch_queue_eta(part, req_nodes=nodes)
+                    qinfo = fetch_queue_eta(
+                        part,
+                        req_nodes=nodes,
+                        cpus=eta_key[2],
+                        mem_mb=eta_key[3],
+                        gpus_per_node=eta_key[4],
+                        gpu_type=eta_key[5],
+                        time_limit=eta_key[6],
+                        account=eta_key[7],
+                        qos=eta_key[8],
+                    )
                     self.transient["queue_info"] = qinfo
                     self.transient["queue_info_part"] = part
-                    self.transient["queue_info_key"] = (part, nodes)
+                    self.transient["queue_info_key"] = eta_key
                 except Exception as e:
                     logger.debug(f"Failed to fetch queue info in TUI: {e}")
 

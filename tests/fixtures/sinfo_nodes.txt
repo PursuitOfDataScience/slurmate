@@ -1,0 +1,10 @@
+idle           0/32/0/32       131072    0        (null)  gpu:0
+idle           0/32/0/32       131072    0        (null)  gpu:0
+idle           0/32/0/32       131072    0        (null)  gpu:0
+idle           0/32/0/32       131072    0        (null)  gpu:0
+idle           0/32/0/32       131072    0        (null)  gpu:0
+mixed          16/16/0/32      131072    65536    (null)  gpu:0
+mixed          24/8/0/32       131072    98304    (null)  gpu:0
+mixed          28/4/0/32       131072    114688   (null)  gpu:0
+allocated      32/0/0/32       131072    131072   (null)  gpu:0
+allocated      32/0/0/32       131072    131072   (null)  gpu:0
