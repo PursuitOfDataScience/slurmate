@@ -17,6 +17,7 @@ from prompt_toolkit.completion import (
 )
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout.containers import (
     Float,
@@ -1291,14 +1292,14 @@ class Wizard:
             ),
         ])
 
-    def _render_header_left(self) -> list[tuple[str, str]]:
+    def _render_header_left(self) -> StyleAndTextTuples:
         # Two-tone brand: the name in the header's teal, the tagline dimmed.
         return [
             ("class:status-bar", "  \u26a1  Slurmate"),
             ("class:subtitle", "  \u2014 sbatch wizard"),
         ]
 
-    def _render_header_right(self) -> list[tuple[str, str]]:
+    def _render_header_right(self) -> StyleAndTextTuples:
         # Just the progress counter — the current step's name is already the card
         # title and the highlighted sidebar row, so repeating it here was redundant.
         visible_total = len(STEPS) - len(self._skipped_indices)
@@ -1315,8 +1316,8 @@ class Wizard:
             width=D.exact(self._SIDEBAR_WIDTH),
         )
 
-    def _render_sidebar(self) -> list[tuple[str, str]]:
-        lines: list[tuple[str, str]] = [("", "\n")]
+    def _render_sidebar(self) -> StyleAndTextTuples:
+        lines: StyleAndTextTuples = [("", "\n")]
         # 4 columns of prefix ("  \u2713 "); ellipsize any title that would overflow
         # the card interior (width minus 2 border columns) rather than clipping it.
         avail = self._SIDEBAR_WIDTH - 2 - 4
@@ -1363,7 +1364,7 @@ class Wizard:
             # spacer below take the rest, so they read as snug panels rather than
             # two mostly-empty boxes. When the script is taller than the screen the
             # spacer collapses to zero and the Final Script card fills + scrolls.
-            config_lines = sum(t.count("\n") for _, t in self._render_review_config())
+            config_lines = sum(frag[1].count("\n") for frag in self._render_review_config())
             script_lines = len(self._build_script_lines())
             body_h = max(config_lines, script_lines) + 2  # +2 for the card borders
             # The script column usually drives the height, so the shorter config
@@ -1436,7 +1437,7 @@ class Wizard:
             height=2 if show else 0,
         )
 
-    def _render_queue_text(self) -> list[tuple[str, str]]:
+    def _render_queue_text(self) -> StyleAndTextTuples:
         qinfo = self.transient.get("queue_info")
         if not qinfo or not self._past_hardware_config():
             return []
@@ -1464,9 +1465,9 @@ class Wizard:
         # Tasks/node, which the Review step previously omitted.
         return job_summary_rows(self.answers)
 
-    def _render_review_config(self) -> list[tuple[str, str]]:
+    def _render_review_config(self) -> StyleAndTextTuples:
         """Left column of the review step \u2014 the job configuration summary."""
-        out: list[tuple[str, str]] = [("", "\n")]
+        out: StyleAndTextTuples = [("", "\n")]
         items = [(label, val) for label, val in self._review_summary_items() if val]
         # Width comes from the actual labels (as the CLI summary already does): a
         # fixed 12 neither padded nor truncated the longer ones ("Array
@@ -1498,11 +1499,11 @@ class Wizard:
             lines.append(frags or [("", "")])
         return lines
 
-    def _render_review_script(self) -> list[tuple[str, str]]:
+    def _render_review_script(self) -> StyleAndTextTuples:
         """Right column \u2014 the final script, manually scrolled by ``_review_scroll``."""
         lines = self._build_script_lines()
         self._review_total_lines = len(lines)
-        out: list[tuple[str, str]] = []
+        out: StyleAndTextTuples = []
         for frags in lines[self._review_scroll:]:
             out.extend(frags)
             out.append(("", "\n"))
@@ -1538,7 +1539,7 @@ class Wizard:
 
         return [("", "  ")] + tokens + [("", "\n")]
 
-    def _render_preview_text(self) -> list[tuple[str, str]]:
+    def _render_preview_text(self) -> StyleAndTextTuples:
         if self.idx < 1:
             return []
         if self.transient.get("preview_dirty"):
@@ -1547,7 +1548,7 @@ class Wizard:
         cached = self.transient.get("preview_lines")
         if cached is not None:
             from typing import cast
-            return cast(list[tuple[str, str]], cached)
+            return cast(StyleAndTextTuples, cached)
         ans: dict[str, Any] = {}
         for i in range(self.idx):
             step = STEPS[i]
@@ -1558,7 +1559,7 @@ class Wizard:
         script = build_from_answers(ans, partial=True)
         if not script.strip():
             return []
-        lines: list[tuple[str, str]] = []
+        lines: StyleAndTextTuples = []
         for line in script.split("\n"):
             lines.extend(self._tokenize_bash_line(line))
         self.transient["preview_lines"] = lines
@@ -1571,7 +1572,7 @@ class Wizard:
             style=_STAGE_BG,
         )
 
-    def _render_footer(self) -> list[tuple[str, str]]:
+    def _render_footer(self) -> StyleAndTextTuples:
         s = self.current_step
         if s.key == "review":
             left = "  ↑↓/PgUp/PgDn:Scroll  Tab/Enter:Submit  Esc:Back  ^C:Quit"
