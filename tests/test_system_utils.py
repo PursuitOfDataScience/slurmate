@@ -175,17 +175,26 @@ class TestHelpers:
         assert validate_memory("64000M") is True
         assert validate_memory("1T") is True
         assert validate_memory("") is False
-        assert validate_memory("0") is False
+        # "0" is valid Slurm: --mem=0 means all the memory on the node. This
+        # assertion used to be False; measured against a live controller, every
+        # zero spelling is accepted.
+        assert validate_memory("0") is True
         assert validate_memory("abc") is False
 
-    def test_validate_memory_rejects_zero_magnitude(self):
-        # P3-11: a zero magnitude is invalid regardless of unit; "0G"/"0M" used
-        # to slip through because the zero check only fired for the unitless "0".
-        from slurmate.system_utils import validate_memory
-        assert validate_memory("0G") is False
-        assert validate_memory("0M") is False
-        assert validate_memory("0.0G") is False
+    def test_validate_memory_accepts_zero_in_every_unit(self):
+        # Reverses P3-11, which rejected a zero magnitude as "not a valid size".
+        # It is a valid size: `--mem=0` is documented Slurm for *all the memory on
+        # the node*, and 0/0K/0M/0G/0T were all measured accepted by a live
+        # controller. Rejecting it left no way to express that request —
+        # `--memory ''`/none omits --mem entirely, which gets the site default.
+        from slurmate.system_utils import normalize_memory, validate_memory
+        for raw in ("0", "0K", "0M", "0G", "0T", "0.0G"):
+            assert validate_memory(raw) is True, raw
+            # Every spelling is the same request; emit the documented bare form
+            # rather than "0M", which reads like a request for nothing.
+            assert normalize_memory(raw) == "0", raw
         assert validate_memory("0.5G") is True
+        assert validate_memory("0P") is False
 
     def test_parse_mem_to_mb(self):
         from slurmate.system_utils import _parse_mem_to_mb

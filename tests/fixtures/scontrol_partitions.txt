@@ -1,5 +1,9 @@
-PartitionName=cpu-shared AllowAccounts=ALL Hidden=NO AllowQos=normal,high,express
-PartitionName=cpu-highmem AllowAccounts=ALL Hidden=NO AllowQos=normal
-PartitionName=gpu-shared AllowAccounts=ALL Hidden=NO AllowQos=gpu,interactive
-PartitionName=gpu-highend AllowAccounts=ALL Hidden=NO AllowQos=gpu
-PartitionName=debug AllowAccounts=restricted Hidden=YES AllowQos=interactive
+PartitionName=cpu-shared AllowAccounts=ALL Hidden=NO AllowQos=normal,high,express Default=YES Nodes=node[001-100]
+PartitionName=cpu-highmem AllowAccounts=ALL Hidden=NO AllowQos=normal Default=NO Nodes=hm[01-20]
+PartitionName=gpu-shared AllowAccounts=ALL Hidden=NO AllowQos=gpu,interactive Default=NO Nodes=gpu[01-10]
+PartitionName=gpu-highend AllowAccounts=ALL Hidden=NO AllowQos=gpu Default=NO Nodes=hgpu[1-4]
+PartitionName=debug AllowAccounts=restricted Hidden=YES AllowQos=interactive Default=NO Nodes=node[001-002]
+PartitionName=retired AllowAccounts=ALL Hidden=NO AllowQos=normal Default=NO Nodes=old[01-06]
+PartitionName=cron AllowAccounts=ALL Hidden=NO AllowQos=normal Default=NO Nodes=dali-login[1-2],midway2-login[1-2]
+PartitionName=legacy AllowAccounts=ALL Hidden=NO AllowQos=normal Default=NO Nodes=leg[01-09]
+PartitionName=oldgpu AllowAccounts=ALL Hidden=NO AllowQos=gpu Default=NO Nodes=ogpu[1-3]

@@ -519,10 +519,12 @@ class TestQosCachePartitionAware:
         calls: list[str] = []
 
         def fake_qos(part):
+            # The qos step now reads BOTH sides of the ACL (AllowQos + DenyQos),
+            # so the partition-aware cache is exercised through fetch_qos_acl.
             calls.append(part)
-            return ["qos_" + part]
+            return {"allow": ["qos_" + part], "deny": []}
 
-        mocker.patch.object(t, "fetch_qos_for_partition", side_effect=fake_qos)
+        mocker.patch.object(t, "fetch_qos_acl", side_effect=fake_qos)
         mocker.patch.object(t, "fetch_known_qos", return_value=["qos_A", "qos_B"])
         w = Wizard()
         qos_step = next(s for s in STEPS if s.key == "qos")

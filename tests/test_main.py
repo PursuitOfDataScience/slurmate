@@ -55,7 +55,7 @@ class TestRunBatch:
         from rich.console import Console
 
         args = argparse.Namespace(
-            job_name="test", account=None, partition="gpu", qos=None,
+            job_name="test", account=None, partition="gpu-shared", qos=None,
             cpus=4, memory="16G", time="01:00:00", nodes=1, gpus=2,
             gpu_type="a100", array=None, modules="python/3.10",
             env="myenv", env_type="mamba", command="python train.py",
@@ -63,7 +63,7 @@ class TestRunBatch:
         )
         answers = run_batch(args, Console(), {})
         assert answers["job_name"] == "test"
-        assert answers["partition"] == "gpu"
+        assert answers["partition"] == "gpu-shared"
         assert answers["cpus"] == 4
         assert answers["gpus"] == 2
         assert answers["gpu_type"] == "a100"
@@ -78,7 +78,7 @@ class TestRunBatch:
         from rich.console import Console
 
         args = argparse.Namespace(
-            job_name="t", account=None, partition="cpu", qos=None,
+            job_name="t", account=None, partition="cpu-shared", qos=None,
             cpus=1, memory="1G", time="00:01:00", nodes=1, gpus=0,
             gpu_type=None, array=None, modules=None,
             env=None, env_type=None, command="echo hi",
@@ -118,7 +118,10 @@ class TestPartitionLimitsValidation:
             "gpus": 1,
             "gpu_type": "a100",
         }
-        console = Console(width=80)
+        # no_color/highlight off: these assertions are on message *text*, and
+        # Rich's repr highlighter otherwise splits "(16)" into its own ANSI span,
+        # so the test passes or fails on the runner's colour detection.
+        console = Console(width=80, no_color=True, highlight=False)
         with console.capture() as capture:
             _validate_partition_limits(answers, console)
         assert capture.get() == ""

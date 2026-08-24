@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import os
 import re
 import shutil
@@ -11,6 +12,126 @@ from typing import Any
 def _env_flag(name: str) -> bool:
     """True when an env var is set to an affirmative value (1/true/yes/on)."""
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ── Output encoding safety ───────────────────────────────────────────────────
+# A non-UTF-8 *but valid* locale (el7 has no C.UTF-8; en_US is latin-1) makes any
+# non-encodable character in a message raise UnicodeEncodeError mid-print, which
+# aborts the run and truncates the output. rich picks a safe box set for its own
+# glyphs, but it does not transcode application text, so slurmate's own "⚠"/"✗"
+# went straight to the encoder. The markers below therefore have ASCII fallbacks
+# — and :func:`make_output_safe` covers everything a table cannot, including
+# user-supplied data (a CJK job name, a partition name) that no fallback table
+# could anticipate.
+
+_FORCE_ASCII = False
+
+
+def set_ascii(enabled: bool) -> None:
+    """Force (or unforce) ASCII markers — backs ``--ascii``."""
+    global _FORCE_ASCII
+    _FORCE_ASCII = enabled
+
+
+def output_encoding() -> str:
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        if encoding:
+            return str(encoding)
+    return "utf-8"
+
+
+def _encodable(text: str) -> bool:
+    try:
+        text.encode(output_encoding(), errors="strict")
+    except (UnicodeEncodeError, LookupError, TypeError):
+        return False
+    return True
+
+
+def use_ascii() -> bool:
+    """Whether to render markers as ASCII: forced, requested, or unencodable."""
+    if _FORCE_ASCII or _env_flag("SLURMATE_ASCII"):
+        return True
+    return not _encodable("".join(_Glyphs.UNICODE.values()))
+
+
+class _Glyphs:
+    """Status markers, resolved per call so ``--ascii`` applies after import."""
+
+    UNICODE = {
+        "OK": "\u2713", "ERR": "\u2717", "WARN": "\u26a0",
+        "BULLET": "\u25b8", "ARROW": "\u2192", "ELLIPSIS": "\u2026",
+        "BOLT": "\u26a1", "UP": "\u2191", "DOWN": "\u2193",
+    }
+    ASCII = {
+        "OK": "+", "ERR": "x", "WARN": "!",
+        "BULLET": ">", "ARROW": "->", "ELLIPSIS": "...",
+        "BOLT": "*", "UP": "^", "DOWN": "v",
+    }
+
+    def __getattr__(self, name: str) -> str:
+        table = self.ASCII if use_ascii() else self.UNICODE
+        try:
+            return table[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+g = _Glyphs()
+
+
+# Typography slurmate writes into its own prose, and the ASCII that carries the
+# same meaning. Applied by the codec error handler below, so it covers every
+# output path at once — including the 238 em dashes, which are far too many to
+# route through the marker table individually.
+_TRANSLITERATE = {
+    "\u2014": "-", "\u2013": "-", "\u2026": "...", "\u00a0": " ",
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+    "\u2192": "->", "\u2022": "*", "\u00d7": "x",
+    "\u2713": "+", "\u2717": "x", "\u26a0": "!", "\u25b8": ">",
+    "\u26a1": "*", "\u2191": "^", "\u2193": "v",
+}
+
+_ERROR_HANDLER = "slurmate.transliterate"
+
+
+def _encode_fallback(exc: UnicodeError) -> tuple[str, int]:
+    """Transliterate what we can; escape what we cannot. Never raise."""
+    if not isinstance(exc, UnicodeEncodeError):
+        raise exc
+    out: list[str] = []
+    for ch in exc.object[exc.start:exc.end]:
+        replacement = _TRANSLITERATE.get(ch)
+        if replacement is None:
+            # Unknown character — escape rather than drop it. This is the case
+            # the table cannot cover: a job name, module or partition carrying
+            # characters the terminal cannot encode is *data*, not decoration,
+            # and "?" would silently destroy it.
+            replacement = ch.encode("ascii", "backslashreplace").decode("ascii")
+        out.append(replacement)
+    return "".join(out), exc.end
+
+
+def make_output_safe() -> None:
+    """Stop a non-encodable character from aborting the run.
+
+    A *valid* non-UTF-8 locale (``en_US`` is latin-1; el7 has no ``C.UTF-8``)
+    made any such character raise ``UnicodeEncodeError`` mid-print, which killed
+    the run and truncated the output. Registering a codec error handler fixes
+    every output path at once, which routing individual strings through the
+    marker table cannot: the failures were on *warning and error* paths, so the
+    tool was least robust exactly when something had already gone wrong.
+    """
+    codecs.register_error(_ERROR_HANDLER, _encode_fallback)
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors=_ERROR_HANDLER)
+        except (ValueError, OSError, LookupError):  # detached / not reconfigurable
+            pass
 
 
 def _should_use_color() -> bool:

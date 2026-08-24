@@ -6,7 +6,7 @@ import re
 import shlex
 from typing import Any
 
-from .system_utils import _parse_slurm_time_to_minutes
+from .system_utils import _parse_slurm_time_to_minutes, normalize_memory
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,28 @@ def sanitize_job_name(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._+-]", "", name)
     cleaned = cleaned.lstrip("-+.")
     return cleaned or "slurm"
+
+
+def _abort_guard(label: str) -> str:
+    """`|| { … exit 1; }` tail that stops the job when a setup line fails.
+
+    A batch script is not run with ``set -e``, so a failed ``module load`` or
+    ``conda activate`` prints to stderr and the body runs anyway — Slurm then
+    records the job **COMPLETED, exit 0** with the environment absent. The worst
+    case is not a confusing failure later, it is a run that quietly proceeds
+    against whatever toolchain was already on ``PATH`` and produces results the
+    user believes came from the environment they asked for.
+
+    Guarding the line also covers the case validation at generation time cannot:
+    a module that exists when the script is written and is retired before the
+    job runs.
+    """
+    # shlex.quote the whole message, not just the command's argument. The label
+    # carries a user-supplied module or environment name, and a double-quoted
+    # shell string still performs command substitution — so `--modules '$(cmd)'`
+    # would have run `cmd` at the moment the guard fired. Single-quoting the
+    # message makes it inert text.
+    return f" || {{ echo {shlex.quote(f'slurmate: {label} failed; aborting')} >&2; exit 1; }}"
 
 
 def _fold_directive(value: str) -> str:
@@ -216,6 +238,114 @@ _OUTPUT_FLAG_NAMES = ("--output", "-o")
 _ERROR_FLAG_NAMES = ("--error", "-e")
 
 
+# Directives slurmate owns and *reconciles* when a custom flag also sets them:
+# --mem/--mem-per-cpu (the custom value wins, the auto one is suppressed),
+# --constraint/-C (merged into one directive), --output/--error (de-duplicated).
+# A custom flag naming one of these is fine — the machinery already accounts for
+# it, and the merged constraint case is behaviour the portability report asked to
+# keep.
+_RECONCILED_CUSTOM_FLAGS = {
+    "--mem", "--mem-per-cpu", "--constraint", "-C", "--output", "-o",
+    "--error", "-e",
+}
+
+# Directives slurmate owns and does NOT reconcile. A custom flag repeating one of
+# these emits a second #SBATCH line; Slurm honours the LAST, so the job runs with
+# the custom value while slurmate's summary, its cluster validation and its
+# queue/ETA figures all describe the first. Each maps to the flag that owns it.
+_MANAGED_CUSTOM_FLAGS = {
+    "--partition": "--partition", "-p": "--partition",
+    "--account": "--account", "-A": "--account",
+    "--qos": "--qos", "-q": "--qos",
+    "--time": "--time", "-t": "--time",
+    "--cpus-per-task": "--cpus", "-c": "--cpus",
+    "--nodes": "--nodes", "-N": "--nodes",
+    "--ntasks-per-node": "--ntasks-per-node",
+    "--job-name": "--job-name", "-J": "--job-name",
+    "--array": "--array", "-a": "--array",
+    "--gres": "--gpus", "--gpus": "--gpus", "-G": "--gpus",
+    "--gpus-per-node": "--gpus", "--gpus-per-task": "--gpus",
+}
+
+
+def output_dir_is_used(output_dir: Any, output_file: Any) -> bool:
+    """Whether ``output_dir`` will actually place the log files.
+
+    The builder puts only a **bare** filename inside it — an absolute or
+    directory-bearing ``output_file`` is left alone. So with
+    ``--output-file /tmp/x.out --output-dir logs`` the script writes to ``/tmp``
+    while the summary still said ``Output directory: logs``, sending the user to
+    an empty directory. Shared with the summary so the two cannot disagree.
+    """
+    if not str(output_dir or "").strip():
+        return False
+    name = os.path.expanduser(str(output_file or "").strip())
+    if not name:
+        return True                  # no explicit file: the directory is used
+    return not os.path.isabs(name) and not os.path.dirname(name)
+
+
+def env_activation_emitted(env_name: Any, env_type: Any) -> bool:
+    """Whether an ``env_name`` will actually produce an activation line.
+
+    ``--env-type none`` (a documented choice) emits nothing, so an ``--env`` given
+    alongside it is silently dropped: the summary still showed
+    ``Environment: myenv`` while the script never activated it, and the only
+    signal was a ``logger.warning`` no user sees. The predicate lets the summary
+    and the checks agree with what the builder actually emits.
+    """
+    if not str(env_name or "").strip():
+        return False
+    return str(env_type or "conda").strip().lower() in (
+        "conda", "mamba", "venv", "virtualenv (venv)"
+    )
+
+
+def command_injects_directives(command: Any) -> str:
+    """The first ``#SBATCH`` line in ``command`` that Slurm would obey, or "".
+
+    Slurm stops reading directives at the first line that is neither blank nor a
+    comment. The command body is emitted after the directive block, so a
+    ``#SBATCH`` line at the *start* of the body — before any real command — is
+    still inside the directive region and takes effect. Measured: a command of
+    ``#SBATCH --qos=INJECTED`` produced ``Access/permission denied`` from the
+    controller, which is its answer for an invalid QoS, so the directive was
+    obeyed. It appears in no summary, is validated by nothing, and bypasses the
+    managed-flag check that covers ``--custom-sbatch``.
+
+    Only the *leading* run matters, which is what makes this safe to enforce: a
+    ``#SBATCH`` inside a heredoc that writes a nested script is preceded by a
+    real command, so Slurm has already stopped parsing and the line is inert.
+    """
+    for raw in str(command or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not line.startswith("#"):
+            return ""            # a real command line: Slurm stops here
+        if re.match(r"^#\s*SBATCH\b", line, re.IGNORECASE):
+            return line
+    return ""
+
+
+def managed_custom_flags(custom_sbatch: Any) -> list[tuple[str, str]]:
+    """``(custom_flag, owning_slurmate_flag)`` for each conflicting custom flag.
+
+    Empty when there is no conflict. Only the *unreconciled* directives count:
+    a custom ``--mem`` or ``-C`` is deliberately supported, and refusing those
+    would undo behaviour this package is relied on for.
+    """
+    out: list[tuple[str, str]] = []
+    for flag in _normalize_custom_flags(custom_sbatch):
+        name = flag.split("=", 1)[0].strip().split()[0] if flag.strip() else ""
+        if not name or name in _RECONCILED_CUSTOM_FLAGS:
+            continue
+        owner = _MANAGED_CUSTOM_FLAGS.get(name)
+        if owner:
+            out.append((name, owner))
+    return out
+
+
 def _custom_mem_override(flags: list[str]) -> tuple[str | None, str | None]:
     """``(mem, mem_per_cpu)`` as supplied by custom flags, or ``(None, None)``.
 
@@ -288,6 +418,13 @@ def _gpus_int(answers: dict[str, Any]) -> int:
         return 0
 
 
+def _fold_or_none(value: Any) -> Any:
+    """CR/LF-fold a free-text directive value for display, preserving None."""
+    if value is None or str(value).strip() == "":
+        return None
+    return _fold_directive(str(value))
+
+
 def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     """Ordered (label, value) rows for the job configuration summary.
 
@@ -304,9 +441,15 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
         if text:
             rows.append((label, text))
 
-    add("Job name", answers.get("job_name"))
+    # Show what Slurm will see, not what was typed. These fields are transformed
+    # on the way into the script — the name is sanitized, memory is normalized,
+    # free-text values are CR/LF-folded — and the CLI happens to pre-transform
+    # them before they reach here, so the two agreed by accident rather than by
+    # construction. A library caller got a summary describing its input and a
+    # script carrying something else.
+    add("Job name", sanitize_job_name(str(answers.get("job_name") or "")) or None)
     add("Partition", answers.get("partition"))
-    add("Account", answers.get("account"))
+    add("Account", _fold_or_none(answers.get("account")))
     qos = answers.get("qos")
     if qos and qos != "Default (none)":
         add("QoS", qos)
@@ -326,11 +469,21 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
         # Mirror the builder: --mem-per-cpu takes precedence over --mem when set.
         add("Mem per CPU", answers.get("mem_per_cpu"))
     else:
-        add("Memory", answers.get("memory"))
+        # normalize_memory is what the builder emits, so the row must show it:
+        # "1.5G" becomes "1536M" and "16" becomes "16M" in the directive.
+        raw_mem = answers.get("memory")
+        add("Memory", normalize_memory(str(raw_mem)) if raw_mem else raw_mem)
     add("Time limit", answers.get("time_limit"))
+    # Mirror the builder's own default: build_sbatch_script receives
+    # opt("nodes", 1), so an absent value still emits `#SBATCH --nodes=1`. Reading
+    # the raw answer here omitted the row, leaving a directive in the script that
+    # nothing in the summary accounted for — SM-15's shape in miniature. (The
+    # value is not an imposition: 1 node is Slurm's own default too. It just has
+    # to be visible, because the summary is what the user checks the script by.)
     nodes = answers.get("nodes")
-    if nodes is not None and str(nodes) != "":
-        add("Nodes", nodes)
+    if nodes is None or str(nodes) == "":
+        nodes = 1
+    add("Nodes", nodes)
     if answers.get("ntasks_per_node"):
         add("Tasks per node", answers.get("ntasks_per_node"))
     if _gpus_int(answers) > 0:
@@ -359,10 +512,26 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
             add("GPU format", answers.get("gpu_format"))
     add("Constraint", answers.get("constraint"))
     add("Array specification", answers.get("array_spec"))
-    add("Output directory", answers.get("output_dir"))
+    # The --output/--error directives are emitted unconditionally, so a row has to
+    # account for them. The CLI and the wizard both default this to "logs", but a
+    # direct API caller may omit it — and then the logs land in the working
+    # directory, which is worth saying rather than leaving the row out.
+    out_dir = answers.get("output_dir")
+    if out_dir and not output_dir_is_used(out_dir, answers.get("output_file")):
+        # The flag was given and has no effect: say that, rather than naming a
+        # directory the job will not write to.
+        add("Output directory", f"{out_dir} (not used — output file has its own path)")
+    else:
+        add("Output directory", out_dir or "(current directory)")
     add("Output file", answers.get("output_file"))
     add("Modules", answers.get("modules"))
-    add("Environment", answers.get("env_name"))
+    # Say when the name will not be acted on, rather than implying activation.
+    env_name = answers.get("env_name")
+    if env_name and not env_activation_emitted(env_name, answers.get("env_type")):
+        add("Environment", f"{env_name} (not activated — env_type "
+                           f"{answers.get('env_type') or 'none'!s})")
+    else:
+        add("Environment", env_name)
     add("Custom flags", answers.get("custom_sbatch"))
     add("Command", answers.get("command"))
     return rows
@@ -572,9 +741,19 @@ def build_sbatch_script(
     if _custom_mem:
         pass  # a custom --mem / --mem-per-cpu flag is emitted below instead
     elif mem_per_cpu:
-        lines.append(f"#SBATCH --mem-per-cpu={_fold_directive(str(mem_per_cpu))}")
+        lines.append(
+            f"#SBATCH --mem-per-cpu={_fold_directive(normalize_memory(str(mem_per_cpu)))}"
+        )
     elif memory:
-        lines.append(f"#SBATCH --mem={_fold_directive(str(memory))}")
+        # normalize_memory here, not only in the CLI: `sbatch --mem` requires an
+        # integer magnitude, so a fractional value that validate_memory accepts
+        # ("1.5G") is refused by the controller with "Invalid --mem
+        # specification" — measured. The CLI and the wizard both normalized before
+        # calling, so the emitted directive was correct *by accident of the
+        # caller*; a library caller got an unsubmittable script, and the summary
+        # row disagreed with it. Idempotent, so the pre-normalising callers are
+        # unaffected.
+        lines.append(f"#SBATCH --mem={_fold_directive(normalize_memory(str(memory)))}")
     if time_limit:
         lines.append(f"#SBATCH --time={_fold_directive(str(time_limit))}")
     if nodes is not None:
@@ -752,7 +931,10 @@ def build_sbatch_script(
             # Shell-quote the token (matching env_name below): shell metacharacters
             # in a module name would otherwise survive into the generated script,
             # and a name with a space would split into two `module load` arguments.
-            lines.append(f"module load {shlex.quote(mod)}")
+            quoted_mod = shlex.quote(mod)
+            lines.append(
+                f"module load {quoted_mod}{_abort_guard(f'module load {mod}')}"
+            )
 
     if env_name:
         strategy = (env_type or "conda").lower()
@@ -776,13 +958,21 @@ def build_sbatch_script(
                 # miniforge 25.3 / mamba 2.x: the bare form exits 1, this form
                 # exits 0 with the right sys.prefix).
                 lines.append("# mamba >= 2 needs its own shell hook; conda activates the same env")
-                lines.append(f"mamba activate {quoted} >/dev/null 2>&1 || conda activate {quoted}")
+                lines.append(
+                    f"mamba activate {quoted} >/dev/null 2>&1 || conda activate {quoted}"
+                    f"{_abort_guard(f'activating {env_name}')}"
+                )
             else:
-                lines.append(f"conda activate {quoted}")
+                lines.append(
+                    f"conda activate {quoted}{_abort_guard(f'activating {env_name}')}"
+                )
         elif strategy in ("virtualenv (venv)", "venv"):
             lines.append("")
             # rstrip a trailing "/" so "/venv/" doesn't become "/venv//bin/activate".
-            lines.append(f"source {shlex.quote(env_name.rstrip('/') + '/bin/activate')}")
+            activate = shlex.quote(env_name.rstrip("/") + "/bin/activate")
+            lines.append(
+                f"source {activate}{_abort_guard(f'activating {env_name}')}"
+            )
         else:
             logger.warning(f"env_type '{env_type}' with env_name '{env_name}' — no activation line emitted")
 
@@ -796,6 +986,44 @@ def build_sbatch_script(
     else:
         lines.append("")
     return "\n".join(lines)
+
+
+# Requested time limits that mean "no limit": `--time=0` is documented Slurm for
+# exactly that, and UNLIMITED/INFINITE appear in config-sourced values. Treating
+# them as a *zero-length* job and substituting a two-hour default produced a
+# confident core-hour figure for something unbounded — the same shape as quoting
+# an ETA for a job the scheduler has refused.
+_UNLIMITED_WORDS = frozenset({"unlimited", "infinite", "inf"})
+
+UNBOUNDED_ESTIMATE = "unbounded — no time limit"
+
+
+def _time_is_unbounded(time_limit: str) -> bool:
+    """Whether a *requested* time limit means "no limit".
+
+    Tested against the controller rather than enumerated: ``--time=0``,
+    ``00:00:00`` and ``0-00:00:00`` are all accepted, and Slurm documents a zero
+    limit as "no time limit be imposed". So any spelling that *parses* to zero
+    counts, which covers the forms a config file or a habit from another site
+    might carry — enumerating strings would have missed ``0-00:00:00``.
+
+    An **absent** limit is deliberately not unbounded: the job takes the
+    partition or site default, and estimating against the 2 h the summary already
+    shows for it is consistent rather than invented.
+    """
+    value = str(time_limit or "").strip().lower()
+    if not value:
+        return False
+    if value in _UNLIMITED_WORDS:
+        return True
+    # Only a *time-shaped* string that parses to zero counts. Without this,
+    # "not-a-time" would parse to 0 and be labelled unbounded — conflating
+    # unparseable with unlimited, which is precisely the SM-10 mistake. (The CLI
+    # rejects such values earlier; the builder is a public API and can be handed
+    # anything.)
+    if not re.fullmatch(r"[\d:\-]+", value):
+        return False
+    return _parse_slurm_time_to_minutes(value) == 0
 
 
 def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
@@ -820,6 +1048,11 @@ def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
     # a direct-API caller passing a negative can't yield a negative estimate.
     cpus = max(0, cpus)
     nodes = max(0, nodes)
+    if _time_is_unbounded(time_limit):
+        return UNBOUNDED_ESTIMATE
+    # An *absent* limit is a different case: the job will get the partition or
+    # site default, and 2 h is what the summary shows for it, so estimating
+    # against that is consistent rather than invented.
     minutes = _parse_slurm_time_to_minutes(time_limit) if time_limit else 120.0
     if minutes <= 0:
         minutes = 120.0
@@ -855,6 +1088,8 @@ def estimate_gpu_hours(gpus: int, time_limit: str, nodes: int = 1,
     if gpus <= 0:
         return ""
     nodes = max(1, nodes or 1)
+    if _time_is_unbounded(time_limit):
+        return UNBOUNDED_ESTIMATE
     minutes = _parse_slurm_time_to_minutes(time_limit) if time_limit else 120.0
     if minutes <= 0:
         minutes = 120.0

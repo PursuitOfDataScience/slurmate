@@ -628,7 +628,11 @@ class TestDirectiveNewlineFolding:
         assert not any(ln.strip() == "injected" for ln in lines)
         # The folded name is now shell-quoted (a space would otherwise split it
         # into two `module load` args, and metacharacters would survive).
-        assert "module load 'm injected'" in lines
+        # The guard tail (`|| { … exit 1; }`) now follows the load, so match the
+        # start of the line — the point of the assertion is the shell-quoting.
+        module_lines = [ln for ln in lines if ln.startswith("module load ")]
+        assert module_lines and module_lines[0].startswith("module load 'm injected'")
+        assert "exit 1;" in module_lines[0]
 
     def test_output_path_newline_folded_and_quoted(self):
         from slurmate.builder import build_from_answers

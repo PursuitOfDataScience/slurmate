@@ -1,2 +1,4 @@
-a100,nvlink|gpu:a100:4
-v100,pcie|gpu:v100:2
+gpu-shared|a100,nvlink|gpu:a100:4
+gpu-shared|v100,pcie|gpu:v100:2
+oldgpu|tc,e5-2670,160G,ib,m2090,gpu,ibspine-g20|gpu:1
+oldgpu|tc,e5-2670,32G,ib,k20m,gpu,ibspine-g20|gpu:1

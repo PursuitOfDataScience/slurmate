@@ -127,6 +127,35 @@ to submit an empty, no-op job). Every submit also saves a `<job>-<id>.sh` copy
 next to where you ran it — pass `--no-save-script` (or set `SLURMATE_NO_SAVE=1`)
 to skip that.
 
+The wizard needs a real terminal on both ends. In a pipe or a CI runner
+(`slurmate | tee setup.log`) it says so and points at the flags above, rather
+than rendering into a stream nobody can type into.
+
+### Checked against *this* cluster
+
+A generated script is only useful if it is correct for the cluster you are on,
+so the partition and account you name are checked against the live cluster
+before anything is written:
+
+```console
+$ slurmate --print --partition caslake --cpus 2 --time 01:00:00 --command ./run.sh
+  ✗ Error: no partition 'caslake' on this cluster.
+    Did you mean: broadwl (default), build, bigmem2?
+    This cluster's partitions: broadwl, build, bigmem2, gpu2, ... (+4 more)
+  Pass --force to generate the script anyway (e.g. for another cluster).
+```
+
+Writing a script to carry somewhere else is a legitimate thing to do — that is
+what `--force` is for; it downgrades the check to a warning. The default just
+is not silent.
+
+`--dry-run` additionally reports what Slurm itself says about the request. A
+job the scheduler has already refused gets the refusal, not a wait time:
+
+```
+│ ETA:  never — More processors requested than permitted │
+```
+
 Run `slurmate --help` for the full flag list.
 
 ---
@@ -137,7 +166,9 @@ Run `slurmate --help` for the full flag list.
 |---|---|
 | 🧠 **Live cluster awareness** | Pulls real partitions, GPU types, QoS, accounts, conda envs, and modules from `sinfo` / `scontrol` / `sacctmgr` / `conda`. |
 | 👀 **Live preview** | The `#SBATCH` script builds incrementally as you answer — what you see is exactly what gets submitted. |
-| 🛡️ **Partition-aware validation** | Inline warnings when CPU / memory / time / GPU requests exceed the selected partition's limits. |
+| 🛡️ **Partition-aware validation** | Inline warnings when CPU / memory / time / GPU requests exceed the selected partition's limits, plus a hard error for a partition or account this cluster does not have (`--force` to override). Under `--dry-run`, Slurm's own `--test-only` verdict is reported instead of an ETA for a job it would refuse. |
+| 🩺 **Usable capacity, not node counts** | The picker counts only nodes that can actually run a job, so a partition whose nodes are all `down`/`drained` reads `unavailable` instead of advertising capacity nothing can use. Ranked by the site default, then your own associations, then usable capacity. |
+| 📏 **Measured defaults** | An unspecified `--mem` is sized from the partition's own node memory (the same share of memory as of cores) rather than a literal that only fits the cluster slurmate was written on. |
 | 📁 **Path autocomplete** | `Tab`-complete file paths while typing your command, virtualenv path, or output files — no more retyping long project paths. |
 | ↩️ **Skip & come back** | Leave steps blank, navigate freely with `Esc`, and get reminded of anything missing before submit. |
 | 📋 **Copy-friendly** | Mouse capture is off so you can select/copy the preview natively; navigation is fully keyboard-driven. |
@@ -182,6 +213,40 @@ output_dir  = "logs"
 
 Every one of them is also a wizard step, so a config file prefills the
 interactive flow and batch mode identically.
+
+**CLI spellings work too.** `time` is accepted for `time_limit`, `array` for
+`array_spec`, and any dashed form (`job-name`, `mem-per-cpu`,
+`ntasks-per-node`, …) for its underscored key — so a key copied from `--help`
+does what it looks like it does.
+
+**Anything else is reported, not dropped.** A key outside the list above gets a
+named warning with the likely intent, instead of being silently discarded:
+
+```
+slurmate: ./.slurmate.toml: unknown key 'partitions' — did you mean 'partition'?
+slurmate: ./.slurmate.toml: ignoring unknown section '[job]' — put keys at the top level or under [defaults]/[slurmate]
+```
+
+**The file that supplied the defaults is named.** A `.slurmate.toml` travels
+with a project into git and onto whatever cluster it is next checked out on, so
+slurmate says where the values came from — on stderr at load, and in the
+`--dry-run` summary, listing only the keys no flag overrode:
+
+```
+slurmate: using defaults from ./.slurmate.toml: partition, account, cpus, time_limit
+  Defaults from ./.slurmate.toml: partition, account, time_limit (flags override the file).
+```
+
+`--print` keeps stdout script-only; the disclosure goes to stderr.
+
+**Plain output:** `--ascii` (or `SLURMATE_ASCII=1`) renders status markers as ASCII
+(`!`, `x`, `+`) instead of `⚠ ✗ ✓`. It is applied automatically when the terminal's
+encoding cannot carry them, so a non-UTF-8 locale degrades rather than failing.
+
+**Config file locations** are `$XDG_CONFIG_HOME/slurmate/config.toml` (falling back to
+`~/.config/slurmate/config.toml`) and `./.slurmate.toml`, merged in that order — so a
+global config still works in an environment with no resolvable home directory, such as
+a job launched with `sbatch --export=NONE`.
 
 Keys may sit at the top level or under a `[defaults]` or `[slurmate]` table.
 When the same key appears in more than one place, the effective precedence is

@@ -22,9 +22,14 @@ def read_fixture(filename: str) -> str:
 
 
 def mock_run_command(cmd: list[str], timeout: int = 30) -> tuple[str, str, int]:
-    # Match sinfo partitions
-    if "sinfo" in cmd and "%P|%l|%D|%a|%c|%m|%G" in cmd:
+    # Match sinfo partitions (matched by prefix so the format can gain fields)
+    if "sinfo" in cmd and any(a.startswith("%P|%l|%D") for a in cmd):
         return read_fixture("sinfo_partitions.txt"), "", 0
+    # The wide, validation-only partition-name list.
+    if "sinfo" in cmd and "-a" in cmd and "%P" in cmd:
+        return "\n".join(
+            line.split("|")[0] for line in read_fixture("sinfo_partitions.txt").splitlines()
+        ), "", 0
     # Match scontrol partitions details (both list all and specific partition show)
     if "scontrol" in cmd and "show" in cmd and "partition" in cmd:
         part = None
@@ -40,9 +45,18 @@ def mock_run_command(cmd: list[str], timeout: int = 30) -> tuple[str, str, int]:
             return "", "Partition not found", 1
         else:
             return scontrol_out, "", 0
-    # Match gpu types sinfo
+    # Match gpu types sinfo. The fixture tags each node row with its partition,
+    # because the real call is per-partition (`-N -p <part>`) and a fixture that
+    # hands every partition every node's features cannot show a partition-scoped
+    # detection bug.
     if "sinfo" in cmd and "%f|%G" in cmd:
-        return read_fixture("sinfo_gputypes.txt"), "", 0
+        want = cmd[cmd.index("-p") + 1] if "-p" in cmd else None
+        rows = []
+        for line in read_fixture("sinfo_gputypes.txt").splitlines():
+            part, _, rest = line.partition("|")
+            if want is None or part == want:
+                rows.append(rest)
+        return "\n".join(rows), "", 0
     # Match squeue jobs
     if "squeue" in cmd:
         return read_fixture("squeue_jobs.txt"), "", 0
@@ -69,7 +83,7 @@ class TestRealParsers:
 
     def test_fetch_partitions_real(self):
         parts = fetch_partitions()
-        assert len(parts) == 5
+        assert len(parts) == 9
 
         cpu_shared = next(p for p in parts if p["name"] == "cpu-shared")
         assert cpu_shared["nodes"] == 100
@@ -77,10 +91,23 @@ class TestRealParsers:
         assert cpu_shared["mem_per_node_mb"] == 131072
         assert cpu_shared["gpu_types"] == []
         assert cpu_shared["timelimit"] == "02:00:00"
+        # The trailing "*" in sinfo's %P marks the site default partition.
+        assert cpu_shared["is_default"] is True
 
         gpu_shared = next(p for p in parts if p["name"] == "gpu-shared")
         assert gpu_shared["nodes"] == 10
         assert sorted(gpu_shared["gpu_types"]) == ["a100", "v100"]
+
+    def test_node_counts_split_usable_from_dead(self):
+        """SM-1: down/drained nodes are counted separately, not as capacity."""
+        parts = fetch_partitions()
+        by_name = {p["name"]: p for p in parts}
+        # idle 60 + allocated 40 — both are live capacity.
+        assert by_name["cpu-shared"]["nodes"] == 100
+        assert by_name["cpu-shared"]["nodes_up"] == 100
+        # 6 nodes, every one down* — advertises capacity nothing can use.
+        assert by_name["retired"]["nodes"] == 6
+        assert by_name["retired"]["nodes_up"] == 0
 
     def test_partitions_expose_has_gpu(self):
         parts = fetch_partitions()
@@ -92,7 +119,7 @@ class TestRealParsers:
     def test_fetch_public_partitions_real(self):
         public_parts = fetch_public_partitions()
         # debug has Hidden=YES and AllowAccounts=restricted, so it should be filtered out
-        assert len(public_parts) == 4
+        assert len(public_parts) == 8
         assert not any(p["name"] == "debug" for p in public_parts)
 
     def test_fetch_qos_for_partition_real(self):
@@ -114,23 +141,33 @@ class TestRealParsers:
         assert queue_info["eta_label"] == "now"
         assert queue_info["source"] == "resources"
 
-        # An 8-core share fits the 5 idle nodes and the 2 mixed ones with 16 and 8
-        # free cores — 7 in all. The third mixed node has only 4 free, and the 2
-        # fully-allocated ones none, so neither counts.
-        assert fetch_queue_eta("gpu-shared", req_nodes=7, cpus=56)["eta_seconds"] == 0
-        assert fetch_queue_eta("gpu-shared", req_nodes=8, cpus=64)["eta_seconds"] > 0
+        # An 8-core share fits the 5 idle nodes, the 2 mixed ones with 16 and 8
+        # free cores, and the 2 GPU nodes with 16 free each — 9 in all. The third
+        # mixed node has only 4 free and the 2 fully-allocated ones none, so
+        # neither counts; nor do the `drained` and `idle*` nodes, which have 32
+        # free cores apiece and are still unschedulable.
+        assert fetch_queue_eta("gpu-shared", req_nodes=9, cpus=72)["eta_seconds"] == 0
+        assert fetch_queue_eta("gpu-shared", req_nodes=10, cpus=80)["eta_seconds"] > 0
 
-        # Per-node share, not the total: 3 mixed nodes have <32 free cores, so a
+        # Per-node share, not the total: the mixed nodes have <32 free cores, so a
         # request needing a whole 32-core node only fits the 5 idle ones.
         assert fetch_queue_eta("gpu-shared", req_nodes=5, cpus=160)["eta_seconds"] == 0
         assert fetch_queue_eta("gpu-shared", req_nodes=6, cpus=192)["eta_seconds"] > 0
 
     def test_fetch_queue_eta_never_says_now_for_unavailable_gpus(self):
-        # gpu:0 on every fixture node: a GPU request cannot start, however many
-        # cores are free. The old state-label tally reported "now" here.
-        info = fetch_queue_eta("gpu-shared", req_nodes=1, cpus=8, gpus_per_node=1)
-        assert info["eta_seconds"] > 0
-        assert info["eta_label"] != "now"
+        # Two fixture nodes carry gpu:a100:4 — one with 2 of 4 allocated, one with
+        # all 4 — and the rest have gpu:0. So a 2-GPU request fits exactly one
+        # node, a 3-GPU request fits none, and the node whose GPUs are fully
+        # allocated is "mixed" by state label yet cannot take a GPU job. The old
+        # state-label tally reported "now" for all of these.
+        assert fetch_queue_eta(
+            "gpu-shared", req_nodes=1, cpus=8, gpus_per_node=2
+        )["eta_seconds"] == 0
+        assert fetch_queue_eta(
+            "gpu-shared", req_nodes=2, cpus=8, gpus_per_node=2
+        )["eta_seconds"] > 0
+        info = fetch_queue_eta("gpu-shared", req_nodes=1, cpus=8, gpus_per_node=3)
+        assert info["eta_seconds"] > 0 and info["eta_label"] != "now"
 
 
 class TestSubmitSbatchReal:
@@ -179,7 +216,14 @@ class TestWizardFlow:
         mocker.patch.object(wizard.app, "run")
         wizard.answers = {"partition": "gpu-shared"}
         res = wizard.run()
-        assert res == {"partition": "gpu-shared"}
+        assert res is not None
+        # The answers now also carry config provenance (which keys still hold the
+        # value a config file supplied), so assert on the job fields rather than
+        # the whole dict.
+        assert {k: v for k, v in res.items() if not k.startswith("_")} == {
+            "partition": "gpu-shared"
+        }
+        assert res["_config_keys"] == []      # no config in this test
 
     def test_wizard_partition_mapping(self, mocker):
         wizard = Wizard()

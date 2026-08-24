@@ -36,16 +36,24 @@ from prompt_toolkit.widgets import RadioList, TextArea
 
 from .builder import _join_flag_values, build_from_answers, job_summary_rows
 from .system_utils import (
+    FALLBACK_MEMORY,
+    config_source,
+    default_memory_for,
     fetch_available_modules,
     fetch_conda_envs,
     fetch_gpu_type_sources,
     fetch_known_qos,
+    fetch_max_array_size,
     fetch_partitions,
     fetch_public_partitions,
+    fetch_qos_acl,
     fetch_qos_for_partition,
+    fetch_system_partitions,
     fetch_user_accounts,
+    fetch_user_partitions,
     load_config,
     normalize_memory,
+    validate_array_spec,
     validate_memory,
     validate_time,
 )
@@ -228,20 +236,85 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
     for p in partitions:
         if p["name"] == name:
             return p
-    return {"name": name, "nodes": 0, "cpus_per_node": 0, "mem_per_node_mb": 0,
-            "gpu_types": [], "timelimit": None, "is_public": True}
+    # Not in the sinfo list: a manually-typed name, or another cluster's. Every
+    # capacity field is unknown (0/None), which is what keeps the limit checks
+    # silent rather than warning against a limit of zero. nodes_up is None
+    # (unknown), never 0, so it is not read as "all nodes are down".
+    return {"name": name, "nodes": 0, "nodes_up": None, "cpus_per_node": 0,
+            "mem_per_node_mb": 0, "gpu_types": [], "timelimit": None,
+            "is_public": True, "is_default": False}
 
 
 def _fmt_partition(p: dict[str, Any]) -> str:
+    """One picker row for a partition.
+
+    Reports *usable* capacity, not raw node count: a partition whose nodes are
+    all ``down*`` advertises the same "31 nodes" as a healthy one, and picking it
+    gets a job that queues forever with nothing to say why. So the row shows
+    ``13 of 17 nodes`` when some are unusable and marks a fully-dead partition
+    ``unavailable`` \u2014 visible, still selectable (a drained partition can be the
+    right answer tomorrow), but not disguised as live capacity.
+    """
     name = p["name"]
     nodes = p.get("nodes", "?")
+    up = p.get("nodes_up")
+    if up is None or up == nodes:
+        # None = this site's sinfo gave no node state, so say nothing about it.
+        node_txt = f"{nodes} nodes"
+    elif up == 0:
+        node_txt = f"{nodes} nodes (unavailable)"
+    else:
+        node_txt = f"{up} of {nodes} nodes"
     cpus = p.get("cpus_per_node", "?")
     mem_gb = p.get("mem_per_node_mb", 0) // 1024
     gpus = p.get("gpu_types", [])
-    label = f"{name:<12} {nodes} nodes \u00b7 {cpus} CPU \u00b7 {mem_gb}G"
+    label = f"{name:<12} {node_txt} \u00b7 {cpus} CPU \u00b7 {mem_gb}G"
+    if p.get("is_default"):
+        label += " \u00b7 default"
     if gpus:
         label += f" \u00b7 GPU:[{','.join(gpus)}]"
     return label
+
+
+def _rank_partitions(
+    parts: list[dict[str, Any]],
+    user_parts: set[str] | None = None,
+    system_parts: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Order the picker so the partition a user wants is near the top.
+
+    Raw ``sinfo`` order puts whatever the site happens to have configured first,
+    which on a multi-year cluster is a scheduler partition followed by a run of
+    retired PI ones \u2014 and the two partitions anybody actually uses somewhere
+    below the fold. Rank instead by:
+
+    1. the site default partition (sinfo's ``*`` marker),
+    2. partitions the user holds an association for,
+    3. partitions with usable nodes, by descending usable capacity,
+    4. fully-dead partitions,
+    5. scheduler/system partitions (``cron`` and friends).
+
+    Nothing is removed \u2014 a partition that is drained today may be the right
+    answer tomorrow, and hiding it is its own kind of confusion.
+    """
+    user = user_parts or set()
+    system = system_parts or set()
+
+    def key(p: dict[str, Any]) -> tuple[Any, ...]:
+        name = str(p.get("name", ""))
+        up = p.get("nodes_up")
+        # None (state unknown) ranks with the live ones \u2014 absence of evidence.
+        dead = up == 0
+        return (
+            name in system,
+            dead,
+            not p.get("is_default", False),
+            name not in user,
+            -(up if isinstance(up, int) else (p.get("nodes") or 0)),
+            name,
+        )
+
+    return sorted(parts, key=key)
 
 
 def _parse_custom_flags(raw: str) -> list[str]:
@@ -367,7 +440,11 @@ STEPS: list[Step] = [
          subtitle="Node feature / Slurm -C, e.g. cpu, gpu, bigmem ('&' = and, '|' = or) (optional)",
          choices=CONSTRAINT_CHOICES),
     Step("array_spec", "Array specification", "text",
-         subtitle="e.g. 1-10, 1,3,5-7%4 (optional)"),
+         subtitle="e.g. 1-10, 1,3,5-7%4 (optional)",
+         # Every other resource field validates as you type; this one was
+         # free-text, so a reversed range or a zero step was only caught later at
+         # the summary. Empty is valid — the field is optional.
+         validate=validate_array_spec),
     Step("output_dir", "Output directory", "text",
          subtitle="Directory for stdout/stderr logs (optional)", default="logs", path=True),
     Step("output_file", "Output file", "text",
@@ -776,7 +853,11 @@ class Wizard:
             # shared with cpus/nodes) — the base case. To OMIT --mem on a whole-node
             # site (e.g. TACC), use batch mode's `--memory none` / `--mem-per-cpu`,
             # or delete the line via the editor step.
-            return normalize_memory(self._config_defaults.get("memory", "")) or "16G"
+            return (
+                normalize_memory(self._config_defaults.get("memory", ""))
+                or self._derived_memory_default()
+                or FALLBACK_MEMORY
+            )
         if s.key == "modules":
             return [m.strip() for m in val.split(",") if m.strip()] if val else None
         if s.key == "custom_sbatch":
@@ -803,6 +884,27 @@ class Wizard:
     _VALIDATED_KEYS = frozenset(
         {"cpus", "memory", "time_limit", "nodes", "ntasks_per_node", "gpus", "gpu_type"}
     )
+
+    def _cached_max_array(self, array_spec: Any) -> int | None:
+        """The site's MaxArraySize, fetched once per session; None until needed.
+
+        Without it the live panel stayed silent about an over-large ``--array``
+        while the final summary flagged it — the same request judged differently
+        by two surfaces. It is a cluster constant, not per-partition, so one
+        lookup covers the session (~20 ms), and it is only fetched when an array
+        has actually been entered, so a user who never uses arrays never pays for
+        it and the redraw stays subprocess-free.
+        """
+        if not str(array_spec or "").strip():
+            return None
+        if "max_array_size" not in self.transient:
+            try:
+                self.transient["max_array_size"] = fetch_max_array_size()
+            except Exception as e:      # a probe failure must not break a redraw
+                logger.debug(f"max array size lookup failed: {e}")
+                self.transient["max_array_size"] = None
+        cached = self.transient.get("max_array_size")
+        return int(cached) if cached else None
 
     def _cached_gpu_types(self, slot: str = "gpu_types") -> list[str] | None:
         """GPU types cached by the gpu_type step, but only for the CURRENT partition.
@@ -842,11 +944,41 @@ class Wizard:
             live,
             extra_gpu_types=self._cached_gpu_types(),
             feature_only_gpu_types=self._cached_gpu_types("gpu_types_feature_only"),
+            max_array_size=self._cached_max_array(live.get("array_spec")),
         )
 
+    def _derived_memory_default(self) -> str:
+        """The memory default, sized from the chosen partition when it is known.
+
+        The step declares a literal ``16G``, which is the number SM-7 was filed
+        about: it is not a measurement of anything, and on a cluster whose nodes
+        have 8 GB it is an unschedulable default. The batch path derives it from
+        the partition; the wizard — the *default* interface, and the one that
+        shows the value pre-filled for the user to accept — did not.
+        """
+        part = self.answers.get("_partition_obj")
+        if not part or part.get("_unknown"):
+            return ""
+        try:
+            cores = int(self.answers.get("cpus") or 1)
+        except (TypeError, ValueError):
+            cores = 1
+        value, source = default_memory_for(part, cores)
+        return value if source == "partition" else ""
+
     def _step_default(self, s: Step) -> str:
-        """Default value for a step, preferring a per-instance config override."""
-        return self._config_defaults.get(s.key, s.default)
+        """Default value for a step, preferring a per-instance config override.
+
+        Memory additionally prefers a value *derived from the cluster* over the
+        declared literal — an explicit config setting still wins, since the user
+        asked for it.
+        """
+        override = self._config_defaults.get(s.key)
+        if override is not None:
+            return override
+        if s.key == "memory":
+            return self._derived_memory_default() or s.default
+        return s.default
 
     def _on_enter_step(self, direction: str = "forward") -> None:
         """Called whenever entering a step (forward or backward)."""
@@ -976,7 +1108,8 @@ class Wizard:
             try:
                 if s.key == "qos":
                     part = self.answers.get("partition", "")
-                    raw = s.fetch(part)          # AllowQos for this partition
+                    acl = fetch_qos_acl(part)    # AllowQos + DenyQos
+                    raw = acl["allow"]
                     known = fetch_known_qos()    # all QoS names, or [] if unknown
                     if any(str(q).upper() == "ALL" for q in raw):
                         # AllowQos=ALL is a sentinel ("any QoS allowed"), not a QoS
@@ -990,6 +1123,12 @@ class Wizard:
                         # against a demo fallback.
                         known_set = set(known)
                         raw = [q for q in raw if q in known_set]
+                    # Subtract DenyQos: a site that writes `AllowQos=ALL` plus a
+                    # deny list means every QoS *except* those, and offering a
+                    # denied one is offering a job the partition will refuse.
+                    denied = {str(q) for q in acl["deny"]}
+                    if denied:
+                        raw = [q for q in raw if str(q) not in denied]
                     result = (["Default (none)"] + raw) if raw else []
                 elif s.key == "env_name":
                     raw = s.fetch()
@@ -1014,21 +1153,46 @@ class Wizard:
         cached = self.transient.get("all_parts")
         if cached is not None:
             public, all_parts = self.transient.get("public_parts", []), cached
+            user_parts = self.transient.get("user_parts")
+            system_parts = self.transient.get("system_parts", set())
         else:
             try:
                 all_parts = fetch_partitions()
                 public = fetch_public_partitions(all_parts)
+                # The partition ACL is not the gate on most clusters — private PI
+                # partitions advertise AllowAccounts=ALL and still reject every
+                # submission. The association list is. None means "can't tell"
+                # (or an account-scoped site), in which case nothing is filtered.
+                user_parts = fetch_user_partitions()
+                system_parts = fetch_system_partitions()
             except Exception as e:
                 logger.debug(f"Failed to fetch partitions: {e}")
                 public, all_parts = [], []
+                user_parts, system_parts = None, set()
         self.transient["public_parts"] = public
         self.transient["all_parts"] = all_parts
+        self.transient["user_parts"] = user_parts
+        self.transient["system_parts"] = system_parts
+
+        # When the site scopes associations per partition, the ones the user can
+        # actually submit to are the shortlist; everything else moves behind the
+        # "private" toggle rather than being offered as an ordinary choice.
+        if user_parts:
+            allowed = [p for p in all_parts if p.get("name") in user_parts]
+            if allowed:
+                public = allowed
+        ranked = _rank_partitions(public, user_parts, system_parts)
         choices = [CUSTOM]
-        if public:
+        if ranked:
             choices.append(PRIVATE)
-            choices.extend(_fmt_partition(p) for p in public)
+            choices.extend(_fmt_partition(p) for p in ranked)
         elif all_parts:
-            choices.extend(_fmt_partition(p) for p in all_parts)
+            choices.extend(
+                _fmt_partition(p)
+                for p in _rank_partitions(all_parts, user_parts, system_parts)
+            )
+        # Keep the resolved list for _set_partition_from_select to match against.
+        self.transient["public_parts"] = ranked or public
         self.radio_list = RadioList([(c, c) for c in choices])
         # Restore the previously-chosen partition as the highlighted row (every
         # other step restores its prior value on Back), so a stray Enter doesn't
@@ -1052,7 +1216,11 @@ class Wizard:
                 self._invalidate()
                 return
             if raw == PRIVATE:
-                all_parts = self.transient.get("all_parts", [])
+                all_parts = _rank_partitions(
+                    self.transient.get("all_parts", []),
+                    self.transient.get("user_parts"),
+                    self.transient.get("system_parts", set()),
+                )
                 fmt_all = [_fmt_partition(p) for p in all_parts]
                 self.radio_list = RadioList([(c, c) for c in fmt_all])
                 self.step_cache["partition_sub"] = "all"
@@ -1588,10 +1756,31 @@ class Wizard:
 
     # ── Entry point ─────────────────────────────────────────────────
 
+    def _record_config_provenance(self) -> None:
+        """Note which answers still hold the value a config file supplied.
+
+        The batch path discloses this (a ``.slurmate.toml`` travels with a project
+        onto whatever cluster it is next checked out on, so where a value came
+        from is part of the answer) and the wizard did not — even though the
+        wizard is what *prefills* from that file. Recorded on the way out rather
+        than at prefill time, so a value the user then changed is no longer
+        credited to the file.
+        """
+        supplied: list[str] = []
+        for key, value in self.config.items():
+            if key not in self.answers:
+                continue
+            answer = self.answers[key]
+            if answer == value or str(answer) == str(value):
+                supplied.append(key)
+        self.answers["_config_source"] = config_source()
+        self.answers["_config_keys"] = supplied
+
     def run(self) -> dict[str, Any] | None:
         self._on_enter_step()
         try:
             self.app.run()
+            self._record_config_provenance()
             return self.answers
         except (KeyboardInterrupt, EOFError):
             return None
