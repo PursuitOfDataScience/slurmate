@@ -89,6 +89,14 @@ printed it as something weaker than it was.
   host's real module system). Verified by running the suite under each variable
   set, and by confirming the seven failures return when the fixture is disabled.
 
+  A second CI-only failure came from the same blind spot in the other direction:
+  the test asserting that every version `requires-python` allows is also declared
+  in the classifiers read `pyproject.toml` with `tomllib`, which is 3.11+ — so the
+  one test whose subject is 3.10 support could not run on 3.10. It parses the two
+  fields with a regex now, as `release.yml` already did for the same reason. The
+  suite is verified on 3.10 (`/software/python-miniforge-24.1.2`) as well as 3.11,
+  3.12 and 3.13.
+
 - **A wizard test was passing for the wrong reason, and only here.** It set
   `COLUMNS=150` in the environment but never sized the pty, and env vars do not
   size a pty — prompt_toolkit asks the tty, which reports 80x24 whatever `COLUMNS`

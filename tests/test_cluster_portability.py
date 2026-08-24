@@ -3412,23 +3412,24 @@ class TestDeclaredPythonSupport:
     matters because classifiers are what PyPI shows and what tooling filters on.
     """
 
-    def _project(self):
-        import tomllib
-        return tomllib.loads(
-            (pathlib.Path(su.__file__).parent.parent.parent / "pyproject.toml").read_text()
-        )["project"]
+    def _pyproject_text(self):
+        return (
+            pathlib.Path(su.__file__).parent.parent.parent / "pyproject.toml"
+        ).read_text()
 
     def test_every_version_requires_python_allows_is_declared(self):
         # The two must not disagree: requires-python is what pip enforces,
         # classifiers are what users read, and a gap understates support.
-        project = self._project()
-        assert project["requires-python"] == ">=3.10"
-        declared = {
-            c.rsplit("::", 1)[-1].strip()
-            for c in project["classifiers"]
-            if "Python ::" in c
-        }
-        assert {"3.10", "3.11", "3.12", "3.13", "3.14"} <= declared
+        #
+        # Read with a regex rather than tomllib, which is 3.11+ — and 3.10 is the
+        # oldest version this very test asserts support for, so importing it made
+        # the test unrunnable on the interpreter it most needed to run on.
+        # release.yml avoids tomllib for the same reason.
+        text = self._pyproject_text()
+        requires = re.search(r'^requires-python\s*=\s*"([^"]+)"', text, re.M)
+        assert requires and requires.group(1) == ">=3.10"
+        declared = set(re.findall(r'"Programming Language :: Python :: ([0-9.]+)"', text))
+        assert {"3.10", "3.11", "3.12", "3.13", "3.14"} <= declared, declared
 
     def test_no_removed_or_deprecated_stdlib_apis(self):
         # What actually breaks on a newer interpreter: distutils and imp are gone,
