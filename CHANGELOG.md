@@ -18,7 +18,7 @@ result was a confident, complete, unsubmittable answer.
 A second open-box run, on a third environment again chosen for how little it
 resembles the first (Booth's Mercury: RHEL 9.8 / Python 3.13 / **Slurm 25.11** /
 cgroup v2 / NFS home / Tcl environment-modules 5.x / no default account for the
-user), produced the next eight. Same shape as before, one layer up: the tool had
+user), produced the next nine. Same shape as before, one layer up: the tool had
 the right answer in hand and either never asked for it on the path being used, or
 printed it as something weaker than it was.
 
@@ -76,6 +76,18 @@ printed it as something weaker than it was.
   `never` or `not right now`, and says plainly that slurmate cannot tell whether
   it clears. It still does not block, because guessing "permanent" fails builds
   over conditions that pass on retry.
+
+- **The suite no longer depends on the shell that runs it.** Seven config tests
+  passed on midway3 and failed in GitHub CI for a reason unrelated to the code:
+  they set `HOME` and wrote `$HOME/.config/slurmate/config.toml`, but
+  `load_config()` honours `XDG_CONFIG_HOME` first, and GitHub's runners export it
+  while a midway3 login shell does not. An autouse fixture now clears the
+  variables slurmate reads that would silently change a result —
+  `XDG_CONFIG_HOME`, `SLURMATE_GPU_FORMAT`, `NO_COLOR`/`FORCE_COLOR`,
+  `EDITOR`/`VISUAL`, and `LMOD_CMD`/`MODULESHOME` (both set on any Lmod login
+  shell and consulted by the module check, so those tests had been reading the
+  host's real module system). Verified by running the suite under each variable
+  set, and by confirming the seven failures return when the fixture is disabled.
 
 - **A wizard test was passing for the wrong reason, and only here.** It set
   `COLUMNS=150` in the environment but never sized the pty, and env vars do not
