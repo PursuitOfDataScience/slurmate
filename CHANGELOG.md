@@ -5,6 +5,458 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.7.0] — 2026-08-25
+
+Two portability rounds, over three more clusters, taking the cluster count to
+four: midway3 (the dev site), midway2, Booth's **Mercury** (RHEL 9, Slurm 25.11,
+no node features) and Booth's **Pythia** (RHEL 8, Slurm 24.11, GPU-only — every
+partition typed-GRES and featureless, a default partition that refuses batch
+jobs, and a test user with no Slurm association, so every submit is refused).
+
+Almost everything here is a fix, and the recurring shape is worth stating once:
+**slurmate usually had the right answer and either never asked for it on the path
+in use, printed it as something weaker than it was, or checked it on the wrong
+machine.** The round's worst finding is the last of those — a job whose log went
+to node-local storage came back `COMPLETED 0:0` with nothing to read, and every
+local check passed because they all tested the login node.
+
+The suite went from 1099 tests to **1457**, and now runs green on four clusters
+and on Python 3.10–3.13.
+
+### Added
+
+New spellings slurmate accepts, so a script or command line copied from Slurm's
+own documentation (or from slurmate's own output) works unchanged. Each is
+detailed under Fixed, because each one closes a handoff that was broken:
+
+- Slurm's short flags `-J -A -p -q -t -N -a -C -G -o -e`, completing the set
+  (`-c` was already there, and was the only one). Deliberately **not** `-n`, which
+  is Slurm's `--ntasks` and has no slurmate option — a short flag meaning
+  something different from Slurm's is worse than none.
+- `--gpus [<type>:]<count>`, `--gres gpu[:<type>]:N`, `--gpus-per-node`,
+  `--gpus-per-task` — four renderings of one request, resolved into
+  `--gpus`/`--gpu-type`/`--gpu-format`.
+- `--mem`, `--cpus-per-task`, `--output` as aliases of `--memory`,
+  `--cpus`, `--output-file`; and `--error`, accepted purely to explain that it is
+  derived and to name the escape hatch.
+- `--time UNLIMITED`/`INFINITE` and `--memory 16GB` (trailing `B`), both of which
+  sbatch accepts and slurmate refused.
+
+### Fixed
+
+Second portability round, on two more clusters: Booth's **Mercury** (RHEL 9,
+Slurm 25.11, no node features at all) and Booth's **Pythia** (RHEL 8, Slurm
+24.11, GPU-only — *every* partition carries typed GRES and no features, the
+default partition refuses batch jobs outright, and the test user has no Slurm
+association at all, so every submission is refused). Nine findings, each
+verified on all three clusters afterwards.
+
+- **A job's log no longer disappears into a compute node's `/tmp`.** The worst
+  finding of the round, and it came out of actually submitting: slurmate
+  submitted from `/tmp/work/submit`, created `logs/`, reported `Submitted! Job
+  ID: 563319` — and the job returned `COMPLETED 0:0` with **no log anywhere the
+  submitter could see**. The 213-byte log was on the compute node's own `/tmp`
+  (a per-node LVM volume); an identical job from the NFS home wrote its log
+  normally. That is SM-24's failure — output discarded, success reported —
+  reached through a door `check_log_dirs` could not cover, and its own docstring
+  said why it did not try: it tests the directory on the *login* node, where a
+  node-local `/tmp/…/logs` exists and is writable. Both facts true, neither the
+  one that matters.
+
+  `node_local_log_dir` now answers the question that does: is this path on
+  storage private to one machine? A hit needs **both** a node-local path **and**
+  a node-local filesystem *type*, read from `/proc/self/mountinfo` (no
+  subprocess — this runs inside `check_log_dirs`), so a site that deliberately
+  exports `/tmp` over NFS is not accused of anything. The paths are `/tmp`,
+  `/var/tmp`, `/dev/shm` and the ones that say so in their own name
+  (`/scratch/local`, `/local`, `/localscratch`) — midway3's `/scratch/local` is
+  the same `/dev/sda1` as its `/tmp` and is where `$TMPDIR` points there, so a
+  log written to it is exactly as unreadable. Deliberately **not** bare
+  `/scratch`: node-local on some sites and shared on others, so warning would
+  fire on the correct configuration. It fires on the submit path too, unlike the
+  missing-directory warning — creating the directory is precisely what does not
+  help. Silent in mock mode, where there is no compute node to be wrong about,
+  which is also what keeps the suite hermetic.
+
+  One test then had to be corrected rather than the code: `pytest`'s `tmp_path`
+  follows `$TMPDIR`, which is unset on both Booth clusters (so `/tmp`) and
+  `/scratch/local/jobs/<id>` on midway3 — both node-local. A test asserting a
+  log-dir check produced *no* findings was therefore measuring the ambient
+  environment, and it failed on the two clusters and passed here for that reason
+  alone. It now asserts the absence of the specific finding it is about.
+
+- **A site plugin that does not use Slurm's `Reason:` convention is still
+  read.** Pythia's lua `job_submit` rejects a batch job with
+  *"Job submission rejected: Batch jobs cannot use the `interactive_*`
+  partitions."* and leaves Slurm's own half as `Unspecified error`. slurmate
+  showed only Slurm's half — the contentless catch-all — and this is Pythia's
+  **default** partition, so it was the shipped-defaults path for that entire
+  cluster. On a `--test-only` run every `sbatch: error:` line is the site's own
+  text (Slurm puts its verdict on the unprefixed `allocation failure:` line), so
+  when there is no `Reason:` and the plugin said exactly **one** thing, that
+  sentence is the specific half. One line only: midway3's plugin writes a
+  six-line block whose `Reason:` is already matched, and with several unlabelled
+  lines there is no way to tell which is the verdict, so nothing is claimed.
+  Gated on Slurm having rendered a verdict at all, which preserves the invariant
+  that a bare non-zero exit is not evidence about the job — sbatch prints
+  `sbatch: error:` for an unreachable controller too. The classification is
+  deliberately unchanged: no marker matches that sentence, and guessing
+  "permanent" is the direction that blocks jobs which would have run.
+
+- **The mirror of H2: a typed-GRES model requested as a `--constraint`.** H2
+  catches a feature-only model asked for as a GRES type and recommends
+  `gpu_format 'constraint'` — which is precisely the request that fails on both
+  Booth clusters, because their nodes advertise `gpu:h100:8` and **no features
+  whatsoever**. So on those clusters `gpu_format constraint` can never work, on
+  any partition, and slurmate emitted `--constraint=h100` in silence and let
+  Slurm answer "Invalid feature specification". `fetch_gpu_type_sources` now
+  reports a third set — models some node advertises as a *feature*, which is not
+  the complement of `typed` (midway3's `a100` is both) — and requesting a model
+  outside it through the constraint format is an error naming `gres_type` as the
+  remedy. `None` means the lookup did not run and claims nothing; `[]` is the
+  measured answer that matters. Wiring mattered as much as the check:
+  `_partition_issues` skipped the `sinfo` lookup for any statically-listed
+  model, i.e. for every typed-GRES model, i.e. for exactly the ones this is
+  about — it now runs for a constraint request too, and still skips it on the
+  default path. Gated on the model actually being in the partition: without that
+  it stacked a false "is a GRES type on 'gpu'" onto the true "not in partition
+  list" for a model midway3's `gpu` partition does not have.
+
+- **`-p` and `-t` are accepted.** `-c` was the only Slurm short flag slurmate
+  took, so the two most-typed flags in Slurm were argparse errors. This is not a
+  hypothetical: every probe written for this round reached for `-p`/`-t` and
+  every one failed before it ran. Added for each long option that has a Slurm
+  short form — `-J -A -p -q -t -N -a -C -G -o -e` — and no others: Slurm's `-n`
+  is `--ntasks`, which slurmate has no option for, and a short flag that means
+  something *different* from Slurm's would silently misread a copied command
+  line, which is worse than not having it.
+
+- **`--gpus a100:2` parses.** SM-25 again, in the one flag whose name matches
+  the option it sets: slurmate *prints* `--gpus=a100:2` under `--gpu-format
+  gpus`, and argparse answered its own output with "invalid int value:
+  'a100:2'". It now takes Slurm's `[<type>:]count`, and a type given that way
+  implies the format, since that rendering is the only one that produces the
+  spelling — so feeding the directive back reproduces the script byte for byte,
+  which a test pins. A bare `--gpus 4` says nothing about format and keeps the
+  default. The int is resolved in `parse_args`, so "after parsing, `gpus` is a
+  number" stays true for every caller.
+
+  An *inferred* format is also allowed to yield: on a cluster that cannot parse
+  `--gpus` (not `select/cons_tres`) the rendering changes to `gres_type` with a
+  note, rather than failing a job the default rendering expresses perfectly
+  well. An explicitly chosen `--gpu-format` is still an error there, because the
+  user asked for that syntax by name. All three clusters run cons_tres, so this
+  branch is covered by a harness that replaces the one cluster fact instead.
+
+- **`--env` no longer hands over a script that dies on its first line.** SM-13
+  fixed the late failure for `module load`; the `--env` check was made silent
+  when conda cannot be asked at all, on the reasoning that an empty env list
+  must not read as "your environment does not exist". True, but it is not
+  nothing either: **conda is on no tested cluster's default PATH** — not
+  Mercury's, not Pythia's, not midway3's — so `--env myenv` with no
+  conda-providing module generated a script whose first real line is
+  `source "$(conda info --base)/…"`, and the job started and immediately died.
+  Now it says conda is unreachable, claims nothing about the environment, and
+  names the remedy where the module system has one. Finding the module needed
+  its own fix: `module -t avail conda` matches a name **prefix**, so it finds
+  Pythia's `conda/23.10` and misses midway3's `python/anaconda-2025.12`
+  entirely — the cluster with the most obvious remedy got none. The whole module
+  list is substring-searched instead, and offered one entry per family (the
+  newest of each), because suggesting `python/anaconda-2019.03` where 2025.12
+  exists is a remedy nobody wants. Silent when conda *is* on PATH and the
+  listing failed anyway: that is a broken conda, and the activation may well
+  work.
+
+- **The memory-provenance note names the partition it measured.** With no
+  `--partition` the figure comes from the site default — which slurmate
+  resolves, and says so two lines further down — but this line read the *user's*
+  answer and printed "sized to 47G from **'?'** node memory". A note whose
+  entire job is to say where a number came from, admitting it does not know, on
+  the default path of every cluster tested.
+
+- **The mock cluster has the shape of a real one.** Two keys every
+  `fetch_partitions` row carries were missing from the fixture, and each one had
+  switched off a check that works live. No row had `is_default`, though `sinfo`
+  marks exactly one partition with a `*` on every cluster there is — so the
+  whole "no `--partition` given, use the site default" path, with its own limit,
+  queue, ETA and memory consequences, was unreachable in mock mode, in `--demo`
+  and in the suite. No row had `gpus_per_node`, so a 99-GPU request on a
+  4-GPU-per-node partition passed in silence here while a real cluster warned.
+  A guard test now derives the key set from `fetch_partitions` itself rather
+  than restating it, so the next divergence is caught here instead of on the
+  next cluster.
+
+- **`--print`'s "stays silent" test no longer measures the checkout.** It
+  asserted an empty stderr for a clean request and passed only because the dev
+  checkout happens to contain an untracked `logs/`. On a fresh clone — both
+  Booth clusters, and GitHub CI — SM-24's missing-directory warning fires and
+  the assertion fails. Now hermetic, in a tmp cwd, with the other half of the
+  pair pinned too: pinning only the silent case is what let the dependency go
+  unnoticed.
+
+
+- **SM-24: `--print` no longer hands over a script that silently discards its
+  output.** Slurm does not validate output paths at submit — it accepts
+  `--output=logs/x-%j.out` with no `logs/` present, discards everything the job
+  writes, and reports `COMPLETED 0:0`. A green job with no log is the most
+  confusing result a batch user can get, and it was reachable from the shipped
+  defaults in any empty directory. `submit_sbatch` already creates these
+  directories, so the submit path was never affected; the gap was `--print`,
+  which by design creates nothing and is the one mode that hands over a script
+  slurmate will never submit itself. It now warns, naming the directory and the
+  remedy (`mkdir -p logs`). `--dry-run` deliberately stays silent — a later real
+  run creates the directory, so warning there would fire on every dry run of the
+  default. An unwritable parent still gets the stronger "cannot be created"
+  message, which tells the reader that `mkdir` will not help either.
+
+- **A custom `--ntasks` is costed.** slurmate has no `--ntasks` option, so
+  `--custom-sbatch=--ntasks=N` is the *only* way to express an MPI job with it —
+  a likely path, not an exotic one — and the estimate ignored it, reporting 2.0
+  core-hours for a job asking for 200 cores. Both estimates now read it. It is
+  job-wide, so it replaces tasks-per-node × nodes rather than multiplying it, and
+  where the two disagree the larger wins, since `--ntasks-per-node` is a per-node
+  cap rather than a total. `--gpus-per-task` tracks it too; a job-wide `--gpus`
+  correctly does not.
+
+- **An array job's cost is the array's cost.** The estimate ignored `--array`
+  entirely, so `--array 1-1000` reported the same `2.0` CPU-hours as a single job —
+  a thousandfold understatement of the one figure a user checks before submitting
+  something expensive, and in the direction that matters, because it says an
+  enormous job is cheap. Both estimates now multiply by the task count and keep
+  the per-task figure visible (`2,000 (1000 tasks × 2.0)`), so the arithmetic is
+  checkable rather than just larger. The `%N` throttle is deliberately not a
+  divisor: it caps how many tasks run *at once*, so it changes the wall-clock and
+  not the bill. A stepped range counts correctly (`1-10:2` is 5 tasks, not 10), a
+  bare `%N` carries no indices and yields no count rather than guessing 1, and an
+  unbounded `--time` still reports "unbounded" rather than a multiplied number.
+  Same family as `--time=0` once reporting 96 core-hours for something unbounded:
+  a confident figure that was wrong.
+
+- **SM-28: the QoS wall limit is left to the scheduler, and its verdict is now
+  classified correctly.** The report asked for `sacctmgr`'s QoS `MaxWall` to be
+  compared locally, since the partition says `infinite` on the cluster where it
+  matters. That was implemented and then **reverted**, because measuring it showed
+  a false warning: whether exceeding a QoS `MaxWall` is refused *at submit*
+  depends on the QoS's `DenyOnLimit` flag, and no QoS on midway3 sets it — there
+  `--qos=build --time=30-00:00:00` against `MaxWall=06:00:00` is reported
+  `***PASSED***` by sbatch. `sacctmgr`'s MaxWall is therefore not a
+  cluster-invariant ceiling, and comparing against it warns about a limit the
+  scheduler does not enforce.
+
+  Slurm's own verdict *is* site-accurate and is already consulted on every path,
+  so the fix is to make that verdict land properly: Slurm's limit tokens split on
+  one word, and a `...PerJob` limit is a statement about the **request** — no
+  waiting makes a 7-day job fit a 6-hour MaxWall — while `...PerUser` count limits
+  are about the moment. `QOSMaxWallDurationPerJobLimit` and its family are now
+  classified permanent, so a site that does enforce the limit gets a definite
+  refusal instead of the vague "cannot tell". `QOSMaxSubmitJobPerUserLimit` stays
+  transient. The partition-limit comparison, including the unbounded-`--time`
+  half, is unchanged — a partition `MaxTime` *is* enforced at submit.
+
+- **The capacity refusal uses the exact maximum too.** SM-27's per-node lookup
+  fixed the *warning* path but left `capacity_refusal` — the one that produces
+  `ETA: never` — still skipping cpu and memory on a mixed partition. That skip was
+  right while the only figure was a floor, since refusing against a floor claims
+  "never" for a request a larger node takes. With a resolved maximum it is simply
+  an asymmetry: a 999-core request was refused on a homogeneous partition and
+  passed in silence on a mixed one whose true ceiling slurmate had already looked
+  up. It now refuses when the figure is exact and keeps its silence when the
+  per-node query did not run. Still pure — it reads the enriched dict, so the ETA
+  path consults it without acquiring a subprocess call, which a test pins.
+
+- **SM-27: a heterogeneous partition's limit is its largest node, not its
+  smallest.** `sinfo`'s aggregate row reports the *smallest* node of a mixed
+  partition and marks it with `+` ("at least this much"). slurmate recorded that
+  number and compared requests against it, so a request that fits a larger node
+  was warned about: 38 of 84 partitions on midway2 emit the `+`, 20 of 87 on
+  midway3, where `test` advertises a floor while its nodes reach **256 cores and
+  2321910 MB**. Invisible on a homogeneous cluster, which is why it survived.
+
+  For the partition the user actually names — and only when the aggregate row
+  carried a `+`, so a homogeneous site pays nothing — slurmate now asks
+  `sinfo -N -p <part>` for the per-node figures and compares against the maximum.
+  The warning then states a real ceiling ("exceeds the largest node"). When that
+  query cannot be made the floor-based comparison and its honest "smallest node;
+  nodes differ" wording remain: an unknown must not turn a floor into a ceiling,
+  nor silence the check. Wired inside `_get_partition`, so all six call sites
+  across the CLI and the wizard get it.
+
+- **The managed-flag advice points at a flag that exists.** SM-15 refuses a
+  `--custom-sbatch` duplicating a directive slurmate owns and names the flag to
+  use instead; SM-25 then made Slurm's own spellings first-class and left that
+  mapping sending users to a *different* flag than the one they typed. For
+  `--gres` it also lost information, since `--gres gpu:a100:2` carries a type a
+  bare `--gpus` does not. Each managed flag now maps to a spelling the CLI
+  accepts, and where that is the flag the user typed the message says the real
+  distinction — pass it as an option rather than inside `--custom-sbatch` —
+  instead of the tautological "use `--gres` instead". A guard test asserts every
+  owner in the map is actually accepted by the CLI, verified to fail when an owner
+  is made stale.
+
+- **A refused array spec says what is actually wrong with it.** Re-measuring
+  `validate_array_spec` against a live controller confirmed its calibration on 18
+  of 20 cases, with one real divergence: `1-10%` — a `%` with the number lost — is
+  *accepted* by sbatch, which silently runs the array with no throttle at all.
+  slurmate still refuses it, deliberately, because an unthrottled array is very
+  unlikely to be what a `%` was typed for. But the message said "Invalid array
+  specification", which is a false claim about the scheduler. It now says Slurm
+  would accept it and drop the throttle, and names the fix with the user's own
+  range filled in (`1-10%4`). Genuinely invalid specs still say invalid.
+
+- **`--memory 16GB` was falsely refused.** sbatch tolerates a trailing `B` after
+  the unit — measured, `16KB`/`16MB`/`16GB`/`16TB` all parse in any case, while
+  `16B` (no unit) and `16GiB` get "Invalid --mem specification" — so refusing the
+  most natural way to write memory was rejecting something the scheduler takes.
+  Accepted now, normalised to the canonical `16G`, on `--memory`, `--mem-per-cpu`
+  and both wizard fields, which share the validator.
+
+  Accepting a spelling means parsing it *everywhere*, and the first cut of this
+  did not. `validate_memory` said yes and `normalize_memory` emitted a correct
+  directive while `_parse_mem_to_mb` still returned **0**, so a 64 GB request on a
+  16 GB partition warned about nothing — a half-fix strictly worse than the
+  refusal it replaced. The same omission turned `1.5GB` into `--mem=0M`, which
+  Slurm reads as *all* the node's memory. One grammar, three functions, and a test
+  that an accepted spelling is also a parsed one. `1.5G` was never a defect: it is
+  deliberately accepted and emitted as `1536M`, since sbatch requires an integer
+  magnitude.
+
+- **`--time=UNLIMITED` was falsely refused, and then read as a zero-length job.**
+  Two mirror-image defects. slurmate rejected `UNLIMITED`/`INFINITE` with "Invalid
+  time limit value", but sbatch accepts both — measured against a live client,
+  where they reach the controller and are judged on policy exactly like
+  `01:00:00`, while only a genuinely bad value gets "Invalid --time
+  specification". Blocking a request the scheduler would take is the rarer and
+  worse direction to be wrong in: there is no cluster on which it was right.
+  `inf` stays rejected, because sbatch rejects that one too — accepting it would
+  trade the bug for its inverse.
+
+  Once accepted, the partition-limit check then affirmed it, because
+  `_parse_slurm_time_to_minutes("UNLIMITED")` is `0.0` and `0 > 120` is false — so
+  "no limit" was compared as a *zero-length* job and passed against a two-hour
+  partition. `--time=0` had the same hole. The cost estimate already got this
+  right from its own copy of the rule, which is the point: there were two
+  implementations of "is this unbounded", and they disagreed. There is one now, in
+  `system_utils`, and the builder's delegates to it.
+
+- **A rewritten job name is disclosed.** `sanitize_job_name` is deliberate —
+  sbatch splits `--job-name` on whitespace, and the name becomes both the log
+  filename and the auto-saved script's filename, so a conservative character set
+  is correct. What was missing was saying it happened. The case that matters is
+  not a developer's: *any* all-non-Latin name (`训练任务`) falls back to `slurm`,
+  so the user's logs appear as `logs/slurm-<jobid>.out` with nothing anywhere
+  explaining why — silently sending someone to look in the wrong place, which is
+  SM-24's failure one field over. A material rewrite now says what the name became
+  and where the output will land. A whitespace collapse stays quiet: it is visible
+  in the result and nothing is lost. The summary row still shows what the
+  directive says, rather than reverting to the name that was typed.
+
+- **SM-25: every flag slurmate prints can now be typed back at it.** The
+  documented handoff — slurmpast says what to request, slurmate builds the script
+  — broke on exactly the two flags carrying the sizing: slurmate *emitted*
+  `--cpus-per-task` and `--mem` and accepted neither. `--mem` was the worse of the
+  two, because argparse called it ambiguous and named two flags
+  (`--memory`, `--mem-per-cpu`) the user had never typed, suggesting neither, so
+  it read as a bug in the tool rather than a wrong flag name. Auditing the whole
+  surface rather than just those two found six of eighteen emitted flags failing
+  to round-trip. Now: `--mem`, `--cpus-per-task`/`-c` and `--output` are aliases,
+  and `--gres`, `--gpus-per-node` and `--gpus-per-task` resolve into
+  `--gpus`/`--gpu-type`/`--gpu-format` — three renderings of one request, so they
+  are not settings of their own. A non-GPU `--gres` (`lscratch:100`) is refused
+  rather than reinterpreted, since silently treating it as a GPU request would
+  drop a resource the user asked for, and a disagreeing `--gres`/`--gpus` pair is
+  an error rather than a precedence rule. `--error` is the one flag that cannot
+  round-trip, because it is *derived* from the output path; it is now accepted
+  purely to say so and to name the escape hatch —
+  `--custom-sbatch=--error=<path>`, verified to replace the derived directive
+  rather than duplicate it.
+
+- **A `--memory` discarded by `--mem-per-cpu` is now disclosed.** Slurm rejects
+  the two together, so the builder correctly emits only `--mem-per-cpu` — but the
+  discarded value then vanished from the summary entirely, which reads as "I never
+  set that" rather than "that had no effect". The case that matters is the one the
+  user cannot see: a `memory` key inherited from a config file, silently dropped
+  by a `--mem-per-cpu` typed on the command line. The summary now says so, in the
+  same register the Output directory row already used for a flag given with no
+  effect. Only one memory directive is still emitted.
+
+- **`--env` is validated the way `--modules` already was.** SM-13 fixed the late
+  failure for `module load` — the job queues, starts, and then dies — and `--env`
+  fails identically on `conda activate`, yet only one of the two was checked. The
+  env list was even being fetched already, for the wizard's picker. A name that
+  this machine's conda does not have now warns, naming the alternatives.
+  Deliberately narrower than the module check in three ways: named conda/mamba
+  envs only (a `venv` is a *path*, and one unreadable from the login node can be
+  valid on the compute node), a warning rather than an error (a site whose compute
+  nodes see an envs dir the login node does not would make an error a false
+  refusal), and silent when conda cannot be asked at all. Only *named* envs are
+  offered as suggestions — `--prefix` paths are 100+ characters and sort ahead of
+  every name, so listing them buried the answer.
+
+- **"Not actually submitted" is no longer inferred from silence.** `rc=0` with an
+  empty stdout was read as mock mode, but that is two causes with one symptom:
+  mock mode short-circuits before running anything, whereas a real `sbatch` that
+  exits 0 and prints nothing has very likely *submitted the job*. Telling that
+  user nothing happened is the costliest direction to be wrong in — it invites a
+  duplicate submission. Which case it is can be asked rather than guessed, so it
+  is; the ambiguous one now reports the submit and says the id is unknown, naming
+  `squeue` before resubmitting.
+
+- **Slurm's own "Submitted batch job N" is recognised again.** `--parsable` gives
+  a bare id, but a site wrapper that drops the flag prints Slurm's default
+  wording, and a federated submit appends `on cluster <name>` even with it.
+  Neither matched, so the id was lost along with the `squeue`/`scancel` hints and
+  the saved script's filename. Both exact shapes are accepted now; arbitrary text
+  containing digits still is not, because guessing an id out of a banner
+  substitutes one wrong answer for another.
+
+- **The wizard's "Save script to a file" checks its log directories too.** The
+  SM-24 fix above went into `--print`, which is not the only mode that hands over
+  a script slurmate will never submit: the wizard's save action does exactly the
+  same thing and said nothing, so the failure stayed reachable through the
+  interface most users actually see. A check wired to one of two equivalent paths
+  is the shape of half the findings in the portability report, and this was that
+  shape in the very fix for one of them.
+
+- **The `--dry-run` script box is copy-safe again.** rich wraps mid-token, so a
+  long directive rendered as a bare `#SBATCH` — a no-op — on one line and
+  `--output=…`, split mid-path, on the next, where it reads as a *shell command*.
+  `bash -n` accepts that, so a user who copied the box out of the terminal got
+  "command not found" at run time and none of the `--output` they had asked for.
+  Lines wider than the terminal are now clipped with a visible marker (ASCII
+  `...` under a non-UTF-8 locale), the box is disclosed as an excerpt, and the
+  note names `--print` as the exact form. Verified at 40, 80 and 100 columns, and
+  `--print` itself is never clipped.
+
+- **A site plugin's refusal reason no longer costs the verdict.** midway3's
+  `job_submit` plugin rejects an account-less job with a six-line block ending in
+  `Reason: Account is not specified` / `allocation failure: Access/permission
+  denied`. The plugin's reason is the more useful half to read, so it won the
+  display — and took the classifiable half with it, because every marker list here
+  is written against Slurm's own wordings rather than a site's. The result was
+  that the *same user error* was fatal on Mercury ("Invalid account or
+  account/partition combination specified", recognised) and merely puzzling on
+  midway3 ("slurmate cannot tell whether this clears on its own"), which is the
+  opposite of cluster-agnostic. Both halves are kept now — specific first, generic
+  in parentheses — so the message reads *"Account is not specified
+  (Access/permission denied)"* and classifies as permanent. Identical halves are
+  not printed twice. A test asserts the two clusters reach the same verdict for
+  the same mistake.
+
+### Security
+
+- **SM-26: the saved script copy is created mode 0600.** It was written with
+  `open(path, "w")`, so the mode was whatever the umask gave — 0002 on both
+  clusters measured, i.e. `-rw-rw-r--`. That is a real disclosure rather than a
+  theoretical one: `/project/rcc` and the user's directory under it are both
+  `o+x`, so a world-readable file at a known path is readable cluster-wide, and
+  the file is the *exact submitted script*, so by construction it contains
+  whatever went into `--command`. Relying on site policy for that is precisely
+  what a cluster-agnostic tool must not do. Fixed at **both** write sites — the
+  post-submit copy the report named, and the wizard's "Save script to a file",
+  which writes the same content to a user-chosen path. The mode applies at
+  creation only, so overwriting a file the user deliberately made shareable leaves
+  their permissions alone. Both "saved" lines now say the file holds the command.
+
 ## [0.6.0] — 2026-08-24
 
 Portability pass. Every item here came from installing 0.5.3 on a second,

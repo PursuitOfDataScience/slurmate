@@ -6,7 +6,11 @@ import re
 import shlex
 from typing import Any
 
-from .system_utils import _parse_slurm_time_to_minutes, normalize_memory
+from .system_utils import (
+    _parse_slurm_time_to_minutes,
+    normalize_memory,
+    time_request_is_unbounded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,34 @@ def sanitize_job_name(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._+-]", "", name)
     cleaned = cleaned.lstrip("-+.")
     return cleaned or "slurm"
+
+
+def job_name_change_note(raw: str) -> str:
+    """Say when sanitising turned the job name into something else, or "".
+
+    Collapsing whitespace to underscores stays quiet: it is visible in the
+    result and nothing is lost. Dropping characters is not, and the fallback is
+    the case that really needs saying — *any* all-non-Latin name (``训练任务``)
+    becomes ``slurm``, so a user's logs appear as ``logs/slurm-<jobid>.out`` and
+    nothing anywhere explained why. The name is not only a directive; it is the
+    log filename and the auto-saved script's filename, so a silent rewrite sends
+    the user looking in the wrong place.
+
+    Same disclosure the summary already makes for a ``--memory`` that
+    ``--mem-per-cpu`` discarded, and for an ``--output-dir`` the job never writes
+    to: the value was given, it did not survive, say so.
+    """
+    original = str(raw or "").strip()
+    if not original:
+        return ""
+    safe = sanitize_job_name(original)
+    if not safe or safe == re.sub(r"\s+", "_", original):
+        return ""
+    return (
+        f"job name '{original}' was changed to '{safe}' — sbatch takes a single "
+        f"token, and the name is also the log filename, so the output will be "
+        f"'{safe}-<jobid>.out'"
+    )
 
 
 def _abort_guard(label: str) -> str:
@@ -258,13 +290,18 @@ _MANAGED_CUSTOM_FLAGS = {
     "--account": "--account", "-A": "--account",
     "--qos": "--qos", "-q": "--qos",
     "--time": "--time", "-t": "--time",
-    "--cpus-per-task": "--cpus", "-c": "--cpus",
+    # Each maps to a spelling the CLI actually accepts. SM-25 made Slurm's own
+    # spellings first-class (--cpus-per-task, --gres, --gpus-per-node/task), so
+    # these used to send the user to a *different* flag than the one they typed —
+    # and for --gres that lost information, since --gres gpu:a100:2 carries a type
+    # that a bare --gpus does not.
+    "--cpus-per-task": "--cpus-per-task", "-c": "--cpus-per-task",
     "--nodes": "--nodes", "-N": "--nodes",
     "--ntasks-per-node": "--ntasks-per-node",
     "--job-name": "--job-name", "-J": "--job-name",
     "--array": "--array", "-a": "--array",
-    "--gres": "--gpus", "--gpus": "--gpus", "-G": "--gpus",
-    "--gpus-per-node": "--gpus", "--gpus-per-task": "--gpus",
+    "--gres": "--gres", "--gpus": "--gpus", "-G": "--gpus",
+    "--gpus-per-node": "--gpus-per-node", "--gpus-per-task": "--gpus-per-task",
 }
 
 
@@ -344,6 +381,31 @@ def managed_custom_flags(custom_sbatch: Any) -> list[tuple[str, str]]:
         if owner:
             out.append((name, owner))
     return out
+
+
+def custom_ntasks(custom_sbatch: Any) -> int | None:
+    """A total task count supplied via ``--custom-sbatch --ntasks``, or ``None``.
+
+    slurmate has no ``--ntasks`` option, so ``--custom-sbatch=--ntasks=N`` is the
+    *only* way to express an MPI job with it — which makes this a likely path
+    rather than an exotic one. The cost estimate multiplies by tasks, so a custom
+    ``--ntasks=100`` left it reporting a hundredth of the real footprint: 2.0
+    core-hours for a job asking for 200 cores.
+
+    Last occurrence wins, mirroring Slurm's "later option overrides earlier" and
+    :func:`_custom_mem_override`.
+    """
+    total: int | None = None
+    for flag in _normalize_custom_flags(custom_sbatch):
+        name, value = _split_flag(flag)
+        if name in ("--ntasks", "-n") and value:
+            try:
+                parsed = int(str(value).strip())
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                total = parsed
+    return total
 
 
 def _custom_mem_override(flags: list[str]) -> tuple[str | None, str | None]:
@@ -468,6 +530,19 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     elif answers.get("mem_per_cpu"):
         # Mirror the builder: --mem-per-cpu takes precedence over --mem when set.
         add("Mem per CPU", answers.get("mem_per_cpu"))
+        # And say so when a --memory was also supplied. Slurm rejects the two
+        # together, so the builder emits only one — but the discarded value was
+        # then absent from the summary entirely, which reads as "I never set
+        # that". It matters most for the case that cannot be seen: a `memory`
+        # key inherited from a config file, silently dropped by a --mem-per-cpu
+        # typed on the command line. Same disclosure the Output directory row
+        # makes when a flag is given and has no effect.
+        if answers.get("memory"):
+            add(
+                "Memory",
+                f"{answers.get('memory')} (not used — --mem-per-cpu takes "
+                f"precedence, and Slurm rejects both together)",
+            )
     else:
         # normalize_memory is what the builder emits, so the row must show it:
         # "1.5G" becomes "1536M" and "16" becomes "16M" in the directive.
@@ -993,41 +1068,41 @@ def build_sbatch_script(
 # them as a *zero-length* job and substituting a two-hour default produced a
 # confident core-hour figure for something unbounded — the same shape as quoting
 # an ETA for a job the scheduler has refused.
-_UNLIMITED_WORDS = frozenset({"unlimited", "infinite", "inf"})
-
 UNBOUNDED_ESTIMATE = "unbounded — no time limit"
 
 
 def _time_is_unbounded(time_limit: str) -> bool:
     """Whether a *requested* time limit means "no limit".
 
-    Tested against the controller rather than enumerated: ``--time=0``,
-    ``00:00:00`` and ``0-00:00:00`` are all accepted, and Slurm documents a zero
-    limit as "no time limit be imposed". So any spelling that *parses* to zero
-    counts, which covers the forms a config file or a habit from another site
-    might carry — enumerating strings would have missed ``0-00:00:00``.
-
-    An **absent** limit is deliberately not unbounded: the job takes the
-    partition or site default, and estimating against the 2 h the summary already
-    shows for it is consistent rather than invented.
+    Delegates to :func:`time_request_is_unbounded`. It used to be a second
+    implementation of the same rule, which is how the partition-limit check came
+    to read "no limit" as a *zero-length* job while the estimate here read it
+    correctly: two copies of one decision, disagreeing. One copy now.
     """
-    value = str(time_limit or "").strip().lower()
-    if not value:
-        return False
-    if value in _UNLIMITED_WORDS:
-        return True
-    # Only a *time-shaped* string that parses to zero counts. Without this,
-    # "not-a-time" would parse to 0 and be labelled unbounded — conflating
-    # unparseable with unlimited, which is precisely the SM-10 mistake. (The CLI
-    # rejects such values earlier; the builder is a public API and can be handed
-    # anything.)
-    if not re.fullmatch(r"[\d:\-]+", value):
-        return False
-    return _parse_slurm_time_to_minutes(value) == 0
+    return time_request_is_unbounded(time_limit)
+
+
+def _with_array_total(per_task: float, array_tasks: int | None) -> str:
+    """Render a cost as the array total, with the per-task figure kept visible.
+
+    The cost of an array job is per-task cost × task count, and showing only the
+    per-task figure understates a 1000-task array a thousandfold — in the
+    direction that matters, because it tells the user an enormous job is cheap.
+    The ``%N`` throttle is not a divisor: it caps concurrency, so it changes the
+    wall-clock and not the bill.
+    """
+    if not array_tasks or array_tasks <= 1:
+        return _fmt_estimate(per_task)
+    return (
+        f"{_fmt_estimate(per_task * array_tasks)} "
+        f"({array_tasks} tasks × {_fmt_estimate(per_task)})"
+    )
 
 
 def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
-                ntasks_per_node: int | None = None) -> str:
+                ntasks_per_node: int | None = None,
+                array_tasks: int | None = None,
+                ntasks_total: int | None = None) -> str:
     """Estimate a job's compute cost in CPU core-hours.
 
     Core-hours = CPUs-per-task × tasks-per-node × nodes × hours. When
@@ -1058,8 +1133,13 @@ def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
         minutes = 120.0
     hours = minutes / 60.0
     tasks = ntasks_per_node if (ntasks_per_node and ntasks_per_node > 0) else 1
-    su = cpus * tasks * hours * nodes
-    return _fmt_estimate(su)
+    # An explicit total (Slurm's --ntasks) is job-wide, so it replaces
+    # tasks-per-node × nodes rather than multiplying it. `max` because the two can
+    # disagree — --ntasks-per-node is a per-node cap, not a total — and the larger
+    # is the number of tasks Slurm will actually run.
+    task_units = max(ntasks_total or 0, tasks * max(nodes, 0))
+    su = cpus * task_units * hours
+    return _with_array_total(su, array_tasks)
 
 
 def _fmt_estimate(value: float) -> str:
@@ -1072,7 +1152,9 @@ def _fmt_estimate(value: float) -> str:
 
 def estimate_gpu_hours(gpus: int, time_limit: str, nodes: int = 1,
                        gpu_format: str | None = None,
-                       ntasks_per_node: int | None = None) -> str:
+                       ntasks_per_node: int | None = None,
+                       array_tasks: int | None = None,
+                       ntasks_total: int | None = None) -> str:
     """Estimate a job's GPU cost in GPU-hours, or "" for a CPU-only job.
 
     GPU allocation is per-node for ``--gres``/``--gpus-per-node`` (and the
@@ -1099,7 +1181,8 @@ def estimate_gpu_hours(gpus: int, time_limit: str, nodes: int = 1,
         total = gpus                                    # job-wide total
     elif fmt == "gpus_per_task":
         tasks = ntasks_per_node if (ntasks_per_node and ntasks_per_node > 0) else 1
-        total = gpus * tasks * nodes
+        # Per *task*, so an explicit --ntasks total governs here as well.
+        total = gpus * max(ntasks_total or 0, tasks * nodes)
     else:                                               # gres_type / constraint / gpus_per_node
         total = gpus * nodes
-    return _fmt_estimate(total * hours)
+    return _with_array_total(total * hours, array_tasks)

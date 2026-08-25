@@ -97,6 +97,16 @@ slurmate \
   --command "python train.py"
 ```
 
+Slurm's own spellings work too, so a command line or script copied from
+`sbatch` needs no translation — the short flags (`-J -A -p -q -t -N -c -a -C -G
+-o`), `--mem`, `--cpus-per-task`, `--output`, and all four GPU renderings
+(`--gpus h100:1`, `--gres gpu:h100:1`, `--gpus-per-node`, `--gpus-per-task`):
+
+```bash
+slurmate -J train_job -p gpu -c 8 --mem 32G -t 04:00:00 -G h100:1 \
+  --command "python train.py"
+```
+
 Submit immediately, no prompts:
 
 ```bash

@@ -19,15 +19,22 @@ from rich.text import Text
 from .builder import (
     build_from_answers,
     command_injects_directives,
+    custom_ntasks,
     env_activation_emitted,
     estimate_gpu_hours,
     estimate_su,
+    job_name_change_note,
     job_summary_rows,
     managed_custom_flags,
     sanitize_job_name,
 )
 from .system_utils import (
+    GPU_COUNT_FLAG,
+    GPU_SPELLING_FORMATS,
+    array_spec_reason,
+    array_task_count,
     capacity_refusal,
+    check_conda_env,
     check_log_dirs,
     check_modules,
     check_script_with_scheduler,
@@ -41,13 +48,16 @@ from .system_utils import (
     fetch_known_qos,
     fetch_max_array_size,
     fetch_node_features,
+    fetch_partition_node_maxima,
     fetch_partitions,
     fetch_queue_eta,
     fetch_select_type,
     fetch_user_accounts,
     is_mock,
+    is_tool_available,
     load_config,
     normalize_memory,
+    parse_gpu_spelling,
     parse_submitted_job_id,
     refusal_is_permanent,
     refusal_is_transient,
@@ -59,6 +69,7 @@ from .system_utils import (
     validate_job_config,
     validate_memory,
     validate_time,
+    write_private_text,
 )
 from .theme import c, g, make_output_safe, print_banner, set_ascii
 from .tui import Wizard, _parse_custom_flags
@@ -73,7 +84,10 @@ _GO_BACK = "\x00__go_back__"
 def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any]:
     for p in partitions:
         if p["name"] == name:
-            return p
+            # Enriched here rather than at the call sites: there are six of them
+            # across the CLI and the wizard, and wiring a lookup into some of them
+            # is how half the findings in the portability report happened.
+            return _enrich_partition_maxima(p)
     # Not in the sinfo list: a manually-typed name, or another cluster's. Every
     # capacity field is unknown (0/None), which is what keeps the limit checks
     # silent rather than warning against a limit of zero. nodes_up is None
@@ -92,6 +106,28 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
             "mem_per_node_mb": 0, "gpu_types": [], "timelimit": None,
             "is_public": True, "is_default": False, "_unknown": True,
             "_unknown_reason": "absent" if partitions else "unreadable"}
+
+
+def _enrich_partition_maxima(part: dict[str, Any]) -> dict[str, Any]:
+    """Attach the per-node maxima for a heterogeneous partition (SM-27).
+
+    Only for the partition actually in use, and only when ``sinfo``'s aggregate
+    row carried a ``+`` — so a homogeneous site makes no extra call at all, and a
+    mixed one makes exactly one. Left absent when the query fails, which keeps the
+    floor-based warning and its honest "nodes differ" wording rather than
+    silencing the check.
+    """
+    if not part or not part.get("heterogeneous") or part.get("_unknown"):
+        return part
+    max_cpus, max_mem = fetch_partition_node_maxima(str(part.get("name") or ""))
+    if max_cpus is None and max_mem is None:
+        return part
+    enriched = dict(part)
+    if max_cpus:
+        enriched["max_cpus_per_node"] = max_cpus
+    if max_mem:
+        enriched["max_mem_per_node_mb"] = max_mem
+    return enriched
 
 
 def _coerce_int(value: Any, default: int, *, field: str | None = None,
@@ -450,12 +486,18 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     # cluster-mismatch errors — with --force, since writing a script for a
     # cons_tres cluster from a cons_res one is legitimate. `gpu_format` is a
     # config-file key, so this arrives without the user typing a flag.
-    _check_gpu_format(
+    resolved_format = _check_gpu_format(
         getattr(args, "gpu_format", None) or config.get("gpu_format"),
         gpus_requested=bool(gpus),
         force=force,
         err_console=err_console,
+        inferred=bool(getattr(args, "gpu_format_inferred", False)),
     )
+    # An inferred format that this cluster cannot parse is replaced rather than
+    # refused, so the substitution has to reach the script that gets built. Any
+    # other outcome returns None and leaves the resolution above untouched.
+    if resolved_format:
+        gpu_format = resolved_format
 
     args_env_type = getattr(args, "env_type", None)
     env_type = _coerce_str(
@@ -505,9 +547,19 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     conflicts = managed_custom_flags(getattr(args, "custom_sbatch", None))
     if conflicts:
         for name, owner in conflicts:
+            # When the owner *is* the flag they typed — now the common case, since
+            # SM-25 made Slurm's own spellings first-class — "use --gres instead"
+            # reads like a tautology. Say the actual distinction: pass it as an
+            # option rather than inside --custom-sbatch.
+            advice = (
+                f"Pass {name} as a slurmate option instead of inside "
+                f"--custom-sbatch."
+                if owner == name
+                else f"Use {owner} instead."
+            )
             err_console.print(
                 f"  {c.RED}\u2717 Error: --custom-sbatch carries {name}, which "
-                f"slurmate manages. Use {owner} instead.{c.RESET}"
+                f"slurmate manages. {advice}{c.RESET}"
             )
         err_console.print(
             f"  {c.GRAY}(A second #SBATCH line for the same directive would win "
@@ -521,7 +573,7 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     # array specification") after a script that looked fine.
     if array_spec and not validate_array_spec(str(array_spec)):
         err_console.print(
-            f"  {c.RED}\u2717 Error: Invalid array specification: {array_spec}{c.RESET}"
+            f"  {c.RED}\u2717 Error: {array_spec_reason(str(array_spec))}{c.RESET}"
         )
         err_console.print(
             f"  {c.GRAY}Expected forms: 1-10, 0-9, 1,3,5, 1-10:2, 1-10%4 "
@@ -532,6 +584,10 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
                           "", field="command", err_console=err_console)
     return {
         "job_name": sanitize_job_name(str(raw_job_name)),
+        # Kept so the checks can say the name was rewritten. The wizard
+        # needs no equivalent: its validator sanitises as the user types,
+        # so the change happens in front of them.
+        "_job_name_given": str(raw_job_name),
         "account": account,
         "partition": partition,
         # The partition the derived figures (limits, queue depth, ETA, default
@@ -589,10 +645,21 @@ def _partition_issues(
         max_array = fetch_max_array_size()
     extra_gpu_types: list[str] = []
     feature_only: list[str] = []
+    constraint_types: list[str] | None = None
     gpu_type = answers.get("gpu_type")
     if gpu_type and str(gpu_type).lower() != "any":
         static = {str(g).lower() for g in part.get("gpu_types", [])}
-        if str(gpu_type).lower() not in static:
+        # A statically-listed model is a typed GRES by construction, so the
+        # lookup buys nothing for the *default* format — but it is the only way
+        # to answer the mirror question, "is this model also a node feature?",
+        # which is what gpu_format 'constraint' turns on. So it runs for an
+        # unrecognized type (as before) or for a constraint request, and stays
+        # skipped on the common path.
+        wants_constraint = str(
+            answers.get("gpu_format")
+            or os.environ.get("SLURMATE_GPU_FORMAT", "gres_type")
+        ).lower() == "constraint"
+        if str(gpu_type).lower() not in static or wants_constraint:
             part_name = part.get("name", "")
             if part_name:
                 try:
@@ -601,31 +668,55 @@ def _partition_issues(
                         set(sources["typed"]) | set(sources["feature"])
                     )
                     feature_only = list(sources["feature"])
+                    # Only when the query actually answered: an empty list has to
+                    # mean "no GPU model is a node feature here", so a failed or
+                    # skipped lookup must stay None instead of borrowing that.
+                    if extra_gpu_types:
+                        constraint_types = list(sources.get("constraint") or [])
                 except Exception:
                     extra_gpu_types = []
                     feature_only = []
+                    constraint_types = None
     return validate_job_config(
         answers, extra_gpu_types=extra_gpu_types, feature_only_gpu_types=feature_only,
-        max_array_size=max_array,
+        constraint_gpu_types=constraint_types, max_array_size=max_array,
     )
 
 
 def _check_gpu_format(
-    gpu_format: Any, *, gpus_requested: bool, force: bool, err_console: Console
-) -> None:
-    """Reject a ``gpu_format`` whose syntax this cluster's Slurm cannot parse."""
+    gpu_format: Any, *, gpus_requested: bool, force: bool, err_console: Console,
+    inferred: bool = False,
+) -> str | None:
+    """Reject a ``gpu_format`` whose syntax this cluster's Slurm cannot parse.
+
+    Returns a replacement format, or ``None`` for "leave it alone" — which is
+    every case but one. The exception: a format that was *inferred* (from a typed
+    ``--gpus a100:2``) and that this cluster cannot parse becomes
+    ``"gres_type"``. An inferred format is slurmate's reading of a spelling, not
+    a request the user made, so a site running something other than
+    ``select/cons_tres`` should get a different rendering rather than a failed job
+    the default rendering expresses perfectly well. An explicitly chosen format
+    is still an error, because there the user asked for that syntax by name.
+    """
     if not gpu_format or not gpus_requested:
-        return
+        return None
     try:
         reason = unsupported_gpu_format(str(gpu_format), fetch_select_type())
     except Exception as e:                    # a broken probe must not block a job
         logger.debug(f"select type check failed: {e}")
-        return
+        return None
     if not reason:
-        return
+        return None
+    if inferred:
+        err_console.print(
+            f"  [dim]--gpus '<type>:count' reads as gpu_format "
+            f"'{escape(str(gpu_format))}', which this cluster cannot parse; "
+            f"using 'gres_type' instead (pass --gpu-format to choose).[/]"
+        )
+        return "gres_type"
     if force:
         err_console.print(f"  [yellow]{g.WARN} Warning: {escape(reason)}[/]")
-        return
+        return None
     err_console.print(f"  [red]{g.ERR} Error: {escape(reason)}[/]")
     err_console.print(
         "  [dim]Pass --force to generate the script anyway "
@@ -664,7 +755,10 @@ def _check_modules_exist(
         sys.exit(1)
 
 
-def _warn_runtime_targets(script: str, answers: dict[str, Any], console: Console) -> None:
+def _warn_runtime_targets(
+    script: str, answers: dict[str, Any], console: Console, *,
+    will_create: bool = True,
+) -> None:
     """Warn about log paths that only resolve when the job actually runs.
 
     A partition or account that does not exist is caught before the script is
@@ -674,7 +768,7 @@ def _warn_runtime_targets(script: str, answers: dict[str, Any], console: Console
     """
     issues: list[tuple[str, str]] = []
     try:
-        issues += check_log_dirs(script)
+        issues += check_log_dirs(script, will_create=will_create)
     except Exception as e:                       # never fail a summary over a check
         logger.debug(f"log dir check failed: {e}")
     for _level, msg in issues:
@@ -719,6 +813,9 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
                 known_qos=fetch_known_qos() if qos else None,
                 known_features=fetch_node_features() if constraint else None,
             )
+        note = job_name_change_note(str(answers.get("_job_name_given") or ""))
+        if note:
+            out.append(("warning", note))
         mods = answers.get("modules") or []
         if mods:
             # Raised to "error" to match the batch path, which SM-13 asked to be
@@ -728,6 +825,17 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
             # An error still lets the wizard offer "go back to edit"; only the
             # batch path exits.
             out += [("error", msg) for _lvl, msg in check_modules([str(m) for m in mods])]
+        # The same late failure, one field over: --modules was validated and
+        # --env was not, though the env list was already being fetched for the
+        # wizard's picker. Kept a warning rather than raised to an error like the
+        # module check: conda's env list is a property of *this* machine, and a
+        # site where the compute nodes see an envs dir the login node does not
+        # would turn an error into a false refusal.
+        out += check_conda_env(
+            str(answers.get("env_name") or ""),
+            str(answers.get("env_type") or ""),
+            [str(m) for m in mods],
+        )
         if answers.get("gpus"):
             reason = unsupported_gpu_format(
                 str(answers.get("gpu_format") or ""), fetch_select_type()
@@ -752,7 +860,7 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
                 ))
         spec = str(answers.get("array_spec") or "")
         if spec and not validate_array_spec(spec):
-            out.append(("error", f"Invalid array specification: {spec}"))
+            out.append(("error", array_spec_reason(str(spec))))
         # An env name that will never be activated: the user asked for an
         # environment and for a strategy that emits nothing, and the script
         # silently does neither.
@@ -817,6 +925,12 @@ def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict
         answers.get("time_limit", "02:00:00"),
         answers.get("nodes", 1),
         answers.get("ntasks_per_node"),
+        # An array's cost is per-task × task count. Without this a 1000-task
+        # array reported the same figure as a single job.
+        array_task_count(str(answers.get("array_spec") or "")),
+        # slurmate has no --ntasks, so --custom-sbatch is the only way to express
+        # an MPI job — and the estimate ignored it entirely.
+        custom_ntasks(answers.get("custom_sbatch")),
     )
 
     # Pass the whole request, not just the node count: an ETA computed from node
@@ -1002,9 +1116,18 @@ def _note_defaulted_memory(answers: dict[str, Any], console: Console) -> None:
         return
     mem = answers.get("memory")
     if source == "partition":
+        # Name the partition the figure was actually derived from. With no
+        # --partition the number comes from the site default (which slurmate
+        # resolves, and says so two lines further down), but this line read the
+        # *user's* answer and printed "from '?' node memory" — a provenance note
+        # whose entire job is to say where a number came from, admitting it does
+        # not know, on the default path of every cluster tested.
+        part = answers.get("_partition_obj") or {}
+        origin = str(answers.get("partition") or part.get("name") or "")
+        whose = f"'{escape(origin)}'" if origin else "this cluster's"
         console.print(
             f"  [dim]Memory not specified; sized to {escape(str(mem))} from "
-            f"'{escape(str(answers.get('partition') or '?'))}' node memory "
+            f"{whose} node memory "
             f"(pass --memory to set it, or --memory none to omit --mem).[/]"
         )
     else:
@@ -1015,11 +1138,48 @@ def _note_defaulted_memory(answers: dict[str, Any], console: Console) -> None:
         )
 
 
+def _clip_cells(text: str, limit: int) -> tuple[str, bool]:
+    """Truncate to ``limit`` display cells; returns ``(text, was_clipped)``.
+
+    Cell-aware rather than character-aware for the same reason the panel measures
+    with ``cell_len``: one CJK glyph occupies two columns, and counting code
+    points would push the line past the border it was trimmed to fit.
+    """
+    if limit <= 0 or cell_len(text) <= limit:
+        return text, False
+    marker = g.ELLIPSIS
+    room = max(0, limit - cell_len(marker))
+    kept: list[str] = []
+    used = 0
+    for ch in text:
+        width = cell_len(ch)
+        if used + width > room:
+            break
+        kept.append(ch)
+        used += width
+    return "".join(kept) + marker, True
+
+
 def _show_script_and_summary(console: Console, script: str, answers: dict[str, Any],
                               su_estimate: str, queue_info: dict[str, Any] | None = None) -> None:
     print()
     script_lines = script.split("\n")
     num_w = len(str(len(script_lines)))
+    # Never let this box wrap. rich wraps mid-token, which renders
+    # "#SBATCH --output=<long path>" as a bare "#SBATCH" (a no-op directive) on
+    # one line and "--output=…" — split mid-path — on the next, where it reads as
+    # a *shell command*. `bash -n` accepts that, so a user who copies the box out
+    # gets "command not found" at run time and none of the --output they asked
+    # for. Clipping makes the box visibly an excerpt instead of a broken script;
+    # --print remains the copy-safe form and the note below says so.
+    text_w = max(8, console.width - 4 - (num_w + 1))
+    clipped = False
+    shown_lines: list[str] = []
+    for raw_line in script_lines:
+        shown, was_clipped = _clip_cells(raw_line, text_w)
+        clipped = clipped or was_clipped
+        shown_lines.append(shown)
+    script_lines = shown_lines
     body = Text()
     for i, ln in enumerate(script_lines, 1):
         body.append(f"{i:>{num_w}} ", style="bright_black")
@@ -1066,6 +1226,8 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         answers.get("nodes", 1) or 1,
         answers.get("gpu_format"),
         answers.get("ntasks_per_node"),
+        array_task_count(str(answers.get("array_spec") or "")),
+        custom_ntasks(answers.get("custom_sbatch")),
     )
     if gpu_hours:
         rows.append(("Estimated GPU-hours:", gpu_hours, "#ffaa00"))
@@ -1146,6 +1308,13 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         print()
         console.print(summary_panel)
 
+    if clipped:
+        console.print(
+            f"  [dim]Lines wider than this terminal are clipped with "
+            f"'{g.ELLIPSIS}': the box above is an excerpt, not something to copy. "
+            f"Use --print for the exact script.[/]"
+        )
+
 
 def _editor_command() -> list[str]:
     """Resolve $EDITOR/$VISUAL into an argv list.
@@ -1204,9 +1373,17 @@ def _save_script(script: str, default_name: str) -> None:
         # UTF-8 bytes arrives as lone surrogates, which a strict UTF-8 write
         # refuses. Round-tripping them writes the user's original bytes, so the
         # saved script is what the shell would have seen.
-        with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
-            f.write(script)
-        print(f"  {c.GREEN}{g.OK} Saved to {path}{c.RESET}")
+        write_private_text(path, script)
+        print(f"  {c.GREEN}{g.OK} Saved to {path}{c.RESET} "
+              f"{c.GRAY}(mode 600 — it contains your command verbatim){c.RESET}")
+        # The same handover as --print, and so the same SM-24 exposure: this
+        # script is the user's to submit, so nothing will create the directories
+        # its --output/--error point at, and Slurm accepts the path, discards
+        # what the job writes and reports COMPLETED anyway. Wiring that check
+        # into --print alone left this second artifact-handover path uncovered —
+        # which is the shape of half the findings in the portability report.
+        for _level, msg in check_log_dirs(script, will_create=False):
+            print(f"  {c.YELLOW}{g.WARN} Warning: {msg}{c.RESET}")
     except (OSError, UnicodeError) as e:
         print(f"  {c.RED}{g.ERR} Could not save: {e}{c.RESET}")
 
@@ -1224,8 +1401,7 @@ def _save_submitted_script(script: str, job_name: str, job_id: str,
     path = os.path.join(directory, f"{safe}-{job_id}.sh")
     try:
         os.makedirs(directory, exist_ok=True)
-        with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
-            f.write(script)
+        write_private_text(path, script)
         return path
     except (OSError, UnicodeError) as e:
         # This runs *after* a successful submission, so an uncaught exception
@@ -1255,11 +1431,20 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
             print(f"  {c.RED}{stderr}{c.RESET}", file=sys.stderr)
         sys.exit(1)
 
-    # An empty job ID with rc 0 means mock mode (sbatch unavailable) — say so
-    # plainly instead of printing a blank ID and broken `squeue -j`/`scancel` hints.
+    # An empty stdout with rc 0 has two very different causes and this inferred
+    # the wrong one. Mock mode (or no sbatch at all) short-circuits before
+    # running anything — but a real sbatch that exits 0 and prints nothing has
+    # very likely *submitted the job*, and telling that user "not actually
+    # submitted" invites them to submit a duplicate. Ask which case it is rather
+    # than reading it off the emptiness.
     raw_out = stdout.strip()
     if not raw_out:
-        print(f"  {c.YELLOW}(mock mode — not actually submitted){c.RESET}")
+        if is_mock() or not is_tool_available("sbatch"):
+            print(f"  {c.YELLOW}(mock mode — not actually submitted){c.RESET}")
+        else:
+            print(f"  {c.GREEN}{g.OK} Submitted!{c.RESET} "
+                  f"{c.YELLOW}(sbatch exited 0 but printed no job ID — "
+                  f"check `squeue -u $USER` before resubmitting){c.RESET}")
         if stderr:
             print(f"  {c.GRAY}{stderr}{c.RESET}")
         return
@@ -1288,7 +1473,10 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
         log_dir = os.environ.get("SLURMATE_LOG_DIR")
         saved = _save_submitted_script(script, job_name, job_id, directory=log_dir)
         if saved:
-            print(f"  {c.GRAY}Script saved: {saved}{c.RESET}")
+            # Say that a copy of the command now exists on disk: the file is the
+            # exact submitted script, so a token pasted into --command is in it.
+            print(f"  {c.GRAY}Script saved: {saved} "
+                  f"(mode 600 — contains your command){c.RESET}")
 
     # Read the actual --output path from the generated script (source of truth).
     # effective_log_path takes the LAST output directive (what Slurm honours) and
@@ -1359,33 +1547,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     from . import __version__
     _check_custom_sbatch_form(list(argv) if argv is not None else sys.argv[1:])
     parser = argparse.ArgumentParser(description="Slurmate \u2014 sbatch wizard")
-    parser.add_argument("--job-name", default=None, help="Job name")
-    parser.add_argument("--account", default=None, help="Slurm account")
-    parser.add_argument("--partition", default=None, help="Target partition")
-    parser.add_argument("--qos", default=None, help="QoS")
-    parser.add_argument("--cpus", type=int, default=None, help="CPU cores")
-    parser.add_argument("--memory", default=None,
-                        help="Memory per node (e.g. 16G, 64000M; empty or 'none' omits --mem for whole-node sites)")
+    parser.add_argument("--job-name", "-J", default=None, help="Job name")
+    parser.add_argument("--account", "-A", default=None, help="Slurm account")
+    parser.add_argument("--partition", "-p", default=None, help="Target partition")
+    parser.add_argument("--qos", "-q", default=None, help="QoS")
+    # Slurm's own spellings are accepted alongside slurmate's. SM-25: the
+    # documented handoff is "slurmpast tells you what to request -> slurmate
+    # builds the script", and it broke on exactly the two flags carrying the
+    # sizing, because slurmate *emitted* --cpus-per-task/--mem and accepted
+    # neither. Declaring --mem explicitly also removes the ambiguity with
+    # --mem-per-cpu, which argparse reported by naming two flags the user had
+    # not typed and suggesting neither.
+    parser.add_argument("--cpus", "--cpus-per-task", "-c", type=int, default=None,
+                        help="CPU cores (Slurm: --cpus-per-task)")
+    parser.add_argument("--memory", "--mem", default=None,
+                        help="Memory per node, Slurm's --mem (e.g. 16G, 64000M; "
+                             "empty or 'none' omits --mem for whole-node sites)")
     parser.add_argument("--mem-per-cpu", default=None,
                         help="Memory per CPU (e.g. 2G); takes precedence over --memory")
-    parser.add_argument("--time", default=None, help="Time limit")
-    parser.add_argument("--nodes", type=int, default=None, help="Node count")
+    parser.add_argument("--time", "-t", default=None, help="Time limit")
+    parser.add_argument("--nodes", "-N", type=int, default=None, help="Node count")
     parser.add_argument("--ntasks-per-node", type=int, default=None, help="Tasks per node")
-    parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs")
+    # Not type=int: Slurm's own -G/--gpus takes "[<type>:]<count>", and slurmate
+    # PRINTS "--gpus=a100:2" under --gpu-format gpus, so int-only was the last
+    # emitted directive argparse still rejected outright ("invalid int value").
+    # Resolved to a count (+ type, + format) by _resolve_gpu_spellings.
+    parser.add_argument("--gpus", "-G", default=None,
+                        help="Number of GPUs, or '<type>:<count>'")
     parser.add_argument("--gpu-type", default=None, help="GPU type (e.g. a100, h100)")
+    # The three GPU spellings a generated script (or a colleague's) carries. Each
+    # is a different *format* of the same request, so they resolve to --gpus /
+    # --gpu-type / --gpu-format rather than to a dest of their own.
+    # Accepted only to explain itself: slurmate derives --error from the output
+    # path rather than tracking it, so it is the one flag a generated script
+    # carries that cannot round-trip. argparse's "unrecognized arguments: --error"
+    # was technically true and useless. Hidden from --help, since the answer is a
+    # redirect rather than an option.
+    parser.add_argument("--error", "-e", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--gres", default=None,
+                        help="Slurm --gres, GPU only (e.g. gpu:2, gpu:a100:2)")
+    parser.add_argument("--gpus-per-node", default=None,
+                        help="Slurm --gpus-per-node (e.g. 2, a100:2)")
+    parser.add_argument("--gpus-per-task", default=None,
+                        help="Slurm --gpus-per-task (e.g. 2, a100:2)")
     parser.add_argument("--gpu-format", default=None,
                         choices=["gres_type", "constraint", "gpus", "gpus_per_node", "gpus_per_task"],
                         help="GPU request format")
-    parser.add_argument("--constraint", default=None,
+    parser.add_argument("--constraint", "-C", default=None,
                         help="Node feature constraint / Slurm -C (e.g. 'gpu', 'cpu', 'a100')")
-    parser.add_argument("--array", default=None, help="Array specification (e.g. 1-10)")
+    parser.add_argument("--array", "-a", default=None, help="Array specification (e.g. 1-10)")
     parser.add_argument("--modules", default=None, help="Comma-separated modules")
     parser.add_argument("--env", default=None, help="Conda environment")
     parser.add_argument("--env-type", default=None, choices=["conda", "mamba", "venv", "none"],
                         help="Environment activation strategy (conda, mamba, venv, none)")
     parser.add_argument("--output-dir", default=None, help="Output directory for logs")
-    parser.add_argument("--output-file", default=None,
-                        help="Output log file name/pattern (%%j = job ID); error derives .err")
+    parser.add_argument("--output-file", "--output", "-o", default=None,
+                        help="Output log file name/pattern, Slurm's --output "
+                             "(%%j = job ID); error derives .err")
     parser.add_argument("--command", default=None, help="Command to run")
     parser.add_argument("--custom-sbatch", default=None,
                         help="Extra #SBATCH flags, space- or comma-separated (e.g. "
@@ -1410,7 +1628,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-save-script", action="store_true",
                         help="Do not auto-save a <job>-<id>.sh copy on submit")
     parser.add_argument("--version", action="version", version=f"slurmate {__version__}")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    _normalize_gpus_flag(args)
+    return args
 
 
 # Job-defining flags whose presence means the user wants non-interactive
@@ -1484,6 +1704,93 @@ def _require_terminal_for_wizard() -> None:
     sys.exit(1)
 
 
+def _redirect_error_flag(args: argparse.Namespace) -> None:
+    """Explain ``--error`` instead of rejecting it as unknown.
+
+    SM-25's rule is that anything slurmate prints should be typeable back at it.
+    ``--error`` is the single exception, because it is *derived* from the output
+    path — so the useful response names the escape hatch, which is verified to
+    work: a custom directive suppresses the auto one rather than duplicating it.
+    """
+    raw = getattr(args, "error", None)
+    if raw is None:
+        return
+    print(
+        f"  {c.RED}{g.ERR} slurmate derives --error from the output path, so there "
+        f"is no --error option. Pass it through as a custom directive instead: "
+        f"--custom-sbatch=--error={raw}{c.RESET}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def _normalize_gpus_flag(args: argparse.Namespace) -> None:
+    """Turn ``--gpus`` into an int, splitting off a ``<type>:`` prefix.
+
+    Called from :func:`parse_args` so that ``args.gpus`` is an int (or None) for
+    every caller — the flag has to accept Slurm's ``<type>:count`` spelling,
+    which argparse's ``type=int`` rejected, but "after parsing, gpus is a number"
+    is an invariant the rest of the module and its tests rely on. Idempotent, so
+    :func:`_resolve_gpu_spellings` can re-run it without caring who came first.
+    """
+    raw = getattr(args, "gpus", None)
+    if raw is None:
+        return
+    if str(raw).strip() == "":
+        args.gpus = None
+        return
+    try:
+        count, gpu_type = parse_gpu_spelling(GPU_COUNT_FLAG, str(raw))
+    except ValueError as e:
+        print(f"  {c.RED}{g.ERR} {e}{c.RESET}", file=sys.stderr)
+        sys.exit(2)
+    args.gpus = count
+    if gpu_type:
+        if not getattr(args, "gpu_type", None):
+            args.gpu_type = gpu_type
+        # Only a *typed* --gpus implies the format: that rendering is the only one
+        # that produces "--gpus=a100:2", so typing it back reproduces the script
+        # it came from. A bare "--gpus 4" says nothing about format and must keep
+        # the default. Flagged as inferred, because a format nobody chose must
+        # yield to a cluster that cannot parse it rather than block the job.
+        if not getattr(args, "gpu_format", None):
+            args.gpu_format = "gpus"
+            args.gpu_format_inferred = True
+
+
+def _resolve_gpu_spellings(args: argparse.Namespace) -> None:
+    """Fold Slurm's --gres/--gpus-per-* into --gpus/--gpu-type/--gpu-format.
+
+    Mutates ``args`` in place, before anything reads it. A disagreement with an
+    explicit ``--gpus`` is an error rather than a precedence rule: these are two
+    spellings of one number, so a conflict is a mistake, and picking a winner
+    silently would submit a request the user did not make.
+
+    ``--gpus`` itself is normalised first, because it also takes Slurm's
+    ``<type>:count`` and everything below compares against it as an int.
+    """
+    _normalize_gpus_flag(args)
+    for flag, fmt in GPU_SPELLING_FORMATS.items():
+        raw = getattr(args, flag.lstrip("-").replace("-", "_"), None)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            count, gpu_type = parse_gpu_spelling(flag, str(raw))
+        except ValueError as e:
+            print(f"  {c.RED}{g.ERR} {e}{c.RESET}", file=sys.stderr)
+            sys.exit(2)
+        if args.gpus is not None and args.gpus != count:
+            print(f"  {c.RED}{g.ERR} {flag} says {count} GPU(s) and --gpus says "
+                  f"{args.gpus}; they are two spellings of one number{c.RESET}",
+                  file=sys.stderr)
+            sys.exit(2)
+        args.gpus = count
+        if gpu_type and not args.gpu_type:
+            args.gpu_type = gpu_type
+        if not args.gpu_format:
+            args.gpu_format = fmt
+
+
 def main() -> None:
     # Before any output: a non-encodable character must not be able to abort the
     # run. A *valid* non-UTF-8 locale (en_US is latin-1; el7 has no C.UTF-8) made
@@ -1492,6 +1799,10 @@ def main() -> None:
     # least robust exactly when something had already gone wrong.
     make_output_safe()
     args = parse_args()
+    # Before --demo and before run_batch: these are aliases, so everything
+    # downstream must see the resolved --gpus/--gpu-type/--gpu-format.
+    _resolve_gpu_spellings(args)
+    _redirect_error_flag(args)
     # Before anything reads it: --demo is the discoverable spelling of an
     # environment variable that was documented nowhere, so the deliberate path
     # and the accidental one now produce the same, marked, output.
@@ -1552,7 +1863,12 @@ def main() -> None:
             )
             err.print(f"  [{colour}]{marker} {escape(head)}[/]")
             fatal = fatal or _level == "error"
-        _warn_runtime_targets(script, answers, err)
+        # will_create=False: --print is the only mode that hands over a script
+        # slurmate will never submit, so it is the only one where a missing log
+        # directory stays missing. --dry-run is not that case — a later real run
+        # creates it — and warning there would fire on every dry run of the
+        # default `logs/`.
+        _warn_runtime_targets(script, answers, err, will_create=False)
         # And Slurm's own verdict on the script. Every other mode gets this free
         # from the ETA (build_and_show), which --print does not call, so the mode
         # meant for pipes and CI was the one that could not learn a job was
@@ -1655,6 +1971,8 @@ def main() -> None:
         _show_script_and_summary(console, script, answers, estimate_su(
             answers.get("cpus", 1), answers.get("time_limit", "02:00:00"),
             answers.get("nodes", 1), answers.get("ntasks_per_node"),
+            array_task_count(str(answers.get("array_spec") or "")),
+            custom_ntasks(answers.get("custom_sbatch")),
         ), queue_info)
 
     # A navigable action menu instead of a one-way confirm chain: every action

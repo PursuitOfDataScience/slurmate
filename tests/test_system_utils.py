@@ -206,11 +206,22 @@ class TestHelpers:
     def test_parse_mem_to_mb_malformed_returns_zero(self):
         # P3-12: malformed forms must return 0 (unknown), not a misleading
         # partial like 16 that would masquerade as a tiny valid value.
+        # "16GB" moved out of this list: sbatch accepts it (measured), so it is a
+        # real spelling and must parse — see test_parse_mem_to_mb_unit_b below.
         from slurmate.system_utils import _parse_mem_to_mb
-        assert _parse_mem_to_mb("16GB") == 0
         assert _parse_mem_to_mb("16 G") == 0
         assert _parse_mem_to_mb("1.5.5G") == 0
+        assert _parse_mem_to_mb("16GiB") == 0
         assert _parse_mem_to_mb("abc") == 0
+
+    def test_parse_mem_to_mb_unit_b(self):
+        # A trailing B after the unit is Slurm's own tolerance. Parsing has to
+        # agree with validate_memory, or a value passes validation and then reads
+        # as 0 in every limit comparison.
+        from slurmate.system_utils import _parse_mem_to_mb
+        assert _parse_mem_to_mb("16GB") == 16 * 1024
+        assert _parse_mem_to_mb("16MB") == 16
+        assert _parse_mem_to_mb("1.5GB") == 1536
 
     def test_validate_time_broad_formats(self):
         # P0-4: accept the full Slurm --time grammar, 1–2 digit lead fields.
@@ -339,8 +350,14 @@ class TestMemHeterogeneous:
 
     def test_still_rejects_malformed(self):
         from slurmate.system_utils import _parse_mem_to_mb
-        assert _parse_mem_to_mb("16GB") == 0
+        assert _parse_mem_to_mb("16GiB") == 0
         assert _parse_mem_to_mb("abc") == 0
+
+    def test_the_b_suffix_survives_the_heterogeneous_plus(self):
+        # Both tolerances at once: sinfo's "+" for a heterogeneous partition and
+        # a user's "GB".
+        from slurmate.system_utils import _parse_mem_to_mb
+        assert _parse_mem_to_mb("256GB+") == 256 * 1024
 
 
 class TestNormalizeMemoryNC:
@@ -839,19 +856,23 @@ class TestGpuTypeProvenance:
 
     def test_count_only_gres_yields_feature_source(self, mocker):
         su = self._sinfo(mocker, "gold-6248r,384g,a100|gpu:4\n")
-        assert su.fetch_gpu_type_sources("gpu") == {"typed": [], "feature": ["a100"]}
+        assert su.fetch_gpu_type_sources("gpu") == {
+            "typed": [], "feature": ["a100"], "constraint": ["a100"]}
         # The flattened view (used by pickers) still lists it.
         assert su.fetch_gpu_types_for_partition("gpu") == ["a100"]
 
     def test_typed_gres_yields_typed_source(self, mocker):
         su = self._sinfo(mocker, "gold-6346,256g,a30|gpu:a30:4\n")
-        assert su.fetch_gpu_type_sources("p") == {"typed": ["a30"], "feature": []}
+        # Also a node feature here, so --constraint can name it too.
+        assert su.fetch_gpu_type_sources("p") == {
+            "typed": ["a30"], "feature": [], "constraint": ["a30"]}
 
     def test_typed_elsewhere_promotes_out_of_feature_only(self, mocker):
         # Mixed partition: one node types the GRES, another only features it. The
         # model IS requestable as a GRES type, so it must not be flagged.
         su = self._sinfo(mocker, "x,a100|gpu:a100:4\ny,a100|gpu:4\n")
-        assert su.fetch_gpu_type_sources("p") == {"typed": ["a100"], "feature": []}
+        assert su.fetch_gpu_type_sources("p") == {
+            "typed": ["a100"], "feature": [], "constraint": ["a100"]}
 
     def test_mock_types_count_as_typed(self):
         from slurmate.system_utils import fetch_gpu_type_sources
@@ -862,7 +883,86 @@ class TestGpuTypeProvenance:
         import slurmate.system_utils as su
         mocker.patch.object(su, "is_tool_available", return_value=True)
         mocker.patch.object(su, "_run_command", return_value=("", "boom", 1))
-        assert su.fetch_gpu_type_sources("p") == {"typed": [], "feature": []}
+        assert su.fetch_gpu_type_sources("p") == {
+            "typed": [], "feature": [], "constraint": []}
+
+
+class TestTypedOnlyGpuConstraintValidation:
+    """The mirror of H2, and reachable by H2's own remedy: a model that is a real
+    GRES type but is in no node's feature list cannot be named by --constraint.
+    Measured on both Booth clusters, whose nodes advertise `gpu:h100:8` and no
+    features at all — so there `gpu_format constraint` can never work, on any
+    partition, and slurmate emitted `--constraint=h100` in silence and let Slurm
+    answer "Invalid feature specification".
+    """
+
+    PART = {"name": "standard_hopper", "gpu_types": ["h100"], "has_gpu": True,
+            "cpus_per_node": 0, "mem_per_node_mb": 0, "timelimit": None}
+
+    def _issues(self, fmt, constraint_types, **kw):
+        from slurmate.system_utils import validate_job_config
+        answers = {"_partition_obj": self.PART, "gpus": 1, "gpu_type": "h100",
+                   "gpu_format": fmt}
+        answers.update(kw)
+        return validate_job_config(
+            answers, extra_gpu_types=["h100"], feature_only_gpu_types=[],
+            constraint_gpu_types=constraint_types)
+
+    def test_featureless_cluster_is_an_error(self):
+        errs = [m for lvl, m in self._issues("constraint", []) if lvl == "error"]
+        assert len(errs) == 1
+        assert "not a node feature" in errs[0] and "gres_type" in errs[0]
+        assert "no GPU model as a node feature" in errs[0]
+
+    def test_a_model_that_is_also_a_feature_is_accepted(self):
+        assert self._issues("constraint", ["h100"]) == []
+
+    def test_case_only_difference_is_accepted(self):
+        # Slurm features are case-sensitive, but the case warning is a separate
+        # check; this one must not double-report the same difference as fatal.
+        assert self._issues("constraint", ["H100"]) == []
+
+    def test_another_models_feature_is_named_in_the_message(self):
+        errs = [m for lvl, m in self._issues("constraint", ["a100"]) if lvl == "error"]
+        assert len(errs) == 1 and "node features here are a100" in errs[0]
+
+    def test_a_gres_naming_format_is_not_flagged(self):
+        for fmt in ("gres_type", "gpus", "gpus_per_node", "gpus_per_task"):
+            assert self._issues(fmt, []) == [], fmt
+
+    def test_unknown_lookup_claims_nothing(self):
+        # None means the sinfo query did not run. An empty list is the measured
+        # answer; conflating them would turn every unlooked-up job into an error.
+        assert self._issues("constraint", None) == []
+
+    def test_no_gpus_requested_is_not_flagged(self):
+        assert self._issues("constraint", [], gpus=0) == []
+
+    def test_a_model_the_partition_lacks_gets_one_error_not_two(self):
+        # Measured on midway3's `gpu` partition: an unknown model drew both the
+        # true "not in partition list" error AND this check asserting the model
+        # "is a GRES type on 'gpu'" — a false statement about a model that is not
+        # there at all. When the model is unrecognized, the first error is the
+        # whole answer.
+        from slurmate.system_utils import validate_job_config
+
+        errs = [m for lvl, m in validate_job_config(
+            {"_partition_obj": self.PART, "gpus": 1, "gpu_type": "a100",
+             "gpu_format": "constraint"},
+            extra_gpu_types=[], feature_only_gpu_types=[],
+            constraint_gpu_types=["h100"]) if lvl == "error"]
+        assert len(errs) == 1 and "not in partition list" in errs[0]
+
+    def test_the_two_directions_cannot_both_fire(self):
+        # A model cannot be feature-only and typed-only at once, and the pair of
+        # checks must not contradict each other if a caller says it is.
+        from slurmate.system_utils import validate_job_config
+        issues = validate_job_config(
+            {"_partition_obj": self.PART, "gpus": 1, "gpu_type": "h100",
+             "gpu_format": "constraint"},
+            extra_gpu_types=["h100"], feature_only_gpu_types=["h100"],
+            constraint_gpu_types=[])
+        assert [lvl for lvl, _ in issues] == []
 
 
 class TestFeatureOnlyGpuFormatValidation:

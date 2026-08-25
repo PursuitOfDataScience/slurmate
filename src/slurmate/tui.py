@@ -882,7 +882,8 @@ class Wizard:
     # checked, so a problem introduced earlier (e.g. GPUs on a CPU-only
     # partition) keeps showing after you move past that step.
     _VALIDATED_KEYS = frozenset(
-        {"cpus", "memory", "time_limit", "nodes", "ntasks_per_node", "gpus", "gpu_type"}
+        {"cpus", "memory", "time_limit", "nodes", "ntasks_per_node", "gpus",
+         "gpu_type", "gpu_format"}
     )
 
     def _cached_max_array(self, array_spec: Any) -> int | None:
@@ -920,6 +921,21 @@ class Wizard:
         types = self.transient.get(slot)
         return list(types) if types else None
 
+    def _cached_constraint_gpu_types(self) -> list[str] | None:
+        """Models ``--constraint`` can name on the current partition; None if unknown.
+
+        Deliberately *not* :meth:`_cached_gpu_types`, which collapses an empty
+        list to None. Empty is the answer that matters: on a cluster whose nodes
+        publish typed GRES and no features, no model can be named by
+        ``--constraint``, and turning that into "unknown" would silence the very
+        check it enables.
+        """
+        if self.transient.get("gpu_types_part") != self.answers.get("partition"):
+            return None
+        if "gpu_types_constraint" not in self.transient:
+            return None
+        return list(self.transient["gpu_types_constraint"] or [])
+
     def _config_warnings(self) -> list[tuple[str, str]]:
         """(level, message) issues for the whole work-in-progress config.
 
@@ -944,6 +960,7 @@ class Wizard:
             live,
             extra_gpu_types=self._cached_gpu_types(),
             feature_only_gpu_types=self._cached_gpu_types("gpu_types_feature_only"),
+            constraint_gpu_types=self._cached_constraint_gpu_types(),
             max_array_size=self._cached_max_array(live.get("array_spec")),
         )
 
@@ -1287,7 +1304,7 @@ class Wizard:
             sources = fetch_gpu_type_sources(part_name)
         except Exception as e:
             logger.debug(f"Failed to fetch GPU types for partition {part_name}: {e}")
-            sources = {"typed": [], "feature": []}
+            sources = {"typed": [], "feature": [], "constraint": []}
         gpu_types = sorted(set(sources["typed"]) | set(sources["feature"]))
         self.transient["gpu_types"] = gpu_types
         # Key the cache on the partition, and keep the models that can only be
@@ -1295,6 +1312,14 @@ class Wizard:
         # default correctly and the live validation can flag a mismatch.
         self.transient["gpu_types_part"] = part_name
         self.transient["gpu_types_feature_only"] = list(sources["feature"])
+        # And the mirror set: models --constraint can actually name. Stored only
+        # when the lookup produced a model list at all, because an empty list is
+        # a meaningful answer here ("no GPU model is a node feature on this
+        # partition") and must not be confused with "never asked".
+        if gpu_types:
+            self.transient["gpu_types_constraint"] = list(sources.get("constraint") or [])
+        else:
+            self.transient.pop("gpu_types_constraint", None)
         if gpu_types:
             choices = ["Any"] + gpu_types
             self.radio_list = RadioList([(c, c) for c in choices])

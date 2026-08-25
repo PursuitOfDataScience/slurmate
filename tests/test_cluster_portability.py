@@ -371,14 +371,31 @@ class TestSchedulerRefusal:
         assert info["eta_label"] == "never"
         assert info["reason"] == "Requested node configuration is not available"
 
-    def test_plugin_reason_beats_the_generic_failure(self, mocker):
+    def test_plugin_reason_leads_and_the_generic_verdict_is_kept(self, mocker):
+        # The site plugin's Reason is what the user needs to read, so it comes
+        # first. Slurm's generic verdict is kept in parentheses because that is
+        # the half refusal_is_permanent() can classify — the marker lists are
+        # written against Slurm's wordings, not a site plugin's. Dropping it made
+        # midway3's "Account is not specified" unclassifiable while Mercury's
+        # wording for the same mistake was correctly called permanent.
         info = self._eta(
             mocker,
             "sbatch: error: Reason: Invalid account [nope]\n"
             "allocation failure: Access/permission denied\n",
             1,
         )
-        assert info["reason"] == "Invalid account [nope]"
+        assert info["reason"].startswith("Invalid account [nope]")
+        assert "Access/permission denied" in info["reason"]
+        assert info["refusal_is_permanent"] is True
+
+    def test_identical_halves_are_not_printed_twice(self, mocker):
+        info = self._eta(
+            mocker,
+            "sbatch: error: Reason: Invalid qos specification\n"
+            "allocation failure: Invalid qos specification\n",
+            1,
+        )
+        assert info["reason"] == "Invalid qos specification"
 
     def test_unreachable_controller_is_not_a_rejection(self, mocker):
         # A broken sbatch must not read as "your job can never run" — that
@@ -573,14 +590,30 @@ class TestSlurmMemoryVocabulary:
 
     # "0" is deliberately absent: --mem=0 is documented Slurm for all the memory
     # on the node, and was measured accepted in every unit spelling.
-    @pytest.mark.parametrize("raw", ["64GB", "16 G", "1.5.5G", "5Q", "", "0P"])
+    # "64GB" was here, on the reasoning that a partial read is worse than a
+    # refusal. The reasoning is right and the example was wrong: sbatch *accepts*
+    # 16GB/16MB/16TB (measured), so refusing it was a false refusal. It is now
+    # accepted, and the hazard the list guards against is enforced below —
+    # accepting a spelling means parsing it too, in every one of the three
+    # functions, or it validates and then reads as 0 in the limit checks.
+    @pytest.mark.parametrize("raw", ["16 G", "1.5.5G", "5Q", "", "0P", "16GiB"])
     def test_malformed_values_are_rejected_not_partially_read(self, raw):
-        # "16GB" must not silently become 16 MB: a misleading partial value in a
-        # limit check is worse than a refusal.
         from slurmate.system_utils import validate_memory
 
         assert validate_memory(raw) is False
         assert su._parse_mem_to_mb(raw) == 0
+
+    @pytest.mark.parametrize("raw,mb", [
+        ("64GB", 65536), ("16MB", 16), ("16KB", 1), ("1.5GB", 1536),
+    ])
+    def test_an_accepted_spelling_is_also_parsed(self, raw, mb):
+        # The half-fix that is worse than the refusal: validate_memory says yes,
+        # normalize_memory emits a correct directive, and _parse_mem_to_mb returns
+        # 0 — so a 64 GB request on a 16 GB partition warns about nothing.
+        from slurmate.system_utils import validate_memory
+
+        assert validate_memory(raw) is True
+        assert su._parse_mem_to_mb(raw) == mb
 
 
 # ── SM-8 / SM-9: the config file is a cross-cluster trap ─────────────────
@@ -1855,12 +1888,18 @@ class TestCustomSbatchConflicts:
             ("-A pi-nope", "--account"),
             ("--qos=x", "--qos"),
             ("--time=99:00:00", "--time"),
-            ("--cpus-per-task=99", "--cpus"),
+            # The owner is the spelling the CLI accepts. These three used to
+            # point at --cpus/--gpus, which was correct before SM-25 made Slurm's
+            # own spellings first-class and wrong afterwards — and for --gres it
+            # also dropped the type that gpu:a100:2 carries.
+            ("--cpus-per-task=99", "--cpus-per-task"),
             ("--nodes=9", "--nodes"),
             ("--job-name=other", "--job-name"),
             ("--array=1-9", "--array"),
-            ("--gres=gpu:2", "--gpus"),
-            ("--gpus-per-node=2", "--gpus"),
+            ("--gres=gpu:2", "--gres"),
+            ("--gpus-per-node=2", "--gpus-per-node"),
+            ("--gpus-per-task=2", "--gpus-per-task"),
+            ("-c 8", "--cpus-per-task"),
         ],
     )
     def test_a_managed_directive_is_refused(self, flag, owner):
@@ -1988,7 +2027,14 @@ class TestNoHomeDirectory:
         assert su.unexpanded_home("/home/u/logs") is False
 
     def test_a_resolved_path_is_not_reported(self, tmp_path):
-        assert su.check_log_dirs(f"#SBATCH --output={tmp_path}/x-%j.out\n") == []
+        # Scoped to this class's subject. Asserting *no* findings at all made the
+        # test depend on where pytest's tmp_path lives: `/tmp` on both Booth
+        # clusters (node-local, so it correctly warned) and
+        # `/scratch/local/jobs/<id>` on midway3, where $TMPDIR points and which is
+        # the same local volume. Passing only because of an ambient $TMPDIR is
+        # what this file exists to stop.
+        issues = su.check_log_dirs(f"#SBATCH --output={tmp_path}/x-%j.out\n")
+        assert not [m for _lvl, m in issues if "~" in m], issues
 
 
 class TestNonUtf8Output:
@@ -2602,16 +2648,31 @@ class TestPrintModeSurfacesChecks:
     warns about twice produced zero bytes on stderr.
     """
 
-    def _run(self, *extra):
+    @pytest.fixture
+    def workdir(self, tmp_path):
+        """A directory where the default request is genuinely clean.
+
+        This class used to inherit pytest's cwd, and the "stays silent" case
+        passed only because the dev checkout happens to contain an untracked
+        ``logs/``. On a fresh clone — both Booth clusters, and GitHub CI — the
+        SM-24 missing-log-directory warning fires and the assertion of an empty
+        stderr fails. A test whose verdict depends on a directory nobody created
+        on purpose is measuring the checkout, not the code.
+        """
+        (tmp_path / "logs").mkdir()
+        return tmp_path
+
+    def _run(self, *extra, cwd=None):
         env = {
-            **os.environ, "PYTHONPATH": "src", "SLURMATE_MOCK": "1",
-            "NO_COLOR": "1",
+            **os.environ, "PYTHONPATH": os.path.abspath("src"),
+            "SLURMATE_MOCK": "1", "NO_COLOR": "1",
         }
         return subprocess.run(
             [sys.executable, "-m", "slurmate", "--print", "--force",
              "--job-name", "x", "--partition", "cpu-shared", "--cpus", "2",
              "--time", "00:05:00", "--command", "true", *extra],
-            capture_output=True, text=True, env=env, timeout=180,
+            capture_output=True, text=True, env=env,
+            cwd=str(cwd) if cwd else None, timeout=180,
         )
 
     def test_stdout_is_still_only_the_script(self):
@@ -2626,9 +2687,17 @@ class TestPrintModeSurfacesChecks:
         done = self._run("--memory", "9999G")
         assert "Memory" in done.stderr
 
-    def test_a_clean_request_stays_silent(self):
-        done = self._run()
+    def test_a_clean_request_stays_silent(self, workdir):
+        done = self._run(cwd=workdir)
         assert done.returncode == 0 and done.stderr == ""
+
+    def test_a_clean_request_in_a_fresh_directory_reports_the_log_dir(self, tmp_path):
+        # The other half of the pair: the silence above is conditional on the log
+        # directory existing, and pinning only the silent case is what let the
+        # dependency go unnoticed.
+        done = self._run(cwd=tmp_path)
+        assert done.returncode == 0
+        assert "logs" in done.stderr and "mkdir" in done.stderr
 
     def test_the_script_is_identical_with_and_without_the_warning(self):
         # The checks must be purely additive to stderr — the emitted script for a
@@ -4098,8 +4167,11 @@ class TestNoSurfaceClaimsAbsentWhenUnreadable:
             if re.search(r'get\("_unknown"\)|\["_unknown"\]', line)
             and not line.lstrip().startswith("#")
         ]
-        # main.py summary rows, system_utils capacity message, tui memory default.
-        assert len(sites) == 3, f"new consumer of _unknown: {sites}"
+        # main.py summary rows, system_utils capacity message, tui memory default,
+        # and _enrich_partition_maxima (SM-27), which reads the flag only to
+        # *skip* work: an unknown partition has no real name to query per-node, so
+        # it makes no claim and cannot make a false one.
+        assert len(sites) == 4, f"new consumer of _unknown: {sites}"
 
 
 class TestConfigIntTypesAreNotSilentlyReinterpreted:
@@ -4197,7 +4269,23 @@ class TestPristineEnvironmentBehaviour:
             capture_output=True, text=True, env=env, cwd=str(cwd), timeout=180,
         )
 
-    def test_a_fresh_directory_emits_a_script_and_says_nothing(self, tmp_path):
+    def test_a_fresh_directory_reports_only_the_missing_log_dir(self, tmp_path):
+        # This asserted *zero* stderr, which was right when the only candidate
+        # message was the false "cannot be created" this class exists to catch.
+        # SM-24 then showed a fresh directory is exactly where --print's script
+        # silently loses its output, so one warning is now correct — and it must
+        # still be the only one, and not the false one.
+        done = self._run(tmp_path)
+        assert done.returncode == 0
+        assert done.stdout.startswith("#!/bin/bash")
+        assert "does not exist" in done.stderr
+        assert "cannot be created" not in done.stderr, "the false warning is back"
+        assert done.stderr.count("\u26a0") == 1, done.stderr
+
+    def test_a_fresh_directory_with_logs_present_says_nothing(self, tmp_path):
+        # The original property, kept: once the one real problem is gone there is
+        # no noise at all.
+        (tmp_path / "logs").mkdir()
         done = self._run(tmp_path)
         assert done.returncode == 0
         assert done.stdout.startswith("#!/bin/bash")
@@ -4260,8 +4348,10 @@ class TestSchedulerRefusalReachesEveryMode:
     # A real limit token that neither marker list recognises: Mercury's QoS tables
     # carry cpu/node caps, so this is reachable, and it is the case that must not
     # be told "your script is fine".
+    # A group limit: neither a request fact nor a recognised wait, so it is the
+    # "cannot tell" case. (A PerJob limit is now classified permanent.)
     UNKNOWN = (
-        "sbatch: error: QOSMaxCpuPerJobLimit\n"
+        "sbatch: error: AssocGrpCpuLimit\n"
         "allocation failure: Job violates accounting/QOS policy "
         "(job submit limit, user's size and/or time limits)"
     )
@@ -4652,8 +4742,11 @@ class TestRefusalTriState:
         ("sbatch: error: QOSMaxSubmitJobPerUserLimit\n"
          "allocation failure: Job violates accounting/QOS policy (job submit "
          "limit, user's size and/or time limits)", False, True, "not right now"),
-        # Reachable on Mercury (its QoS tables carry cpu caps) and in neither list.
-        ("sbatch: error: QOSMaxCpuPerJobLimit\n"
+        # A *group* limit: it clears as other people's jobs finish, so it is not
+        # a request fact, but nothing here recognises it either — the honest
+        # "cannot tell". (QOSMaxCpuPerJobLimit used to sit here and is now
+        # correctly permanent: a PerJob limit is about the request.)
+        ("sbatch: error: AssocGrpCpuLimit\n"
          "allocation failure: Job violates accounting/QOS policy (job submit "
          "limit, user's size and/or time limits)", False, False, "refused"),
     ])
@@ -4687,3 +4780,2232 @@ class TestRefusalTriState:
     def test_neither_holds_for_an_empty_reason(self):
         assert su.refusal_is_permanent("") is False
         assert su.refusal_is_transient("") is False
+
+
+class TestSitePluginReasonStaysClassifiable:
+    """A third cluster, a third wording for the same mistake. midway3's site
+    `job_submit` plugin rejects an account-less job with a six-line block ending
+    in `Reason: Account is not specified` / `allocation failure: Access/permission
+    denied`; Mercury says `Invalid account or account/partition combination
+    specified`; both mean "this job can never run". The specific reason is the one
+    worth reading and the generic one is the only one a marker list can recognise,
+    so both are kept — otherwise the same defect is fatal on one cluster and
+    merely puzzling on the next, which is the opposite of cluster-agnostic.
+    """
+
+    MIDWAY3 = (
+        "sbatch: error: Verify job submission ...\n"
+        "sbatch: error: Partition: test\n"
+        "sbatch: error: QOS-Flag: test\n"
+        "sbatch: error: Account: unknown\n"
+        "sbatch: error: Verification: ***REJECTED***\n"
+        "sbatch: error: Reason: Account is not specified\n"
+        "allocation failure: Access/permission denied"
+    )
+    MERCURY = (
+        "allocation failure: Invalid account or account/partition combination "
+        "specified"
+    )
+
+    def test_midway3_account_block_is_permanent(self):
+        _eta, reason = su._read_test_only_output("", self.MIDWAY3, 1)
+        assert reason.startswith("Account is not specified")
+        assert su.refusal_is_permanent(reason) is True
+        assert su.refusal_is_transient(reason) is False
+
+    def test_both_clusters_agree_on_the_verdict(self):
+        # The property that matters: the same user error gets the same severity
+        # whichever controller answered.
+        verdicts = set()
+        for out in (self.MIDWAY3, self.MERCURY):
+            _eta, reason = su._read_test_only_output("", out, 1)
+            verdicts.add(su.refusal_is_permanent(reason))
+        assert verdicts == {True}, (
+            "the same mistake classified differently per cluster"
+        )
+
+    def test_the_verbose_block_does_not_leak_into_the_message(self):
+        # Six lines of plugin chatter must not become the message; only the
+        # Reason and the generic verdict.
+        _eta, reason = su._read_test_only_output("", self.MIDWAY3, 1)
+        for noise in ("Verify job submission", "QOS-Flag", "***REJECTED***"):
+            assert noise not in reason
+        assert reason.count("\n") == 0
+
+
+class TestMissingOutputDirectory:
+    """SM-24: the shipped default `--output-dir logs` is never created by
+    `--print`, and Slurm does not validate output paths at submit — it accepts a
+    path in a missing directory, discards what the job writes, and reports
+    `COMPLETED 0:0`. A green job with no log is the most confusing result a batch
+    user can get, and it is reachable from slurmate's defaults in an empty
+    directory.
+
+    The split that matters: `submit_sbatch` *does* create these directories, so
+    warning when slurmate is the one submitting would fire on every default run.
+    `--print` is the one mode that hands over a script it will never submit.
+    """
+
+    ARGS = [
+        "--job-name", "x", "--partition", "cpu-shared", "--cpus", "1",
+        "--memory", "500M", "--time", "00:02:00", "--command", "echo HI",
+    ]
+
+    def _run(self, cwd, mode):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        return subprocess.run(
+            [sys.executable, "-m", "slurmate", mode, *self.ARGS],
+            capture_output=True, text=True, cwd=str(cwd), timeout=180, env=env,
+        )
+
+    def test_print_warns_when_the_default_logs_dir_is_absent(self, tmp_path):
+        done = self._run(tmp_path, "--print")
+        assert "#SBATCH --output=logs/" in done.stdout, "the directive still ships"
+        assert "does not exist" in done.stderr, done.stderr
+        assert "logs" in done.stderr
+        # Actionable, and it names the remedy rather than just the problem.
+        assert "mkdir -p logs" in done.stderr
+        # A warning, not an error: the script itself is correct.
+        assert done.returncode == 0
+
+    def test_print_is_silent_once_the_directory_exists(self, tmp_path):
+        (tmp_path / "logs").mkdir()
+        done = self._run(tmp_path, "--print")
+        assert done.returncode == 0
+        assert done.stderr == "", done.stderr
+
+    def test_dry_run_does_not_warn(self, tmp_path):
+        # --dry-run submits nothing, but a later real run creates the directory,
+        # so warning here would fire on every dry run of the default.
+        done = self._run(tmp_path, "--dry-run")
+        assert "does not exist" not in done.stdout + done.stderr
+
+    def test_the_submitting_caller_stays_silent(self):
+        # will_create=True is the submit path, which makes the directory itself.
+        script = (
+            "#!/bin/bash\n"
+            "#SBATCH --output=definitely/not/here/x-%j.out\n"
+            "echo hi\n"
+        )
+        assert su.check_log_dirs(script, will_create=True) == []
+
+    def test_the_handing_over_caller_reports_it(self):
+        script = (
+            "#!/bin/bash\n"
+            "#SBATCH --output=definitely/not/here/x-%j.out\n"
+            "echo hi\n"
+        )
+        issues = su.check_log_dirs(script, will_create=False)
+        assert [lvl for lvl, _ in issues] == ["warning"]
+        assert "definitely/not/here" in issues[0][1]
+
+    def test_a_slurm_pattern_directory_is_not_reported(self):
+        # "%j" is expanded per job; there is no literal directory to test, and
+        # claiming it is missing would be a false warning on every array job.
+        script = "#!/bin/bash\n#SBATCH --output=logs/%A_%a/x.out\necho hi\n"
+        assert su.check_log_dirs(script, will_create=False) == []
+
+
+class TestScriptBoxIsNotCopyPasteBroken:
+    """Round 60, secondary: rich wraps mid-token, so a long directive rendered as
+    a bare `#SBATCH` (a no-op) on one line and `--output=…` — split mid-path — on
+    the next, where it reads as a *shell command*. `bash -n` accepts that, so a
+    user who copied the box got "command not found" at run time and none of the
+    `--output` they asked for.
+    """
+
+    LONG = "/tmp/" + "x" * 90
+
+    def _dry_run(self, cols):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": str(cols)}
+        return subprocess.run(
+            [sys.executable, "-m", "slurmate", "--dry-run", "--job-name", "x",
+             "--partition", "cpu-shared", "--cpus", "1", "--memory", "500M",
+             "--time", "00:02:00", "--output-dir", self.LONG,
+             "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        ).stdout
+
+    def _box_lines(self, out):
+        """Just the script box's interior.
+
+        Scoped deliberately: the advisories *below* the box are prose and wrap at
+        word boundaries, so one of them legitimately begins a line with
+        "--demo, for real values.)" — scanning the whole of stdout made this
+        assertion fail on text that has nothing to copy in it.
+        """
+        lines = out.splitlines()
+        start = next(
+            (i for i, ln in enumerate(lines) if "Generated sbatch script" in ln),
+            None,
+        )
+        assert start is not None, f"no script box in output: {out[:400]!r}"
+        body = []
+        for ln in lines[start + 1:]:
+            if ln.lstrip().startswith(("\u2570", "+--")):     # closing border
+                break
+            body.append(ln)
+        assert body, "script box was empty"
+        return body
+
+    @pytest.mark.parametrize("cols", [40, 80, 100])
+    def test_no_directive_is_split_across_rendered_lines(self, cols):
+        # The signature of the defect: a boxed line whose content begins with
+        # "--", i.e. a flag that lost its "#SBATCH".
+        for line in self._box_lines(self._dry_run(cols)):
+            stripped = line.strip("\u2502|+ ").strip()
+            assert not stripped.startswith("--"), (
+                f"at {cols} cols a directive was wrapped onto its own line, which "
+                f"reads as a shell command when copied: {line!r}"
+            )
+
+    @pytest.mark.parametrize("cols", [40, 80, 100])
+    def test_a_bare_sbatch_never_appears(self, cols):
+        for line in self._box_lines(self._dry_run(cols)):
+            stripped = line.strip("\u2502|+ ").strip()
+            # "<n> #SBATCH" with nothing after it is the no-op half of the split.
+            assert not re.fullmatch(r"\d+\s+#SBATCH", stripped), (
+                f"at {cols} cols a '#SBATCH' was left alone on a line: {line!r}"
+            )
+
+    def test_clipping_is_disclosed_and_points_at_print(self):
+        out = self._dry_run(80)
+        assert "clipped" in out
+        assert "--print" in out, "the copy-safe alternative is not named"
+
+    def test_nothing_is_disclosed_when_nothing_is_clipped(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        out = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--dry-run", "--job-name", "x",
+             "--partition", "cpu-shared", "--cpus", "1", "--memory", "500M",
+             "--time", "00:02:00", "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        ).stdout
+        assert "clipped" not in out
+
+    def test_print_remains_byte_exact(self):
+        # --print is the copy-safe form the note points at, so it must never clip.
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "COLUMNS": "40"}
+        out = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--job-name", "x",
+             "--partition", "cpu-shared", "--cpus", "1", "--memory", "500M",
+             "--time", "00:02:00", "--output-dir", self.LONG,
+             "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        ).stdout
+        assert f"#SBATCH --output={self.LONG}/x-%j.out" in out.splitlines()
+        assert "…" not in out and "..." not in out
+
+    def test_clip_helper_is_cell_aware(self):
+        from slurmate.main import _clip_cells
+        # Two-cell glyphs must not overflow the limit they were trimmed to.
+        text = "中" * 20          # 20 CJK chars = 40 cells
+        shown, was = _clip_cells(text, 10)
+        assert was is True
+        from rich.cells import cell_len
+        assert cell_len(shown) <= 10
+        assert _clip_cells("short", 40) == ("short", False)
+
+
+class TestEveryHandoverPathChecksItsLogDirs:
+    """SM-24's fix was wired into `--print`, which is not the only mode that hands
+    over a script slurmate will never submit. The wizard's "Save script to a file"
+    action does exactly the same thing, and said nothing — so the failure
+    (Slurm accepts the path, discards the output, reports COMPLETED) stayed
+    reachable through the interface most users see. A check wired to one of two
+    equivalent paths is the shape of half the findings in this report.
+    """
+
+    SCRIPT = (
+        "#!/bin/bash\n"
+        "#SBATCH --job-name=x\n"
+        "#SBATCH --output=logs/x-%j.out\n"
+        "echo hi\n"
+    )
+
+    def test_saving_a_script_warns_about_a_missing_log_dir(
+        self, mocker, tmp_path, capsys, monkeypatch
+    ):
+        import questionary
+
+        from slurmate.main import _save_script
+
+        target = tmp_path / "job.sh"
+        mocker.patch.object(
+            questionary, "text",
+            return_value=mocker.Mock(ask=lambda: str(target)),
+        )
+        # monkeypatch.chdir is auto-restored; a bare chdir would leak the
+        # working directory into every test that runs after this one.
+        monkeypatch.chdir(tmp_path)
+        _save_script(self.SCRIPT, "job.sh")
+        out = capsys.readouterr().out
+        assert "Saved to" in out
+        assert "does not exist" in out, out
+        assert "mkdir -p logs" in out
+        assert target.read_text() == self.SCRIPT, "the script is still written"
+
+    def test_no_warning_once_the_directory_exists(
+        self, mocker, tmp_path, capsys, monkeypatch
+    ):
+        import questionary
+
+        from slurmate.main import _save_script
+
+        (tmp_path / "logs").mkdir()
+        target = tmp_path / "job.sh"
+        mocker.patch.object(
+            questionary, "text",
+            return_value=mocker.Mock(ask=lambda: str(target)),
+        )
+        monkeypatch.chdir(tmp_path)
+        _save_script(self.SCRIPT, "job.sh")
+        out = capsys.readouterr().out
+        assert "Saved to" in out
+        assert "does not exist" not in out
+
+    def test_the_save_still_succeeds_if_the_check_finds_nothing_to_say(
+        self, mocker, tmp_path, capsys, monkeypatch
+    ):
+        # The warning must never be able to prevent the write.
+        import questionary
+
+        from slurmate.main import _save_script
+
+        target = tmp_path / "sub" / "job.sh"
+        mocker.patch.object(
+            questionary, "text",
+            return_value=mocker.Mock(ask=lambda: str(target)),
+        )
+        monkeypatch.chdir(tmp_path)
+        _save_script("#!/bin/bash\necho hi\n", "job.sh")
+        assert target.exists()
+        assert "Saved to" in capsys.readouterr().out
+
+
+class TestSubmitOutcomeIsNotInferred:
+    """`rc=0` with empty stdout was read as "mock mode — not actually submitted".
+    That is an inference, and it is wrong in the direction that costs the most: a
+    real `sbatch` which exits 0 and prints nothing has very likely submitted the
+    job, and telling that user nothing happened invites a duplicate submission.
+    Mock mode short-circuits before running anything, so which case it is can be
+    asked rather than guessed.
+    """
+
+    @pytest.fixture
+    def silent_sbatch(self, tmp_path):
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        for name, body in (
+            ("sbatch", "#!/bin/bash\ncat > /dev/null\nexit 0\n"),   # accepts, says nothing
+            ("squeue", "#!/bin/bash\nexit 0\n"),
+            ("sinfo", "#!/bin/bash\nexit 0\n"),
+        ):
+            (bindir / name).write_text(body)
+            (bindir / name).chmod(0o755)
+        (tmp_path / "logs").mkdir()
+        return bindir, tmp_path
+
+    def _run(self, bindir, cwd, extra_env=None, partition="p"):
+        env = {"PATH": f"{bindir}:/usr/bin:/bin", "NO_COLOR": "1",
+               "COLUMNS": "220", "HOME": os.environ.get("HOME", "/tmp"),
+               "PYTHONPATH": str(pathlib.Path(__file__).parent.parent / "src")}
+        env.update(extra_env or {})
+        return subprocess.run(
+            [sys.executable, "-m", "slurmate", "--yes", "--job-name", "x",
+             "--partition", partition, "--cpus", "1", "--memory", "1G",
+             "--time", "00:05:00", "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env, cwd=str(cwd),
+        )
+
+    def test_a_real_silent_sbatch_is_not_called_mock_mode(self, silent_sbatch):
+        bindir, work = silent_sbatch
+        done = self._run(bindir, work)
+        combined = done.stdout + done.stderr
+        assert "mock mode" not in combined, (
+            "a real sbatch that exited 0 was reported as mock mode, which tells "
+            "the user to resubmit a job that may already exist"
+        )
+        assert "Submitted" in combined
+        # And it says what it does not know, rather than inventing an id.
+        assert "no job ID" in combined
+        assert "squeue" in combined
+
+    def test_mock_mode_still_says_mock_mode(self, silent_sbatch):
+        bindir, work = silent_sbatch
+        # A partition from the demo list: under SLURMATE_MOCK the cluster's
+        # partitions *are* the mock ones, so "p" is rejected before submit and
+        # the run never reaches the branch under test.
+        done = self._run(
+            bindir, work, {"SLURMATE_MOCK": "1"}, partition="cpu-shared"
+        )
+        assert "mock mode" in done.stdout + done.stderr
+
+
+class TestJobIdFormats:
+    """Every shape Slurm itself prints, and nothing else. Losing the id costs the
+    `squeue`/`scancel` hints and the saved script's filename, which is exactly
+    what happened on a site whose sbatch wrapper drops `--parsable`."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("12345", "12345"),                                    # --parsable
+        ("12345;mercury", "12345"),                            # federated --parsable
+        ("Submitted batch job 12345", "12345"),                # sbatch's own default
+        ("Submitted batch job 12345 on cluster mercury", "12345"),   # federated
+        ("  Submitted batch job 12345  ", "12345"),            # padded
+        # A wrapper's banner ahead of the real line must not defeat it.
+        ("NOTICE: policy 2024 applies\nSubmitted batch job 999", "999"),
+    ])
+    def test_accepted(self, raw, expected):
+        assert su.parse_submitted_job_id(raw) == expected
+
+    @pytest.mark.parametrize("raw", [
+        "",
+        "Submitted batch job",                 # no number
+        "Submitted batch job abc",             # not a number
+        "Job 12345 has been queued",           # not a shape Slurm prints
+        "NOTICE: see ticket 12345 for policy",  # a banner that merely contains digits
+        "error: Batch job submission failed",
+    ])
+    def test_rejected(self, raw):
+        assert su.parse_submitted_job_id(raw) == "", (
+            "guessing an id out of arbitrary text substitutes one wrong answer "
+            "for another"
+        )
+
+
+class TestCondaEnvIsValidatedLikeModules:
+    """SM-13 fixed the late failure for `module load`: the job queues, starts, and
+    then dies. `--env` fails exactly the same way on `conda activate`, and the env
+    list was already being fetched for the wizard's picker — but a name typed on
+    the command line was never checked against it. One field validated, the
+    neighbouring one not.
+    """
+
+    KNOWN = ["base", "pytorch", "tensorflow", "jax", "my_project"]
+
+    def _known(self, mocker, envs):
+        mocker.patch.object(su, "fetch_conda_envs", return_value=envs)
+
+    def test_an_unknown_env_warns(self, mocker):
+        self._known(mocker, self.KNOWN)
+        issues = su.check_conda_env("nosuchenv", "conda")
+        assert [lvl for lvl, _ in issues] == ["warning"]
+        assert "nosuchenv" in issues[0][1]
+        assert "conda activate" in issues[0][1]
+        assert "pytorch" in issues[0][1]
+
+    def test_a_known_env_passes(self, mocker):
+        self._known(mocker, self.KNOWN)
+        assert su.check_conda_env("pytorch", "conda") == []
+
+    def test_mamba_is_checked_too(self, mocker):
+        self._known(mocker, self.KNOWN)
+        assert su.check_conda_env("nosuchenv", "mamba") != []
+
+    @pytest.mark.parametrize("env_type", ["venv", "none", "", None])
+    def test_only_named_conda_envs_are_checked(self, mocker, env_type):
+        # A venv is a path, and a path unreadable from the login node can be
+        # perfectly valid on the compute node — checking it manufactures false
+        # refusals, the same restraint check_log_dirs applies.
+        self._known(mocker, self.KNOWN)
+        assert su.check_conda_env("/no/such/venv", env_type) == []
+
+    def test_an_unaskable_conda_claims_nothing_about_the_env(self, mocker):
+        # fetch_conda_envs returns [] for both "no conda" and "conda failed";
+        # neither may read as "your environment does not exist". But "conda is
+        # not reachable here" is a fact about the *script*, and staying silent
+        # about it shipped a job that dies on its first line — on all three
+        # clusters tested, none of which has conda on the default PATH.
+        self._known(mocker, [])
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        mocker.patch.object(su, "fetch_available_modules", return_value=[])
+        issues = su.check_conda_env("anything", "conda")
+        assert [lvl for lvl, _ in issues] == ["warning"]
+        msg = issues[0][1]
+        assert "not on this cluster's PATH" in msg
+        assert "not found" not in msg      # no claim about the env's existence
+
+    def test_a_conda_providing_module_is_named(self, mocker):
+        # The remedy is what makes it actionable: on a cluster where conda is one
+        # `module load` away, "conda is missing" is the wrong conclusion.
+        self._known(mocker, [])
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        mocker.patch.object(su, "fetch_available_modules",
+                            return_value=["conda/23.10", "gcc/12"])
+        msg = su.check_conda_env("myenv", "conda")[0][1]
+        assert "--modules conda/23.10" in msg
+
+    def test_a_substring_match_finds_it_where_module_avail_cannot(self, mocker):
+        # `module -t avail conda` matches a name PREFIX, so it finds Pythia's
+        # `conda/23.10` and misses midway3's `python/anaconda-2025.12` — the
+        # cluster with the most obvious remedy was the one that got none.
+        self._known(mocker, [])
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        mocker.patch.object(su, "fetch_available_modules", return_value=[
+            "gcc/12", "python/anaconda-2019.03", "python/anaconda-2025.12"])
+        msg = su.check_conda_env("myenv", "conda")[0][1]
+        # ...and offers the NEWEST of the family, not every version of it.
+        assert "python/anaconda-2025.12" in msg
+        assert "2019.03" not in msg
+        # One family, one candidate: nameable as the thing to do.
+        assert "--modules python/anaconda-2025.12" in msg
+
+    def test_one_candidate_per_family(self, mocker):
+        # midway3 has anaconda, miniforge and miniforge3 side by side. Taking the
+        # last of the flat sorted list picked miniforge3-4.8 as "newest".
+        self._known(mocker, [])
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        mocker.patch.object(su, "fetch_available_modules", return_value=[
+            "python/anaconda-2019.03", "python/anaconda-2025.12",
+            "python/miniforge-24.1.2", "python/miniforge-25.3.0",
+            "python/miniforge3-4.8",
+        ])
+        msg = su.check_conda_env("myenv", "conda")[0][1]
+        for kept in ("python/anaconda-2025.12", "python/miniforge-25.3.0",
+                     "python/miniforge3-4.8"):
+            assert kept in msg, kept
+        for dropped in ("2019.03", "24.1.2"):
+            assert dropped not in msg, dropped
+        # Several families: no single "e.g." guessed for the user.
+        assert "e.g." not in msg
+
+    def test_module_family_strips_either_version_convention(self):
+        assert su._module_family("conda/23.10") == "conda"
+        assert su._module_family("python/anaconda-2025.12") == "python/anaconda"
+        assert su._module_family("python/miniforge3-4.8") == "python/miniforge3"
+        # Nothing version-like: left alone rather than truncated.
+        assert su._module_family("mpi") == "mpi"
+        assert su._module_family("gcc/toolchain") == "gcc/toolchain"
+
+    def test_no_module_system_still_warns_without_inventing_a_remedy(self, mocker):
+        self._known(mocker, [])
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        mocker.patch.object(su, "fetch_available_modules", return_value=[])
+        msg = su.check_conda_env("myenv", "conda")[0][1]
+        assert "--modules" in msg and "conda/23.10" not in msg
+        assert "--env-type venv" in msg
+
+    def test_a_broken_conda_that_is_on_path_claims_nothing(self, mocker):
+        # conda is right there and the listing still failed: a broken install, or
+        # one that cannot read its own config. The activation line may well work,
+        # so there is no positive evidence to report.
+        self._known(mocker, [])
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        assert su.check_conda_env("anything", "conda") == []
+
+    def test_mamba_env_type_names_mamba(self, mocker):
+        self._known(mocker, [])
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        mocker.patch.object(su, "fetch_available_modules", return_value=[])
+        msg = su.check_conda_env("e", "mamba")[0][1]
+        assert "'mamba' is not on this cluster's PATH" in msg
+
+    def test_an_empty_env_is_not_a_finding(self, mocker):
+        self._known(mocker, self.KNOWN)
+        assert su.check_conda_env("", "conda") == []
+        assert su.check_conda_env("   ", "conda") == []
+
+    def test_a_prefix_path_env_that_exists_passes(self, mocker):
+        self._known(mocker, ["base", "/scratch/me/envs/custom"])
+        assert su.check_conda_env("/scratch/me/envs/custom", "conda") == []
+
+    def test_prefix_paths_are_not_offered_as_suggestions(self, mocker):
+        # They are 100+ characters each and sort before every name, so listing
+        # them buries the answer the user needs.
+        long_path = "/project/someone/very/long/scratch/path/envs/theirs"
+        self._known(mocker, [long_path, "base", "pytorch"])
+        issues = su.check_conda_env("nosuchenv", "conda")
+        assert issues
+        assert long_path not in issues[0][1]
+        assert "base" in issues[0][1] and "pytorch" in issues[0][1]
+
+    def test_no_named_envs_means_no_suggestion_list(self, mocker):
+        self._known(mocker, ["/only/a/prefix/env"])
+        issues = su.check_conda_env("nosuchenv", "conda")
+        assert issues
+        assert "Available" not in issues[0][1]
+
+    def test_the_modules_are_passed_through(self, mocker):
+        # conda is usually provided by a module, so the env list is only visible
+        # after loading it — fetch_conda_envs takes the modules for that reason.
+        fetch = mocker.patch.object(su, "fetch_conda_envs", return_value=["base"])
+        su.check_conda_env("x", "conda", ["python/anaconda-2025.12"])
+        assert fetch.call_args[0][0] == ["python/anaconda-2025.12"]
+
+    def test_it_reaches_the_cli(self):
+        # Wired into site_check_issues, so every mode gets it. MOCK_CONDA_ENVS is
+        # the env list under SLURMATE_MOCK.
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--job-name", "x",
+             "--partition", "cpu-shared", "--cpus", "1", "--memory", "1G",
+             "--time", "00:05:00", "--env", "nosuchenv", "--env-type", "conda",
+             "--command", "python t.py"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert "nosuchenv" in done.stderr
+        assert "conda activate" in done.stderr
+        # A warning, not an error: conda's env list is a property of this machine,
+        # and a site whose compute nodes see an envs dir the login node does not
+        # would turn an error into a false refusal.
+        assert done.returncode == 0
+        assert "#SBATCH" in done.stdout
+
+
+class TestDiscardedMemoryValueIsDisclosed:
+    """Slurm rejects `--mem` and `--mem-per-cpu` together, so the builder emits
+    only one — correctly, `--mem-per-cpu`. But the discarded value then vanished
+    from the summary entirely, which reads as "I never set that". The case that
+    matters is the invisible one: a `memory` key inherited from a config file,
+    dropped by a `--mem-per-cpu` typed on the command line.
+
+    Same disclosure the Output directory row already makes for a flag that is
+    given and has no effect.
+    """
+
+    def _rows(self, **over):
+        from slurmate.builder import job_summary_rows
+
+        answers = {
+            "job_name": "x", "partition": "p", "cpus": 4,
+            "time_limit": "00:05:00", "command": "echo hi",
+        }
+        answers.update(over)
+        return dict(job_summary_rows(answers))
+
+    def test_both_given_discloses_the_unused_one(self):
+        rows = self._rows(memory="8G", mem_per_cpu="2G")
+        assert rows["Mem per CPU"] == "2G"
+        assert "8G" in rows["Memory"]
+        assert "not used" in rows["Memory"]
+        assert "--mem-per-cpu takes precedence" in rows["Memory"]
+
+    def test_only_mem_per_cpu_adds_no_memory_row(self):
+        rows = self._rows(mem_per_cpu="2G")
+        assert rows.get("Mem per CPU") == "2G"
+        assert "Memory" not in rows, "a row for a value the user never set"
+
+    def test_only_memory_is_unchanged(self):
+        rows = self._rows(memory="8G")
+        assert "Mem per CPU" not in rows
+        assert "not used" not in rows["Memory"]
+
+    def test_the_script_still_carries_exactly_one_memory_directive(self):
+        from slurmate.builder import build_from_answers
+
+        script = build_from_answers({
+            "job_name": "x", "partition": "p", "cpus": 4,
+            "time_limit": "00:05:00", "command": "echo hi",
+            "memory": "8G", "mem_per_cpu": "2G",
+        })
+        mem_lines = [
+            ln for ln in script.splitlines()
+            if ln.startswith("#SBATCH --mem")
+        ]
+        assert len(mem_lines) == 1, mem_lines
+        assert mem_lines[0] == "#SBATCH --mem-per-cpu=2G", (
+            "Slurm rejects --mem and --mem-per-cpu together"
+        )
+
+
+class TestSlurmSpellingsRoundTrip:
+    """SM-25: the documented handoff is "slurmpast tells you what to request →
+    slurmate builds the script", and it broke on exactly the two flags carrying
+    the sizing — because slurmate *emitted* `--cpus-per-task` and `--mem` and
+    accepted neither. `--mem` was the worse of the two: argparse called it
+    ambiguous and named two flags the user had never typed, suggesting neither.
+
+    The general rule, which is what this pins: anything appearing in slurmate's
+    own output should be typeable back at slurmate.
+    """
+
+    # Every flag a generated script can carry, with a value valid for it.
+    EMITTED = [
+        ("--job-name", "x"), ("--partition", "cpu-shared"), ("--account", "a"),
+        ("--qos", "normal"), ("--cpus-per-task", "2"), ("--mem", "1G"),
+        ("--mem-per-cpu", "2G"), ("--time", "00:05:00"), ("--nodes", "1"),
+        ("--ntasks-per-node", "2"), ("--gpus", "1"), ("--gres", "gpu:1"),
+        ("--gpus-per-node", "1"), ("--gpus-per-task", "1"),
+        ("--constraint", "feat"), ("--array", "1-4"), ("--output", "o-%j.out"),
+    ]
+
+    def _run(self, *extra):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        return subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "cpu-shared",
+             "--time", "00:05:00", "--command", "echo hi", *extra],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+
+    @pytest.mark.parametrize("flag,value", EMITTED, ids=[f[0] for f in EMITTED])
+    def test_every_emitted_flag_is_accepted(self, flag, value):
+        done = self._run(flag, value)
+        assert "ambiguous option" not in done.stderr, done.stderr
+        assert "unrecognized argument" not in done.stderr, done.stderr
+        assert done.stdout.startswith("#!/bin/bash"), done.stderr
+
+    def test_the_report_s_own_sizing_advice_is_typeable(self):
+        # Verbatim from slurmpast's --sizing output, which is where this was hit.
+        done = self._run("--time", "00:05:00", "--mem", "1G", "--cpus-per-task", "2")
+        assert done.returncode == 0
+        script = done.stdout
+        assert "#SBATCH --time=00:05:00" in script
+        assert "#SBATCH --mem=1G" in script
+        assert "#SBATCH --cpus-per-task=2" in script
+
+    def test_mem_does_not_shadow_mem_per_cpu(self):
+        # Declaring --mem explicitly must leave --mem-per-cpu reachable, not turn
+        # it into a second ambiguous prefix.
+        done = self._run("--mem-per-cpu", "2G")
+        assert "ambiguous" not in done.stderr
+        assert "#SBATCH --mem-per-cpu=2G" in done.stdout
+
+    def test_error_is_explained_rather_than_unrecognized(self):
+        done = self._run("--error", "/tmp/x.err")
+        assert done.returncode == 2
+        assert "unrecognized" not in done.stderr
+        assert "--custom-sbatch=--error=/tmp/x.err" in done.stderr
+
+    def test_the_error_escape_hatch_actually_works(self):
+        # The advice above is only worth giving if it does what it says: the
+        # custom directive must replace the derived one, not duplicate it.
+        done = self._run("--custom-sbatch=--error=/tmp/mine.err")
+        err_lines = [
+            ln for ln in done.stdout.splitlines()
+            if ln.startswith("#SBATCH --error")
+        ]
+        assert err_lines == ["#SBATCH --error=/tmp/mine.err"], err_lines
+
+
+class TestGpuSpellingTranslation:
+    """`--gres`/`--gpus-per-*` are three renderings of one request, so they
+    resolve to gpus/gpu_type/gpu_format rather than settings of their own."""
+
+    @pytest.mark.parametrize("flag,value,count,gtype", [
+        ("--gres", "gpu:2", 2, ""),
+        ("--gres", "gpu:a100:2", 2, "a100"),
+        ("--gres", "gpu:h100:1", 1, "h100"),
+        ("--gpus-per-node", "2", 2, ""),
+        ("--gpus-per-node", "a100:2", 2, "a100"),
+        ("--gpus-per-task", "3", 3, ""),
+    ])
+    def test_parsed(self, flag, value, count, gtype):
+        assert su.parse_gpu_spelling(flag, value) == (count, gtype)
+
+    @pytest.mark.parametrize("value", [
+        "lscratch:100",   # a real non-GPU gres, which slurmate does not manage
+        "gpu",
+        "gpu:bogus",
+        "",
+        "2",              # a bare count is not a gres
+    ])
+    def test_a_non_gpu_gres_is_refused_not_reinterpreted(self, value):
+        # Quietly treating one of these as a GPU request would drop a resource
+        # the user actually asked for.
+        with pytest.raises(ValueError):
+            su.parse_gpu_spelling("--gres", value)
+
+    def test_a_disagreeing_duplicate_is_an_error(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "gpu-shared", "--time", "00:05:00",
+             "--command", "echo hi", "--gres", "gpu:2", "--gpus", "4"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert done.returncode == 2
+        assert "two spellings of one number" in done.stderr
+
+    def test_an_agreeing_duplicate_is_fine(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "gpu-shared", "--time", "00:05:00",
+             "--command", "echo hi", "--gres", "gpu:2", "--gpus", "2"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert done.returncode == 0
+        assert "#SBATCH --gres=gpu:2" in done.stdout
+
+
+class TestJobNameRewriteIsDisclosed:
+    """`sanitize_job_name` is deliberate and documented — sbatch splits
+    `--job-name` on whitespace, and the name becomes the log filename and the
+    auto-saved script's filename, so a conservative character set is right. What
+    was missing is telling the user it happened.
+
+    The case that matters is not the developer's: *any* all-non-Latin name falls
+    back to `slurm`, so a user's logs appear as `logs/slurm-<jobid>.out` and
+    nothing anywhere explained why. Silently sending someone to look in the wrong
+    place is the same failure as SM-24's discarded output, one field over.
+    """
+
+    def test_a_whitespace_collapse_stays_quiet(self):
+        from slurmate.builder import job_name_change_note
+
+        # Visible in the result, nothing lost — a note here would be noise.
+        assert job_name_change_note("my training job") == ""
+        assert job_name_change_note("tab\there") == ""
+
+    def test_an_unchanged_name_stays_quiet(self):
+        from slurmate.builder import job_name_change_note
+
+        assert job_name_change_note("ok-name") == ""
+        assert job_name_change_note("") == ""
+        assert job_name_change_note("   ") == ""
+
+    @pytest.mark.parametrize("raw,safe", [
+        ("ünïcøde", "ncde"),
+        ("训练任务", "slurm"),        # the fallback: nothing of the input survives
+        ("../../escape", "escape"),
+        ("semi;rm -rf x", "semirm_-rf_x"),
+        ("$(whoami)", "whoami"),
+        ("..", "slurm"),
+    ])
+    def test_a_lossy_rewrite_is_disclosed(self, raw, safe):
+        from slurmate.builder import job_name_change_note
+
+        note = job_name_change_note(raw)
+        assert note, f"{raw!r} was silently rewritten to {safe!r}"
+        assert raw in note and f"'{safe}'" in note
+        # It names where the logs will actually be, which is the practical
+        # consequence and the reason this is worth a line at all.
+        assert f"{safe}-<jobid>.out" in note
+
+    def test_it_reaches_the_cli(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "训练任务", "--partition", "cpu-shared", "--cpus", "1",
+             "--memory", "1G", "--time", "00:05:00", "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert done.returncode == 0, done.stderr
+        assert "was changed to 'slurm'" in done.stderr
+        # And the script really does carry the fallback, so the note is accurate.
+        assert "#SBATCH --job-name=slurm" in done.stdout
+
+    def test_the_summary_still_shows_what_the_script_says(self):
+        # The note explains the change; the row must keep matching the directive,
+        # not revert to showing the name the user typed.
+        from slurmate.builder import build_from_answers, job_summary_rows
+
+        answers = {
+            "job_name": "ncde", "partition": "p", "cpus": 1, "memory": "1G",
+            "time_limit": "00:05:00", "command": "echo hi",
+        }
+        rows = dict(job_summary_rows(answers))
+        assert rows["Job name"] == "ncde"
+        assert "#SBATCH --job-name=ncde" in build_from_answers(answers)
+
+
+class TestUnlimitedTimeIsAcceptedAndBounded:
+    """Two mirror-image defects around an unlimited `--time`.
+
+    slurmate *refused* `--time=UNLIMITED`, which sbatch accepts — a false
+    refusal, and the rarer, worse direction: there is no cluster on which it was
+    right. And once accepted, the partition-limit check read "no limit" as a
+    **zero-length** job (`_parse_slurm_time_to_minutes("UNLIMITED")` is `0.0`),
+    so an unbounded request against a two-hour partition was affirmed. The cost
+    estimate already got this right, from its own copy of the rule.
+
+    Every spelling below was measured against a live sbatch: `UNLIMITED` and
+    `INFINITE` parse, and `inf` does *not* — sbatch rejects it with "Invalid
+    --time specification", so accepting it would trade the bug for its inverse.
+    """
+
+    @pytest.mark.parametrize("value", ["UNLIMITED", "unlimited", "INFINITE",
+                                       "Infinite", "0", "00:00:00", "0-00:00:00"])
+    def test_accepted(self, value):
+        assert su.validate_time(value) is True
+
+    @pytest.mark.parametrize("value", ["inf", "INF", "notatime", "forever", "1:99"])
+    def test_rejected(self, value):
+        assert su.validate_time(value) is False, (
+            "accepting what sbatch rejects is the inverse of the bug being fixed"
+        )
+
+    @pytest.mark.parametrize("value", ["UNLIMITED", "infinite", "0", "00:00:00",
+                                       "0-00:00:00"])
+    def test_recognised_as_unbounded(self, value):
+        assert su.time_request_is_unbounded(value) is True
+
+    @pytest.mark.parametrize("value", ["", "  ", "notatime", "inf", "01:00:00"])
+    def test_not_unbounded(self, value):
+        # "" is deliberately not unbounded: an absent limit takes the partition
+        # default. "not-a-time" must not parse to 0 and be called unlimited.
+        assert su.time_request_is_unbounded(value) is False
+
+    def test_one_implementation_not_two(self):
+        # The builder's predicate delegates rather than reimplementing: two copies
+        # of this rule is exactly how the estimate and the partition check came to
+        # disagree about the same value.
+        from slurmate.builder import _time_is_unbounded
+
+        for value in ("UNLIMITED", "0", "inf", "notatime", "", "01:00:00"):
+            assert _time_is_unbounded(value) is su.time_request_is_unbounded(value)
+
+    @pytest.mark.parametrize("value", ["UNLIMITED", "0"])
+    def test_unbounded_exceeds_a_finite_partition_limit(self, value):
+        issues = su.validate_job_config({
+            "time_limit": value, "cpus": 1,
+            "_partition_obj": {
+                "name": "p", "timelimit": "02:00:00", "nodes": 4, "nodes_up": 4,
+                "cpus_per_node": 32, "mem_per_node_mb": 64000, "gpu_types": [],
+            },
+        })
+        msgs = [m for _lvl, m in issues if "Time limit" in m]
+        assert msgs, "an unbounded request was affirmed against a 2h partition"
+        assert value in msgs[0] and "02:00:00" in msgs[0]
+
+    def test_unbounded_is_fine_on_an_unbounded_partition(self):
+        # inf vs inf: nothing to warn about, and comparing against inf must not
+        # produce a warning by accident.
+        issues = su.validate_job_config({
+            "time_limit": "UNLIMITED", "cpus": 1,
+            "_partition_obj": {
+                "name": "p", "timelimit": "infinite", "nodes": 4, "nodes_up": 4,
+                "cpus_per_node": 32, "mem_per_node_mb": 64000, "gpu_types": [],
+            },
+        })
+        assert not [m for _lvl, m in issues if "Time limit" in m]
+
+    def test_a_bounded_request_within_the_limit_still_passes(self):
+        issues = su.validate_job_config({
+            "time_limit": "01:00:00", "cpus": 1,
+            "_partition_obj": {
+                "name": "p", "timelimit": "02:00:00", "nodes": 4, "nodes_up": 4,
+                "cpus_per_node": 32, "mem_per_node_mb": 64000, "gpu_types": [],
+            },
+        })
+        assert not [m for _lvl, m in issues if "Time limit" in m]
+
+    def test_the_estimate_says_unbounded_rather_than_a_number(self):
+        from slurmate.builder import UNBOUNDED_ESTIMATE, estimate_su
+
+        assert estimate_su(48, "UNLIMITED", 1) == UNBOUNDED_ESTIMATE
+
+
+class TestMemoryUnitSuffix:
+    """`16GB` is the most natural way to write memory, and slurmate refused it —
+    another false refusal of something sbatch takes. Measured against a live
+    client: `16KB`/`16MB`/`16GB`/`16TB` all parse in any case, while `16B` (no
+    unit) and `16GiB` both get "Invalid --mem specification". So the rule is a
+    trailing `B` *after* a K/M/G/T unit, not "any memory-looking word".
+    """
+
+    @pytest.mark.parametrize("value,emitted", [
+        ("16GB", "16G"), ("16gb", "16G"), ("16Gb", "16G"),
+        ("16KB", "16K"), ("16MB", "16M"), ("16TB", "16T"),
+        ("0GB", "0"),
+        # The B must not defeat the fractional conversion sbatch needs.
+        ("1.5GB", "1536M"), ("1.5gb", "1536M"), ("0.5TB", "524288M"),
+    ])
+    def test_accepted_and_normalised(self, value, emitted):
+        assert su.validate_memory(value) is True, value
+        assert su.normalize_memory(value) == emitted
+
+    @pytest.mark.parametrize("value", ["16B", "16GiB", "16XB", "16P", "GB", "B"])
+    def test_still_rejected(self, value):
+        # sbatch rejects each of these, so accepting them would trade one false
+        # refusal for a script that dies at submit.
+        assert su.validate_memory(value) is False, value
+
+    def test_a_fractional_suffix_is_not_read_as_zero(self):
+        # The regression this class caught while being written: the fractional
+        # branch handed the *raw* string to the MB parser, which does not read a
+        # trailing B, so "1.5GB" came back 0 — and "--mem=0M" means *all* the
+        # node's memory to Slurm. A 1.5 GiB request becoming "the whole node" is
+        # the worst possible direction for a normalisation bug.
+        assert su.normalize_memory("1.5GB") == "1536M"
+        assert su.normalize_memory("1.5GB") != "0M"
+
+    @pytest.mark.parametrize("suffix", ["N", "C"])
+    def test_the_slurm_per_node_per_cpu_suffix_still_works(self, suffix):
+        assert su.normalize_memory(f"1.5G{suffix}") == "1536M"
+        assert su.normalize_memory(f"16G{suffix}") == "16G"
+
+    def test_it_reaches_both_memory_flags(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1"}
+        for flag, expected in (("--memory", "#SBATCH --mem=16G"),
+                               ("--mem-per-cpu", "#SBATCH --mem-per-cpu=2G")):
+            value = "16GB" if flag == "--memory" else "2GB"
+            done = subprocess.run(
+                [sys.executable, "-m", "slurmate", "--print", "--force",
+                 "--job-name", "x", "--partition", "cpu-shared", "--cpus", "2",
+                 "--time", "00:05:00", "--command", "echo hi", flag, value],
+                capture_output=True, text=True, timeout=180, env=env,
+            )
+            assert done.returncode == 0, done.stderr
+            assert expected in done.stdout, (flag, done.stdout)
+
+
+class TestArraySpecCalibrationHolds:
+    """A re-measurement of `validate_array_spec` against a live controller, since
+    the same "it was measured" claim on the memory validator still had a hole.
+
+    Every case below was re-run through `sbatch --test-only` with an account and
+    partition that actually validate — the first attempt used a combination whose
+    site plugin rejects on *account* before Slurm ever looks at the array, so
+    every spec came back "accepted" and the whole comparison was meaningless.
+    """
+
+    # Confirmed accepted by sbatch.
+    ACCEPTED = ["5", "1-10", "0-9", "1,3,5", "1-10:2", "1-10%4", "1-5,10", "%4",
+                "1-10:2%3", "0", "1,2-4:2", "1-10%0"]
+    # Confirmed rejected by sbatch ("Invalid job array specification").
+    REJECTED = ["10-1", "1-10:0", "1-", "-5", "a-b", "1--5"]
+
+    @pytest.mark.parametrize("spec", ACCEPTED)
+    def test_slurm_accepts_so_slurmate_must(self, spec):
+        assert su.validate_array_spec(spec) is True, spec
+
+    @pytest.mark.parametrize("spec", REJECTED)
+    def test_slurm_rejects_so_slurmate_does(self, spec):
+        assert su.validate_array_spec(spec) is False, spec
+
+
+class TestTrailingPercentIsRefusedTruthfully:
+    """The one divergence from sbatch, and it is deliberate: `1-10%` *is* accepted
+    by sbatch, which silently drops the throttle and runs the array unthrottled.
+    A `%` with no number is a lost digit, so refusing it catches a real mistake —
+    but the message must not call it "invalid", because that is a false statement
+    about what the scheduler would do.
+    """
+
+    @pytest.mark.parametrize("spec", ["1-10%", "1-3%", "5%", "1,3,5%"])
+    def test_still_refused(self, spec):
+        assert su.validate_array_spec(spec) is False
+
+    @pytest.mark.parametrize("spec", ["1-10%", "1-3%"])
+    def test_the_reason_is_the_real_one(self, spec):
+        reason = su.array_spec_reason(spec)
+        assert "no number" in reason
+        assert "Slurm accepts this" in reason, (
+            "the message claimed the scheduler rejects it, which it does not"
+        )
+        assert "invalid" not in reason.lower()
+        # It names the fix with the user's own range filled in.
+        assert "%4" in reason
+
+    @pytest.mark.parametrize("spec", ["10-1", "a-b", "1-10:0", "1--5"])
+    def test_genuinely_invalid_specs_still_say_invalid(self, spec):
+        reason = su.array_spec_reason(spec)
+        assert reason.startswith("Invalid array specification")
+
+    def test_a_valid_spec_has_no_reason(self):
+        for spec in ("1-10", "1-10%4", "%4", ""):
+            assert su.array_spec_reason(spec) == ""
+
+    def test_it_reaches_the_cli(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "cpu-shared", "--cpus", "1",
+             "--memory", "1G", "--time", "00:05:00", "--array", "1-10%",
+             "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert done.returncode == 1
+        assert "no number" in done.stderr
+
+
+class TestSavedScriptIsPrivate:
+    """SM-26: the saved script copy was created by `open(path, "w")`, so its mode
+    was whatever the umask gave — 0002 on both clusters measured, i.e.
+    `-rw-rw-r--`. That is a real disclosure here rather than a theoretical one:
+    `/project/rcc` and the user's directory under it are both `o+x`, so a
+    world-readable file at a known path is readable cluster-wide.
+
+    The content is the *exact submitted script*, so by construction it holds
+    whatever went into `--command`.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _umask(self):
+        # The permissive umask that produced the finding. Restored afterwards, or
+        # every later test in the process inherits it.
+        old = os.umask(0o002)
+        yield
+        os.umask(old)
+
+    def test_the_post_submit_copy_is_600(self, tmp_path, monkeypatch):
+        from slurmate.main import _save_submitted_script
+
+        monkeypatch.chdir(tmp_path)
+        path = _save_submitted_script("#!/bin/bash\necho SECRET=x\n", "s", "999")
+        assert path is not None
+        assert os.stat(path).st_mode & 0o777 == 0o600, oct(
+            os.stat(path).st_mode & 0o777
+        )
+
+    def test_a_fresh_file_is_600_under_a_permissive_umask(self, tmp_path):
+        target = tmp_path / "fresh.sh"
+        su.write_private_text(str(target), "#!/bin/bash\n")
+        assert target.stat().st_mode & 0o777 == 0o600
+
+    def test_an_existing_shared_file_keeps_its_mode(self, tmp_path):
+        # The mode applies at creation only. Overwriting a file the user made
+        # deliberately shareable must not silently re-close it.
+        target = tmp_path / "shared.sh"
+        target.write_text("old")
+        target.chmod(0o644)
+        su.write_private_text(str(target), "#!/bin/bash\nnew\n")
+        assert target.stat().st_mode & 0o777 == 0o644
+        assert target.read_text() == "#!/bin/bash\nnew\n"
+
+    def test_content_survives_a_non_utf8_command(self, tmp_path):
+        # surrogateescape, for the same reason the plain open() used it: under a
+        # non-UTF-8 locale a UTF-8 --command arrives as lone surrogates.
+        target = tmp_path / "s.sh"
+        su.write_private_text(str(target), "echo \udcff\n")
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert target.read_bytes().endswith(b"\n")
+
+    def test_the_wizard_save_is_also_private(self, mocker, tmp_path, monkeypatch):
+        # The site the report did not name: the wizard's "Save script to a file"
+        # writes the same content to a user-chosen path.
+        import questionary
+
+        from slurmate.main import _save_script
+
+        target = tmp_path / "job.sh"
+        mocker.patch.object(
+            questionary, "text",
+            return_value=mocker.Mock(ask=lambda: str(target)),
+        )
+        monkeypatch.chdir(tmp_path)
+        _save_script("#!/bin/bash\necho SECRET=x\n", "job.sh")
+        assert target.stat().st_mode & 0o777 == 0o600
+
+
+class TestEditorTempFileIsCleanedUp:
+    """The report's own correction said the editor temp file "does leak a file
+    into /tmp permanently". It does not, in this tree: `_edit_script_in_editor`
+    unlinks it in a `finally`, so it survives neither the happy path nor an
+    editor that fails to exec. Pinned so that stays true.
+    """
+
+    def test_the_temp_file_is_removed(self, mocker, tmp_path):
+        from slurmate.main import _edit_script_in_editor
+
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["path"] = argv[-1]
+            assert os.path.exists(seen["path"])
+            return mocker.Mock(returncode=0)
+
+        mocker.patch("subprocess.run", side_effect=fake_run)
+        mocker.patch.dict(os.environ, {"EDITOR": "true"}, clear=False)
+        _edit_script_in_editor("#!/bin/bash\necho hi\n")
+        assert not os.path.exists(seen["path"]), "the temp script outlived the edit"
+
+    def test_it_is_removed_even_when_the_editor_cannot_exec(self, mocker):
+        from slurmate.main import _edit_script_in_editor
+
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["path"] = argv[-1]
+            raise OSError("no such editor")
+
+        mocker.patch("subprocess.run", side_effect=fake_run)
+        mocker.patch.dict(os.environ, {"EDITOR": "nope"}, clear=False)
+        _edit_script_in_editor("#!/bin/bash\necho hi\n")
+        assert not os.path.exists(seen["path"])
+
+
+class TestManagedFlagAdviceIsActionable:
+    """SM-15 refuses a `--custom-sbatch` that duplicates a directive slurmate
+    owns, and names the flag to use instead. SM-25 then made Slurm's own
+    spellings first-class (`--cpus-per-task`, `--gres`, `--gpus-per-node/task`) —
+    and left this mapping pointing at a *different* flag than the one the user
+    typed. For `--gres` that also lost information, since `--gres gpu:a100:2`
+    carries a type a bare `--gpus` does not.
+
+    The guard that matters is the first test: advice naming a flag the CLI does
+    not accept is worse than no advice.
+    """
+
+    def test_every_owner_is_a_flag_the_cli_accepts(self):
+        from slurmate.builder import _MANAGED_CUSTOM_FLAGS
+
+        for owner in sorted(set(_MANAGED_CUSTOM_FLAGS.values())):
+            done = subprocess.run(
+                [sys.executable, "-m", "slurmate", "--print", "--force",
+                 "--job-name", "x", "--partition", "cpu-shared",
+                 "--time", "00:05:00", "--command", "echo hi",
+                 owner, "gpu:1" if owner == "--gres" else "1"],
+                capture_output=True, text=True, timeout=180,
+                env={**os.environ, "PYTHONPATH": os.path.abspath("src"),
+                     "SLURMATE_MOCK": "1", "NO_COLOR": "1"},
+            )
+            assert "unrecognized argument" not in done.stderr, (
+                f"the managed-flag message sends users to {owner}, which the CLI "
+                f"does not accept"
+            )
+            assert "ambiguous option" not in done.stderr, owner
+
+    @pytest.mark.parametrize("spec,flag", [
+        ("--gres=gpu:2", "--gres"),
+        ("--cpus-per-task=8", "--cpus-per-task"),
+        ("--partition=gpu-shared", "--partition"),
+        ("--gpus-per-node=2", "--gpus-per-node"),
+    ])
+    def test_a_self_owned_flag_says_pass_it_as_an_option(self, spec, flag):
+        done = self._run(spec)
+        assert done.returncode == 1
+        assert f"Pass {flag} as a slurmate option" in done.stderr, done.stderr
+        assert f"Use {flag} instead" not in done.stderr, "tautological advice"
+
+    def test_a_short_form_still_names_the_long_flag(self):
+        done = self._run("-p=gpu-shared")
+        assert done.returncode == 1
+        assert "Use --partition instead" in done.stderr
+
+    def test_a_reconciled_flag_is_still_allowed(self):
+        # --mem is reconciled, not refused: slurmate suppresses its own directive
+        # and the summary shows the custom value.
+        done = self._run("--mem=99G")
+        assert done.returncode == 0
+        assert "#SBATCH --mem=99G" in done.stdout
+        mem_lines = [ln for ln in done.stdout.splitlines()
+                     if ln.startswith("#SBATCH --mem")]
+        assert mem_lines == ["#SBATCH --mem=99G"], mem_lines
+
+    def _run(self, custom):
+        return subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "gpu-shared", "--cpus", "1",
+             "--memory", "1G", "--time", "00:05:00",
+             f"--custom-sbatch={custom}", "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180,
+            env={**os.environ, "PYTHONPATH": os.path.abspath("src"),
+                 "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"},
+        )
+
+
+class TestHeterogeneousPartitionUsesLargestNode:
+    """SM-27: `sinfo`'s aggregate row reports a heterogeneous partition's
+    *smallest* node and marks it `+` ("at least this much"). Treating that as the
+    partition limit turns a floor into a ceiling, so a request that fits a larger
+    node is warned about — 38 of 84 partitions on midway2 emit the `+`, and 20 of
+    87 on midway3, where `test` advertises a floor while its nodes reach 256 cores
+    and 2321910 MB.
+
+    Invisible on a homogeneous cluster, which is why it survived.
+    """
+
+    AGG = "roux|infinite|2|up|16+|20044+|(null)|idle"
+    NODES = "16|20044\n24|64000\n"
+
+    def _parts(self, mocker, node_rows=NODES, node_rc=0):
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_force_mock", return_value=False)
+
+        def run(cmd, timeout=30, **kw):
+            if "-N" in cmd:
+                return node_rows, "", node_rc
+            return self.AGG + "\n", "", 0
+
+        mocker.patch.object(su, "_run_command", side_effect=run)
+        return su.fetch_partitions()
+
+    def test_the_aggregate_row_is_recorded_as_a_floor(self, mocker):
+        part = self._parts(mocker)[0]
+        assert part["cpus_per_node"] == 16
+        assert part["mem_per_node_mb"] == 20044
+        assert part["heterogeneous"] is True
+
+    def test_the_per_node_query_finds_the_maxima(self, mocker):
+        self._parts(mocker)
+        assert su.fetch_partition_node_maxima("roux") == (24, 64000)
+
+    def test_capacity_prefers_the_largest_node(self, mocker):
+        from slurmate.main import _get_partition
+
+        part = _get_partition(self._parts(mocker), "roux")
+        assert su.partition_capacity(part, "cpus") == (24, True)
+        assert su.partition_capacity(part, "mem") == (64000, True)
+
+    @pytest.mark.parametrize("answers", [
+        {"cpus": 24},                      # fits the 24-core node
+        {"memory": "60G"},                 # 61440 MB fits the 64000 MB node
+        {"memory": "30G"},
+        {"cpus": 16, "memory": "20G"},
+    ])
+    def test_a_request_that_fits_a_larger_node_is_not_warned_about(
+        self, mocker, answers
+    ):
+        from slurmate.main import _get_partition
+
+        part = _get_partition(self._parts(mocker), "roux")
+        issues = su.validate_job_config({**answers, "_partition_obj": part})
+        offending = [m for _l, m in issues if "exceeds" in m]
+        assert offending == [], offending
+
+    @pytest.mark.parametrize("answers,word", [
+        ({"cpus": 32}, "CPUs"),
+        ({"memory": "70G"}, "Memory"),
+    ])
+    def test_a_genuine_over_request_is_a_definite_ceiling(
+        self, mocker, answers, word
+    ):
+        from slurmate.main import _get_partition
+
+        part = _get_partition(self._parts(mocker), "roux")
+        issues = su.validate_job_config({**answers, "_partition_obj": part})
+        msgs = [m for _l, m in issues if word in m and "exceeds" in m]
+        assert msgs, issues
+        # The figure is now the largest node, so the claim is a real ceiling.
+        assert "largest node" in msgs[0]
+        assert "nodes differ" not in msgs[0]
+
+    def test_an_unreadable_per_node_query_keeps_the_honest_floor_wording(self, mocker):
+        # The fail-safe shape: an unknown must not turn the floor into a ceiling,
+        # and must not silence the check either.
+        from slurmate.main import _get_partition
+
+        part = _get_partition(self._parts(mocker, node_rows="", node_rc=1), "roux")
+        assert "max_cpus_per_node" not in part
+        assert su.partition_capacity(part, "cpus") == (16, False)
+        issues = su.validate_job_config({"cpus": 24, "_partition_obj": part})
+        msgs = [m for _l, m in issues if "exceeds" in m]
+        assert msgs and "smallest node" in msgs[0] and "nodes differ" in msgs[0]
+
+    def test_a_homogeneous_partition_makes_no_extra_call(self, mocker):
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_force_mock", return_value=False)
+        calls = []
+
+        def run(cmd, timeout=30, **kw):
+            calls.append(cmd)
+            return "flat|infinite|2|up|16|20044|(null)|idle\n", "", 0
+
+        mocker.patch.object(su, "_run_command", side_effect=run)
+        from slurmate.main import _get_partition
+
+        part = _get_partition(su.fetch_partitions(), "flat")
+        assert part.get("heterogeneous") is not True
+        assert not any("-N" in c for c in calls), (
+            "a homogeneous site should pay nothing for this"
+        )
+
+
+class TestCapacityRefusalUsesTheExactMaximum:
+    """The other consumer of the figure SM-27 fixed. `capacity_refusal` skipped
+    cpu/memory entirely on a mixed partition — correctly, while the only number
+    available was `sinfo`'s floor, since refusing against a floor would claim
+    "never" for a request a larger node takes.
+
+    The per-node lookup removes that limitation where it has run, and leaving the
+    skip in place produced a plain asymmetry: a 999-core request was refused on a
+    homogeneous partition and passed in silence on a mixed one whose true maximum
+    slurmate had already resolved.
+    """
+
+    EXACT = {
+        "name": "roux", "nodes": 2, "nodes_up": 2, "cpus_per_node": 16,
+        "mem_per_node_mb": 20044, "gpu_types": [], "timelimit": "infinite",
+        "heterogeneous": True, "max_cpus_per_node": 24,
+        "max_mem_per_node_mb": 64000,
+    }
+    UNRESOLVED = {k: v for k, v in EXACT.items() if not k.startswith("max_")}
+    FLAT = {k: v for k, v in UNRESOLVED.items() if k != "heterogeneous"}
+
+    @pytest.mark.parametrize("answers,fragment", [
+        ({"cpus": 999}, "999 cores"),
+        ({"cpus": 1, "memory": "999G"}, "1022976 MB"),
+    ])
+    def test_an_impossible_request_is_refused_on_a_mixed_partition(
+        self, answers, fragment
+    ):
+        reason = su.capacity_refusal(self.EXACT, answers)
+        assert fragment in reason, reason
+
+    @pytest.mark.parametrize("answers", [
+        {"cpus": 24},                 # exactly the largest node
+        {"cpus": 1, "memory": "60G"},  # 61440 MB, fits the 64000 MB node
+        {"cpus": 16},
+    ])
+    def test_a_fitting_request_is_not_refused(self, answers):
+        assert su.capacity_refusal(self.EXACT, answers) == ""
+
+    @pytest.mark.parametrize("answers", [{"cpus": 999}, {"memory": "999G"}])
+    def test_an_unresolved_mixed_partition_keeps_its_silence(self, answers):
+        # The fail-safe half: with only a floor to go on, refusing would claim
+        # "never" for a request a larger node might take.
+        assert su.capacity_refusal(self.UNRESOLVED, answers) == ""
+
+    def test_a_homogeneous_partition_is_unchanged(self):
+        assert "999 cores" in su.capacity_refusal(self.FLAT, {"cpus": 999})
+        assert su.capacity_refusal(self.FLAT, {"cpus": 8}) == ""
+
+    def test_it_stays_pure(self, mocker):
+        # Documented contract: the ETA path consults this for free, so it must not
+        # acquire a subprocess call by reading the maxima.
+        run = mocker.patch.object(su, "_run_command")
+        su.capacity_refusal(self.EXACT, {"cpus": 999})
+        run.assert_not_called()
+
+    def test_the_eta_reports_never_with_the_real_reason(self, mocker):
+        # End to end through the tier that consumes it: tier 1 silent (controller
+        # unreachable), so the capacity verdict decides.
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_force_mock", return_value=False)
+
+        def run(cmd, timeout=30, **kw):
+            if "sbatch" in cmd:
+                return "", "sbatch: error: Unable to contact slurm controller\n", 1
+            if "squeue" in cmd:
+                return "", "", 0
+            if "-N" in cmd:
+                return "16|20044\n24|64000\n", "", 0
+            return "roux|infinite|2|up|16+|20044+|(null)|idle\n", "", 0
+
+        mocker.patch.object(su, "_run_command", side_effect=run)
+        info = su.fetch_queue_eta("roux", req_nodes=1, cpus=999)
+        # fetch_queue_eta does not consult capacity_refusal itself; the caller
+        # does. What matters here is that tier 1 stayed silent so the caller's
+        # verdict is the one that shows.
+        assert info["source"] != "scheduler" or info["feasible"] is True
+
+
+class TestQosWallLimitIsLeftToTheScheduler:
+    """SM-28 asked for the QoS `MaxWall` to be compared locally. I implemented
+    that, and measurement showed it produced a **false warning** on midway3, so it
+    is reverted — recorded here because the reasoning is the point.
+
+    Whether exceeding a QoS `MaxWall` is refused *at submit* depends on the QoS's
+    `DenyOnLimit` flag. No QoS on midway3 sets it, and there
+    `--qos=build --time=30-00:00:00` against `MaxWall=06:00:00` is reported
+    `***PASSED***` by sbatch. So `sacctmgr`'s MaxWall is not a cluster-invariant
+    ceiling, and comparing against it warns about a limit the scheduler does not
+    enforce. On the reporting cluster it *is* enforced, and sbatch says so —
+    which is the authoritative, per-site answer slurmate already consults on every
+    path.
+    """
+
+    PART_INF = {
+        "name": "build", "nodes": 4, "nodes_up": 4, "cpus_per_node": 32,
+        "mem_per_node_mb": 64000, "gpu_types": [], "timelimit": "infinite",
+    }
+    PART_2H = {**PART_INF, "timelimit": "02:00:00"}
+
+    def _time_msgs(self, answers):
+        issues = su.validate_job_config(answers)
+        return [m for _lvl, m in issues if "Time limit" in m]
+
+    @pytest.mark.parametrize("requested", ["07:00:00", "24:00:00", "7-00:00:00"])
+    def test_no_local_maxwall_claim_is_made(self, requested):
+        # The guard against re-introducing the false warning: an unbounded
+        # partition plus an explicit --qos must produce nothing, however large the
+        # request, because only the scheduler knows whether this site enforces it.
+        assert self._time_msgs({
+            "time_limit": requested, "cpus": 1, "qos": "build",
+            "_partition_obj": self.PART_INF,
+        }) == []
+
+    def test_no_qos_lookup_is_attempted(self, mocker):
+        # And it must not even ask: a sacctmgr call whose answer cannot be used is
+        # latency for nothing.
+        run = mocker.patch.object(su, "_run_command")
+        self._time_msgs({
+            "time_limit": "7-00:00:00", "cpus": 1, "qos": "build",
+            "_partition_obj": self.PART_INF,
+        })
+        for call in run.call_args_list:
+            assert "sacctmgr" not in str(call), call
+
+    def test_the_partition_limit_check_is_untouched(self):
+        msgs = self._time_msgs({
+            "time_limit": "04:00:00", "cpus": 1, "_partition_obj": self.PART_2H,
+        })
+        assert msgs and "partition limit (02:00:00)" in msgs[0]
+
+    @pytest.mark.parametrize("spelling", ["0", "00:00:00", "UNLIMITED"])
+    def test_unbounded_still_warns_against_a_finite_partition(self, spelling):
+        # This half of SM-28 item 4 stands: it is a partition comparison, and a
+        # partition MaxTime *is* enforced at submit.
+        msgs = self._time_msgs({
+            "time_limit": spelling, "cpus": 1, "_partition_obj": self.PART_2H,
+        })
+        assert msgs, f"{spelling} passed against a 2h partition"
+
+
+class TestPerJobLimitsAreRequestFacts:
+    """The scheduler's own verdict is what slurmate acts on, so its limit tokens
+    have to be classified correctly. Slurm splits on one word: a `...PerJob` limit
+    is a statement about the *request* — no waiting makes a 7-day job fit a 6-hour
+    MaxWall — while `...PerUser`/`...PerAccount` count limits are about the moment
+    and clear when something finishes.
+
+    Before this, every per-job limit landed in the honest-but-vague "cannot tell"
+    bucket, so a site that genuinely refuses the job said so only advisorily.
+    """
+
+    @pytest.mark.parametrize("token", [
+        "QOSMaxWallDurationPerJobLimit",
+        "QOSMaxCpuPerJobLimit",
+        "QOSMaxNodePerJobLimit",
+        "AssocMaxWallDurationPerJobLimit",
+        "QOSMaxMemoryPerJobLimit",
+    ])
+    def test_a_per_job_limit_is_permanent(self, token):
+        out = (f"sbatch: error: {token}\n"
+               "allocation failure: Job violates accounting/QOS policy "
+               "(job submit limit, user's size and/or time limits)")
+        _eta, reason = su._read_test_only_output("", out, 1)
+        assert su.refusal_is_permanent(reason) is True, reason
+        assert su.refusal_is_transient(reason) is False
+
+    @pytest.mark.parametrize("token", [
+        "QOSMaxSubmitJobPerUserLimit",
+        "AssocMaxSubmitJobLimit",
+    ])
+    def test_a_submit_count_limit_stays_transient(self, token):
+        out = (f"sbatch: error: {token}\n"
+               "allocation failure: Job violates accounting/QOS policy (...)")
+        _eta, reason = su._read_test_only_output("", out, 1)
+        assert su.refusal_is_transient(reason) is True, reason
+        assert su.refusal_is_permanent(reason) is False
+
+    def test_the_rule_does_not_fire_on_unrelated_prose(self):
+        assert su.refusal_is_permanent("a job limit was mentioned in passing") is False
+        assert su.refusal_is_permanent("perjob") is False
+
+
+class TestMemoryZeroIsAlreadyExpressible:
+    """SM-28 item 3 reported `--memory 0` as refused. It is not, in this tree —
+    `validate_memory` was changed deliberately to accept every zero spelling,
+    because `--mem=0` is Slurm's documented way to ask for all the memory on a
+    node and refusing it left that request unexpressible. Pinned so it stays
+    reachable."""
+
+    @pytest.mark.parametrize("value", ["0", "0G", "0M", "0K", "0T", "0GB"])
+    def test_memory_zero_is_accepted_and_labelled(self, value):
+        assert su.validate_memory(value) is True
+        # Normalised to the documented bare form, not "0M", which reads like a
+        # request for nothing.
+        assert su.normalize_memory(value) == "0"
+
+    def test_it_reaches_the_script(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "cpu-shared", "--cpus", "1",
+             "--memory", "0", "--time", "00:05:00", "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert done.returncode == 0, done.stderr
+        assert "#SBATCH --mem=0" in done.stdout
+
+
+class TestArrayCostIsTheArrayCost:
+    """The cost estimate ignored the array entirely, so `--array 1-1000` reported
+    the same `2.0` CPU-hours as a single job — a thousandfold understatement of
+    the one figure a user checks before submitting something expensive, and in the
+    direction that matters, because it says an enormous job is cheap.
+
+    Same family as `--time=0` reporting 96 core-hours for something unbounded: a
+    confident number that is wrong.
+    """
+
+    @pytest.mark.parametrize("spec,count", [
+        ("1-10", 10), ("1-1000", 1000), ("0-9", 10), ("5", 1),
+        ("1,3,5", 3), ("1-5,10", 6),
+        ("1-10:2", 5),      # 1,3,5,7,9
+        ("1-10:3", 4),      # 1,4,7,10
+        ("1-1000%4", 1000),  # the throttle caps concurrency, not the count
+        ("1-10:2%3", 5),
+    ])
+    def test_the_task_count(self, spec, count):
+        assert su.array_task_count(spec) == count
+
+    @pytest.mark.parametrize("spec", ["", "   ", "%4", "10-1", "a-b", "1-10:0"])
+    def test_unknowable_counts_return_none(self, spec):
+        # A bare "%N" carries no indices, and an invalid spec is not a count of 1.
+        assert su.array_task_count(spec) is None
+
+    def test_the_estimate_multiplies(self):
+        from slurmate.builder import estimate_su
+
+        single = estimate_su(2, "01:00:00", 1, None)
+        assert single == "2.0"
+        arrayed = estimate_su(2, "01:00:00", 1, None, 1000)
+        assert arrayed.startswith("2,000") or arrayed.startswith("2000"), arrayed
+        # The per-task figure stays visible, so the multiplication is checkable.
+        assert "1000 tasks" in arrayed and "2.0" in arrayed
+
+    def test_a_single_task_array_adds_no_noise(self):
+        from slurmate.builder import estimate_su
+
+        assert estimate_su(2, "01:00:00", 1, None, 1) == "2.0"
+        assert estimate_su(2, "01:00:00", 1, None, None) == "2.0"
+
+    def test_gpu_hours_multiply_too(self):
+        from slurmate.builder import estimate_gpu_hours
+
+        one = estimate_gpu_hours(2, "02:00:00", 1, "gres_type", None)
+        many = estimate_gpu_hours(2, "02:00:00", 1, "gres_type", None, 50)
+        assert one == "4.0"
+        assert many.startswith("200") and "50 tasks" in many
+
+    def test_an_unbounded_array_still_says_unbounded(self):
+        # Multiplying "unbounded" by 1000 is not a number; the label must survive.
+        from slurmate.builder import UNBOUNDED_ESTIMATE, estimate_su
+
+        assert estimate_su(2, "0", 1, None, 1000) == UNBOUNDED_ESTIMATE
+
+    @pytest.mark.parametrize("spec,expected", [
+        ("1-10", "10 tasks"),
+        ("1-1000", "1000 tasks"),
+        ("1-1000%4", "1000 tasks"),
+    ])
+    def test_it_reaches_the_summary(self, spec, expected):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "240"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--dry-run", "--force",
+             "--job-name", "x", "--partition", "cpu-shared", "--cpus", "2",
+             "--memory", "1G", "--time", "01:00:00", "--array", spec,
+             "--command", "true"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert expected in done.stdout, done.stdout[-500:]
+
+    def test_a_non_array_summary_is_unchanged(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "240"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--dry-run", "--force",
+             "--job-name", "x", "--partition", "cpu-shared", "--cpus", "2",
+             "--memory", "1G", "--time", "01:00:00", "--command", "true"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert "tasks ×" not in done.stdout
+
+
+class TestCustomNtasksIsCosted:
+    """Round 78 audited the cost estimates and found them exact in every case it
+    covered. Two cases it did not cover were wrong: the array multiplier (fixed
+    separately) and this one.
+
+    slurmate has no `--ntasks` option, so `--custom-sbatch=--ntasks=N` is the
+    *only* way to express an MPI job with it — a likely path, not an exotic one —
+    and the estimate ignored it, reporting 2.0 core-hours for a job asking for 200
+    cores.
+    """
+
+    @pytest.mark.parametrize("custom,total", [
+        ("--ntasks=100", 100),
+        ("-n 100", 100),
+        ("--ntasks 8", 8),
+        ("--ntasks=1", 1),
+        # Last occurrence wins, as Slurm does and as _custom_mem_override does.
+        ("--ntasks=4 --ntasks=9", 9),
+    ])
+    def test_the_total_is_read(self, custom, total):
+        from slurmate.builder import custom_ntasks
+
+        assert custom_ntasks(custom) == total
+
+    @pytest.mark.parametrize("custom", [
+        None, "", "--exclusive", "--ntasks=0", "--ntasks=-3", "--ntasks=abc",
+        "--ntasks-per-socket=8",   # a different flag that merely starts the same
+    ])
+    def test_nothing_is_read_when_there_is_nothing(self, custom):
+        from slurmate.builder import custom_ntasks
+
+        assert custom_ntasks(custom) is None
+
+    def test_the_estimate_uses_it(self):
+        from slurmate.builder import estimate_su
+
+        # 2 cpus/task × 100 tasks × 1 h
+        assert estimate_su(2, "01:00:00", 1, None, None, 100) == "200"
+
+    def test_a_total_replaces_rather_than_multiplies_per_node(self):
+        # --ntasks is job-wide, so it must not be multiplied by --nodes as well.
+        from slurmate.builder import estimate_su
+
+        assert estimate_su(2, "01:00:00", 4, None, None, 100) == "200"
+
+    def test_the_larger_task_count_wins(self):
+        # --ntasks-per-node is a per-node cap, not a total, so the two can
+        # disagree; the number Slurm will actually run is the larger.
+        from slurmate.builder import estimate_su
+
+        # 4 nodes x 8 per node = 32 tasks beats a stated total of 10.
+        assert estimate_su(1, "01:00:00", 4, 8, None, 10) == "32.0"
+        # and a stated total of 100 beats 4 x 8.
+        assert estimate_su(1, "01:00:00", 4, 8, None, 100) == "100"
+
+    def test_gpus_per_task_tracks_the_total(self):
+        from slurmate.builder import estimate_gpu_hours
+
+        assert estimate_gpu_hours(2, "01:00:00", 1, "gpus_per_task", None, None,
+                                  50) == "100"
+        # A job-wide --gpus is not per task, so the total must not apply.
+        assert estimate_gpu_hours(2, "01:00:00", 1, "gpus", None, None, 50) == "2.0"
+
+    def test_round_78_s_table_still_holds(self):
+        # The audit that found no defect must keep finding none.
+        from slurmate.builder import estimate_gpu_hours, estimate_su
+
+        assert estimate_su(4, "01:00:00", 2, None) == "8.0"
+        assert estimate_su(2, "01:00:00", 3, 4) == "24.0"
+        assert estimate_su(28, "12:00:00", 1, None) == "336"
+        assert estimate_gpu_hours(2, "01:00:00", 3, "gres_type", None) == "6.0"
+        assert estimate_gpu_hours(2, "01:00:00", 3, "gpus", None) == "2.0"
+        assert estimate_gpu_hours(2, "01:00:00", 3, "gpus_per_node", None) == "6.0"
+        assert estimate_gpu_hours(2, "01:00:00", 3, "gpus_per_task", 4) == "24.0"
+
+    def test_it_reaches_the_summary(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "240"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--dry-run", "--force",
+             "--job-name", "x", "--partition", "cpu-shared", "--cpus", "2",
+             "--memory", "1G", "--time", "01:00:00",
+             "--custom-sbatch=--ntasks=100", "--command", "true"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert "200" in done.stdout, done.stdout[-400:]
+
+
+class TestSitePluginLoneMessageIsRead:
+    """Booth's Pythia rejects a batch job on its **default** partition with a lua
+    ``job_submit`` plugin, and its wording is not Slurm's ``Reason:`` convention:
+
+        sbatch: error: Job submission rejected: Batch jobs cannot use the
+                       `interactive_*` partitions.
+        allocation failure: Unspecified error
+
+    So the only half slurmate showed was ``Unspecified error`` — Slurm's
+    contentless catch-all — on the shipped-defaults path of that whole cluster,
+    while the sentence that says exactly what is wrong sat one line above it.
+    """
+
+    PYTHIA = (
+        "sbatch: error: Job submission rejected: Batch jobs cannot use the "
+        "`interactive_*` partitions.\nallocation failure: Unspecified error\n"
+    )
+
+    def test_the_plugins_sentence_is_shown(self):
+        from slurmate.system_utils import _test_only_refusal
+
+        got = _test_only_refusal(self.PYTHIA)
+        assert "Batch jobs cannot use" in got
+        # Slurm's own half is kept in parentheses, as for a Reason:-style plugin:
+        # it is the half the marker lists are written against.
+        assert "(Unspecified error)" in got
+
+    def test_a_reason_line_still_wins(self):
+        # midway3's plugin writes a six-line block ending in Reason:. That path
+        # must be untouched — and its banner lines must not become the reason.
+        from slurmate.system_utils import _test_only_refusal
+
+        midway3 = (
+            "sbatch: error: Verify job submission ...\n"
+            "sbatch: error: Partition: test\n"
+            "sbatch: error: Account: unknown\n"
+            "sbatch: error: Verification: ***REJECTED***\n"
+            "sbatch: error: Reason: Account is not specified\n"
+            "allocation failure: Access/permission denied\n"
+        )
+        assert _test_only_refusal(midway3) == (
+            "Account is not specified (Access/permission denied)"
+        )
+
+    def test_several_site_lines_claim_nothing_extra(self):
+        # With no Reason: and more than one candidate there is no way to tell
+        # which line is the verdict, so Slurm's own half stands alone.
+        from slurmate.system_utils import _test_only_refusal
+
+        out = (
+            "sbatch: error: Verify job submission ...\n"
+            "sbatch: error: Verification: ***REJECTED***\n"
+            "allocation failure: Access/permission denied\n"
+        )
+        assert _test_only_refusal(out) == "Access/permission denied"
+
+    def test_a_broken_sbatch_is_still_not_a_refusal(self):
+        # The invariant this fallback must not break: a non-zero exit with no
+        # `allocation failure:` verdict is not evidence about the job. sbatch
+        # prints `sbatch: error:` for an unreachable controller too.
+        from slurmate.system_utils import _test_only_refusal
+
+        assert _test_only_refusal(
+            "sbatch: error: Batch job submission failed: Unable to contact "
+            "slurm controller\n"
+        ) == ""
+        assert _test_only_refusal("sbatch: error: Account is not specified\n") == ""
+
+    def test_a_lone_limit_token_is_not_taken_as_the_sentence(self):
+        # Mercury's shape: the CamelCase limit name is appended in brackets by a
+        # separate step, so it must not also be consumed as the reason.
+        from slurmate.system_utils import _test_only_refusal
+
+        got = _test_only_refusal(
+            "sbatch: error: QOSMaxSubmitJobPerUserLimit\n"
+            "allocation failure: Job violates accounting/QOS policy\n"
+        )
+        assert got == (
+            "Job violates accounting/QOS policy [QOSMaxSubmitJobPerUserLimit]"
+        )
+
+    def test_the_verdict_is_not_guessed_permanent(self):
+        # Surfacing the sentence must not also promote it: no marker matches it,
+        # and guessing "permanent" is the direction that blocks runnable jobs.
+        from slurmate.system_utils import refusal_is_permanent, refusal_is_transient
+
+        got = "Batch jobs cannot use the `interactive_*` partitions. (Unspecified error)"
+        assert not refusal_is_permanent(got) and not refusal_is_transient(got)
+
+
+class TestSlurmShortFlagsAreAccepted:
+    """`-c` was the only Slurm short flag slurmate took, so `-p` and `-t` — the
+    two most-typed flags in Slurm — were argparse errors. Every probe written for
+    this round's cluster testing used them and every one failed before it ran.
+    """
+
+    def test_the_common_short_flags_parse(self):
+        from slurmate.main import parse_args
+
+        args = parse_args([
+            "-J", "j", "-A", "acct", "-p", "part", "-q", "qos", "-t", "01:00:00",
+            "-N", "2", "-c", "8", "-a", "1-4", "-C", "bigmem", "-G", "2",
+            "-o", "out/%j.log",
+        ])
+        assert args.job_name == "j" and args.account == "acct"
+        assert args.partition == "part" and args.qos == "qos"
+        assert args.time == "01:00:00" and args.nodes == 2 and args.cpus == 8
+        assert args.array == "1-4" and args.constraint == "bigmem"
+        assert args.gpus == 2 and args.output_file == "out/%j.log"
+
+    def test_every_short_flag_has_the_slurm_meaning(self):
+        # A short flag that means something *different* from Slurm's is worse than
+        # none: it silently misreads a copied command line.
+        from slurmate.main import parse_args
+
+        for flag, dest, value in (
+            ("-J", "job_name", "n"), ("-A", "account", "a"),
+            ("-p", "partition", "p"), ("-q", "qos", "q"),
+            ("-t", "time", "5"), ("-a", "array", "1-2"),
+            ("-C", "constraint", "f"), ("-o", "output_file", "f.out"),
+        ):
+            assert getattr(parse_args([flag, value]), dest) == value, flag
+
+    def test_short_and_long_agree(self):
+        from slurmate.main import parse_args
+
+        assert (parse_args(["-p", "x", "-t", "1:00"]).partition
+                == parse_args(["--partition", "x", "--time", "1:00"]).partition)
+
+    def test_ntasks_has_no_short_flag(self):
+        # Slurm's -n is --ntasks, which slurmate has no option for. Accepting it
+        # as anything else would be the misreading above; rejecting it is honest.
+        from slurmate.main import parse_args
+
+        with pytest.raises(SystemExit):
+            parse_args(["-n", "4"])
+
+
+class TestGpusFlagTakesSlurmSpelling:
+    """SM-25 again, in the one flag whose name matches the option it sets:
+    slurmate *prints* ``--gpus=a100:2`` under ``--gpu-format gpus`` and argparse
+    answered its own output with "invalid int value: 'a100:2'".
+    """
+
+    def test_a_typed_count_round_trips(self):
+        from slurmate.main import parse_args
+
+        args = parse_args(["--gpus", "a100:2"])
+        assert args.gpus == 2 and args.gpu_type == "a100"
+        # That rendering is the only one that produces this spelling, so typing it
+        # back must reproduce the script it came from.
+        assert args.gpu_format == "gpus"
+
+    def test_a_bare_count_keeps_the_default_format(self):
+        from slurmate.main import parse_args
+
+        args = parse_args(["--gpus", "4"])
+        assert args.gpus == 4 and args.gpu_type is None and args.gpu_format is None
+
+    def test_an_explicit_type_and_format_win(self):
+        from slurmate.main import parse_args
+
+        args = parse_args(["--gpus", "a100:2", "--gpu-type", "v100",
+                           "--gpu-format", "constraint"])
+        assert args.gpus == 2 and args.gpu_type == "v100"
+        assert args.gpu_format == "constraint"
+
+    def test_nonsense_is_still_refused(self):
+        from slurmate.main import parse_args
+
+        with pytest.raises(SystemExit):
+            parse_args(["--gpus", "lots"])
+
+    def test_the_emitted_directive_is_the_accepted_spelling(self):
+        # Generate, then feed the generated flag back in: the loop SM-25 is about.
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1"}
+        base = [sys.executable, "-m", "slurmate", "--print", "--force",
+                "--job-name", "x", "--partition", "gpu-shared",
+                "--time", "00:05:00", "--command", "true"]
+        first = subprocess.run(
+            base + ["--gpus", "2", "--gpu-type", "a100", "--gpu-format", "gpus"],
+            capture_output=True, text=True, env=env, timeout=180)
+        directive = next(
+            ln for ln in first.stdout.splitlines() if ln.startswith("#SBATCH --gpus=")
+        )
+        value = directive.split("=", 1)[1]
+        assert value == "a100:2"
+        again = subprocess.run(base + [f"--gpus={value}"],
+                               capture_output=True, text=True, env=env, timeout=180)
+        assert again.returncode == 0, again.stderr
+        assert first.stdout == again.stdout
+
+
+class TestConstraintFormatIsCheckedAgainstFeatures:
+    """The mirror of H2, wired end to end: on a cluster whose nodes advertise
+    typed GRES and no features, `--gpu-format constraint` emits a
+    `--constraint=<model>` Slurm rejects. Both Booth clusters are in that state
+    on every partition, and H2's own advice is what sends a user there.
+    """
+
+    def _run(self, *extra):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "200"}
+        return subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--job-name", "x",
+             "--partition", "gpu-shared", "--time", "00:05:00",
+             "--command", "true", *extra],
+            capture_output=True, text=True, env=env, timeout=180,
+        )
+
+    def test_the_lookup_runs_for_a_statically_known_model(self, mocker):
+        # The reason this needed wiring as well as a check: _partition_issues
+        # skipped the sinfo lookup whenever the model was already in the
+        # partition's static list — which is every typed-GRES model, i.e. exactly
+        # the ones this check is about.
+        from slurmate.main import _partition_issues
+
+        called = {}
+
+        def fake(part):
+            called["part"] = part
+            return {"typed": ["h100"], "feature": [], "constraint": []}
+
+        mocker.patch("slurmate.main.fetch_gpu_type_sources", side_effect=fake)
+        issues = _partition_issues({
+            "_partition_obj": {"name": "p", "gpu_types": ["h100"], "has_gpu": True,
+                               "cpus_per_node": 0, "mem_per_node_mb": 0,
+                               "timelimit": None},
+            "gpus": 1, "gpu_type": "h100", "gpu_format": "constraint",
+        })
+        assert called["part"] == "p"
+        assert any(lvl == "error" and "not a node feature" in m for lvl, m in issues)
+
+    def test_the_default_format_still_skips_the_lookup(self, mocker):
+        # The "avoid a needless sinfo call" property the original wiring had.
+        from slurmate.main import _partition_issues
+
+        spy = mocker.patch("slurmate.main.fetch_gpu_type_sources")
+        _partition_issues({
+            "_partition_obj": {"name": "p", "gpu_types": ["h100"], "has_gpu": True,
+                               "cpus_per_node": 0, "mem_per_node_mb": 0,
+                               "timelimit": None},
+            "gpus": 1, "gpu_type": "h100",
+        })
+        spy.assert_not_called()
+
+    def test_mock_mode_sees_no_mismatch(self):
+        # Demos and the rest of the suite use --gpu-format constraint freely; mock
+        # types stand in for features as well as GRES types.
+        done = self._run("--gpus", "1", "--gpu-type", "a100",
+                         "--gpu-format", "constraint")
+        assert done.returncode == 0, done.stderr
+        assert "--constraint=a100" in done.stdout
+
+
+class TestMemoryProvenanceNamesThePartition:
+    """The note exists to say where a number nobody typed came from, and on the
+    no---partition path — the default on every cluster tested — it said
+    "from '?' node memory".
+    """
+
+    def _run(self, *extra):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "200"}
+        return subprocess.run(
+            [sys.executable, "-m", "slurmate", "--dry-run", "--force",
+             "--job-name", "x", "--time", "00:05:00", "--command", "true", *extra],
+            capture_output=True, text=True, env=env, timeout=180,
+        )
+
+    def test_the_default_partition_is_named(self):
+        done = self._run()
+        assert "'?'" not in done.stdout
+        # The site default mock mode reports, which the summary also names two
+        # lines further down — the two must agree.
+        assert "from 'cpu-shared' node memory" in done.stdout
+
+    def test_an_explicit_partition_is_still_named(self):
+        done = self._run("--partition", "gpu-shared")
+        assert "from 'gpu-shared' node memory" in done.stdout
+
+
+class TestMockClusterHasTheShapeOfARealOne:
+    """`sinfo` marks exactly one partition with a trailing `*` on every cluster
+    there is; the fixture marked none. So the "no --partition given, fall back to
+    the site default" path — with its own queue-depth, ETA, limit and memory
+    consequences — could not be reached in mock mode, in `--demo`, or by any test.
+    """
+
+    def test_every_key_a_real_partition_has(self, mocker):
+        # Derive the real key set from fetch_partitions itself rather than
+        # restating it: a new field added there must be added to the fixture too,
+        # or the check that reads it goes silent in mock mode.
+        import slurmate.system_utils as su
+
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_force_mock", return_value=False)
+        mocker.patch.object(su, "_run_command", return_value=(
+            "part*|02:00:00|4|up|32|131072|gpu:a100:4|idle\n", "", 0))
+        real_keys = set(su.fetch_partitions()[0])
+        for part in su.MOCK_PARTITIONS:
+            missing = real_keys - set(part)
+            assert not missing, f"{part['name']} lacks {sorted(missing)}"
+
+    def test_a_per_node_gpu_over_request_is_flagged(self):
+        # The concrete check the missing gpus_per_node key had switched off.
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "200"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "gpu-shared", "--gpus", "99",
+             "--time", "00:05:00", "--command", "true"],
+            capture_output=True, text=True, env=env, timeout=180,
+        )
+        assert "GPUs (99)" in done.stderr and "per node" in done.stderr
+
+    def test_exactly_one_partition_is_the_default(self):
+        from slurmate.system_utils import MOCK_PARTITIONS
+
+        defaults = [p["name"] for p in MOCK_PARTITIONS if p.get("is_default")]
+        assert len(defaults) == 1, defaults
+
+    def test_the_default_is_reachable_without_a_partition_flag(self):
+        from slurmate.system_utils import fetch_partitions
+
+        os.environ.setdefault("SLURMATE_MOCK", "1")
+        assert any(p.get("is_default") for p in fetch_partitions())
+
+    def test_the_summary_uses_it(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "200"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--dry-run", "--force",
+             "--job-name", "x", "--time", "00:05:00", "--command", "true"],
+            capture_output=True, text=True, env=env, timeout=180,
+        )
+        # The limits, queue depth and ETA are the default partition's, and the
+        # summary says so rather than reporting them as belonging to nothing.
+        assert "default partition 'cpu-shared'" in done.stdout
+        # ...and no --partition directive is invented from it.
+        assert "#SBATCH --partition" not in done.stdout
+
+
+# A slurmate entry point with one cluster fact replaced: the SelectType plugin.
+# Every cluster available for testing runs select/cons_tres, so the "this site
+# cannot parse that GPU syntax" branches have no live cluster to exercise them.
+FAKE_SELECT_HARNESS = """
+import os, sys
+import slurmate.main as m
+m.fetch_select_type = lambda: os.environ["SLURMATE_FAKE_SELECT_TYPE"]
+sys.argv = ["slurmate"] + sys.argv[1:]
+m.main()
+"""
+
+class TestInferredGpuFormatYieldsToTheCluster:
+    """`--gpus a100:2` reads as gpu_format 'gpus', which needs select/cons_tres.
+    That inference is slurmate's reading of a spelling, not a format the user
+    asked for by name — so on a cluster that cannot parse it the rendering has to
+    change, not the job fail. All three clusters tested run cons_tres, so this is
+    the path that has no live cluster to catch it.
+    """
+
+    def _run(self, *extra, select="select/linear"):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "200",
+               "SLURMATE_FAKE_SELECT_TYPE": select}
+        return subprocess.run(
+            [sys.executable, "-c", FAKE_SELECT_HARNESS, "--print", "--job-name", "x",
+             "--partition", "gpu-shared", "--time", "00:05:00",
+             "--command", "true", *extra],
+            capture_output=True, text=True, env=env, timeout=180,
+        )
+
+    def test_an_inferred_format_is_downgraded_not_refused(self):
+        done = self._run("--gpus", "a100:2")
+        assert done.returncode == 0, done.stderr
+        assert "#SBATCH --gres=gpu:a100:2" in done.stdout
+        assert "--gpus=a100:2" not in done.stdout
+        # And it says so: a rendering the user did not choose changed under them.
+        assert "using 'gres_type'" in done.stderr
+
+    def test_an_explicit_format_is_still_an_error(self):
+        done = self._run("--gpus", "2", "--gpu-type", "a100",
+                         "--gpu-format", "gpus")
+        assert done.returncode == 1
+        assert "needs select/cons_tres" in done.stderr
+
+    def test_a_cons_tres_cluster_keeps_the_inferred_format(self):
+        done = self._run("--gpus", "a100:2", select="select/cons_tres")
+        assert done.returncode == 0, done.stderr
+        assert "#SBATCH --gpus=a100:2" in done.stdout
+        assert "using 'gres_type'" not in done.stderr
+
+
+class TestNodeLocalLogDirIsFlagged:
+    """A `--output` path on node-local storage is the worst kind of working
+    script. Measured on Booth's Mercury, whose `/tmp` is a per-node LVM volume:
+    slurmate submitted from `/tmp/work/submit`, created `logs/`, reported
+    `Submitted! Job ID: 563319`, and the job came back `COMPLETED 0:0` with **no
+    log anywhere the submitter could see**. The 213-byte log was on the compute
+    node's own `/tmp`. The identical job from an NFS home wrote its log normally.
+
+    `check_log_dirs` could not catch it and said so in its own docstring — it
+    tests the directory on the *login* node, where a node-local `/tmp/…/logs`
+    exists and is writable. Both true; neither the fact that matters.
+    """
+
+    MOUNTINFO = (
+        "22 96 0:21 / /proc rw,relatime shared:5 - proc proc rw\n"
+        "36 96 253:2 / / rw,relatime shared:1 - xfs /dev/mapper/root rw\n"
+        "44 36 253:4 / /tmp rw,relatime shared:9 - xfs /dev/mapper/tmpvol rw\n"
+        "45 36 8:1 / /scratch/local rw,relatime shared:10 - xfs /dev/sda1 rw\n"
+        "46 36 0:60 / /scratch/midway3 rw,relatime shared:12 - gpfs gpfs rw\n"
+        "51 36 0:44 / /home rw,relatime shared:11 - nfs4 nfs:/home rw\n"
+        "60 36 0:52 / /project rw,relatime shared:13 - gpfs gpfs_root rw\n"
+    )
+
+    @pytest.fixture(autouse=True)
+    def _real_cluster(self, mocker):
+        # The check is silent in mock mode (no cluster => no compute node), which
+        # is what keeps the rest of the suite hermetic.
+        mocker.patch.object(su, "_force_mock", return_value=False)
+        mocker.patch.object(
+            su, "_mount_fs_type",
+            side_effect=lambda p: self._fs_for(os.path.abspath(p)))
+
+    def _fs_for(self, path):
+        best, best_type = "", ""
+        for line in self.MOUNTINFO.splitlines():
+            left, _, right = line.partition(" - ")
+            point = left.split()[4]
+            fs = right.split()[0]
+            if path == point or path.startswith(point.rstrip("/") + "/"):
+                if len(point) >= len(best):
+                    best, best_type = point, fs
+        return best_type
+
+    def test_tmp_is_flagged(self):
+        assert su.node_local_log_dir("/tmp/work/submit/logs") == "xfs"
+
+    def test_shared_storage_is_not(self):
+        assert su.node_local_log_dir("/home/me/logs") == ""
+        assert su.node_local_log_dir("/project/lab/logs") == ""
+
+    def test_a_shared_tmp_is_not_flagged(self, mocker):
+        # A site that deliberately exports /tmp over NFS is doing nothing wrong,
+        # and the type is what distinguishes it from one that does not.
+        mocker.patch.object(su, "_mount_fs_type", return_value="nfs4")
+        assert su.node_local_log_dir("/tmp/logs") == ""
+
+    def test_var_tmp_and_dev_shm_too(self):
+        assert su.node_local_log_dir("/var/tmp/logs") == "xfs"
+
+    def test_a_scratch_that_names_itself_local(self):
+        # midway3's /scratch/local is the same /dev/sda1 as its /tmp, and is where
+        # $TMPDIR points, so a log written there is just as unreadable.
+        assert su.node_local_log_dir("/scratch/local/me/logs") == "xfs"
+
+    def test_bare_scratch_is_left_alone(self):
+        # Node-local on some sites, shared on others: warning would fire on the
+        # correct configuration.
+        assert su.node_local_log_dir("/scratch/midway3/me/logs") == ""
+
+    def test_a_path_merely_starting_with_the_prefix_is_not_matched(self):
+        # "/tmpfiles" is not under "/tmp".
+        assert su.node_local_log_dir("/tmpfiles/logs") == ""
+
+    def test_the_script_check_reports_it(self):
+        script = (
+            "#!/bin/bash\n"
+            "#SBATCH --output=/tmp/work/logs/x-%j.out\n"
+            "#SBATCH --error=/tmp/work/logs/x-%j.err\n"
+        )
+        issues = su.check_log_dirs(script, will_create=True)
+        assert [lvl for lvl, _ in issues] == ["warning"]
+        msg = issues[0][1]
+        assert "node-local storage (xfs)" in msg
+        assert "COMPLETED" in msg and "--output-dir" in msg
+
+    def test_it_fires_on_the_submit_path_too(self):
+        # Unlike SM-24's missing-directory warning, creating the directory does
+        # not help here, so `will_create=True` must not silence it.
+        script = "#SBATCH --output=/tmp/work/logs/x-%j.out\n"
+        assert su.check_log_dirs(script, will_create=True)
+        assert su.check_log_dirs(script, will_create=False)
+
+    def test_it_replaces_rather_than_stacks_with_the_other_checks(self):
+        # One path, one finding: the node-local fact subsumes "does not exist".
+        script = "#SBATCH --output=/tmp/definitely/not/there/x-%j.out\n"
+        issues = su.check_log_dirs(script, will_create=False)
+        assert len(issues) == 1 and "node-local" in issues[0][1]
+
+    def test_mock_mode_stays_silent(self, mocker):
+        mocker.patch.object(su, "_force_mock", return_value=True)
+        assert su.node_local_log_dir("/tmp/work/logs") == ""
+
+
+class TestMountFsTypeParsesMountinfo:
+    """The lookup reads /proc/self/mountinfo rather than shelling out to
+    `stat -f`, because check_log_dirs must not acquire a subprocess.
+    """
+
+    def test_the_longest_matching_mount_wins(self, tmp_path, mocker):
+        info = tmp_path / "mountinfo"
+        info.write_text(
+            "36 96 253:2 / / rw - xfs /dev/root rw\n"
+            "44 36 0:44 / /home rw - nfs4 nfs:/home rw\n"
+            "45 44 0:45 / /home/me/scratch rw - lustre mds:/lus rw\n"
+        )
+        real_open = open
+        mocker.patch("builtins.open", lambda p, *a, **k: real_open(
+            info if p == "/proc/self/mountinfo" else p, *a, **k))
+        assert su._mount_fs_type("/home/me/scratch/logs") == "lustre"
+        assert su._mount_fs_type("/home/me/logs") == "nfs4"
+        assert su._mount_fs_type("/opt/x") == "xfs"
+
+    def test_an_unreadable_mountinfo_claims_nothing(self, mocker):
+        mocker.patch("builtins.open", side_effect=OSError("nope"))
+        assert su._mount_fs_type("/tmp") == ""
