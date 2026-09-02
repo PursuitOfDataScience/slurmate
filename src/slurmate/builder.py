@@ -103,24 +103,71 @@ def _fold_directive(value: str) -> str:
     to a space so the value always stays a single well-formed directive. The
     ``command`` body and ``custom_sbatch`` flags are handled separately (command
     is intentionally multi-line; custom flags fold their own newlines).
+
+    Leading/trailing whitespace is stripped for the same reason, and it is the
+    same bug: Slurm's directive parser splits on unquoted whitespace, so
+    ``#SBATCH --array= 1-10`` is read as the directive ``--array=`` followed by a
+    stray word, and sbatch refuses the whole script with *"Invalid directive
+    found in batch script: 1-10"*. Measured on midway3 (Slurm 20.11.8) by
+    generating with ``--print --force`` and running ``sbatch --test-only`` on the
+    result: ``-a " 1-10 "`` and ``-t " 00:20:00 "`` each produced a script sbatch
+    rejected outright (exit 255) while slurmate exited 0, because every consumer
+    of the value already strips -- ``validate_array_spec`` calls the padded spec
+    valid -- and only the emitter did not, so what was validated was not what was
+    written. ``--constraint`` was fixed on its own (see
+    ``TestConstraintWhitespace``: *"used to emit ``#SBATCH --constraint= a100 ``
+    -- broken twice over"*); doing it here covers ``--array``, ``--time``,
+    ``--qos``, ``--partition`` and ``--account`` too. Whitespace *inside* a value
+    is untouched: it is meaningful (a log path with a space), and
+    :func:`_quote_sbatch_value` quotes it.
     """
-    return value.replace("\r", " ").replace("\n", " ")
+    return value.replace("\r", " ").replace("\n", " ").strip()
 
 
 def _quote_sbatch_value(value: str) -> str:
-    """Double-quote a #SBATCH value only if it contains whitespace.
+    """Double-quote a #SBATCH value that contains whitespace or a quote mark.
 
     Slurm's directive parser splits on unquoted whitespace (so an output path
     like ``/scratch/My Group/log`` would bind only ``/scratch/My``). Slurm strips
     the surrounding quotes and preserves ``%j``/``%A``/``%a`` patterns literally,
-    so quoting is safe; paths without spaces stay unquoted for readability.
+    so quoting is safe; plain paths stay unquoted for readability.
+
+    **Whitespace is not the only thing that has to be quoted.** That parser also
+    does quote processing, and an *unmatched* ``'`` or ``"`` anywhere in a
+    directive value is not a split -- it is fatal, and it takes the whole script
+    down. Measured on midway3 (Slurm 20.11.8) on a script this function had
+    emitted unquoted, because ``logs/it's-%j.out`` holds no whitespace::
+
+        #SBATCH --output=logs/it's-%j.out
+        $ sbatch --test-only script.sh
+        sbatch: fatal: script.sh: line 9: Unmatched `'` in [ --output=logs/it's-%j.out]
+        rc=1
+
+    An apostrophe in a path is ordinary (``--output-dir /scratch/o'brien``), so
+    slurmate was exiting 0 on a script sbatch refuses outright -- the same defect
+    :func:`_fold_directive` documents for a padded ``--array``, where what was
+    validated was not what was written. Wrapping fixes it: ``--output="logs/it's-%j.out"``
+    and ``--output="logs/a\\"b-%j.out"`` both verify rc=0.
+
+    A *balanced* pair of quotes does parse, but Slurm strips it, so an unquoted
+    ``logs/a"b"c.out`` silently became ``logs/abc.out``; wrapping keeps the name
+    the user asked for. Only a trailing backslash must not be left bare inside
+    the quotes -- it would escape the closing one -- so it is doubled, which Slurm
+    accepts.
 
     A newline in the value is folded to a space first (see :func:`_fold_directive`)
     so it can't split the directive across lines or inject a script-body line.
     """
     value = _fold_directive(value)
-    if value and any(ch.isspace() for ch in value):
-        return '"' + value.replace('"', '\\"') + '"'
+    if value and (
+        any(ch.isspace() for ch in value) or '"' in value or "'" in value
+    ):
+        inner = value.replace('"', '\\"')
+        # A run of backslashes at the very end would swallow the closing quote.
+        trailing = len(inner) - len(inner.rstrip("\\"))
+        if trailing:
+            inner += "\\" * trailing
+        return '"' + inner + '"'
     return value
 
 
@@ -196,13 +243,19 @@ _VALUE_TAKING_FLAGS = frozenset({
 _OPTION_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
 
 
-def _join_flag_values(tokens: list[str]) -> list[str]:
+def _join_flag_values(
+    tokens: list[str], reassembled: list[tuple[str, str]] | None = None
+) -> list[str]:
     """Turn a token list into flags, attaching space-separated values.
 
     One implementation shared by the free-form parser (:func:`~slurmate.tui.
     _parse_custom_flags`) and the list/API path (:func:`_normalize_custom_flags`),
     so ``--custom-sbatch="-o /p"``, ``custom_sbatch = ["-o /p"]`` and
     ``custom_sbatch = ["-o", "/p"]`` all end up as the same single directive.
+
+    ``reassembled`` collects ``(flag_name, fragment)`` for every bare word that
+    was folded into a preceding ``--flag=value``, so a caller can say what it
+    did.  See the branch below for why it does it at all.
     """
     flags: list[str] = []
     for raw in tokens:
@@ -218,12 +271,51 @@ def _join_flag_values(tokens: list[str]) -> list[str]:
                               or not _OPTION_NAME_RE.match(tok)):
                 flags[-1] = f"{prev} {tok}"
                 continue
+            if prev and "=" in prev and " " not in prev:
+                # A bare word after `--flag=value` is the tail of a value the
+                # user did not quote. It cannot be an option: sbatch options
+                # start with a dash, and this token has none.
+                #
+                # It used to be given one. `--custom-sbatch='--comment=my run'`
+                # emitted `#SBATCH --comment=my` and then `#SBATCH --run`, which
+                # sbatch refuses outright -- `unrecognized option '--run'` --
+                # silently, from a tool whose output is a script somebody submits.
+                # `--help` does say to quote such a value and the quoted forms
+                # are correct; what was wrong was writing an option nobody typed
+                # and no scheduler has.
+                #
+                # Bounded to ONE word, by the same `" " not in prev` test the
+                # branch above uses. Unbounded, it absorbed every later dashless
+                # token -- and that LOST REAL OPTIONS, which is worse than the
+                # invalid directive it replaced:
+                #
+                #   --custom-sbatch='--array=1-10 hold exclusive requeue'
+                #       -> #SBATCH --array="1-10 hold exclusive requeue"
+                #          (three options gone)
+                #   --custom-sbatch='--comment="my run" hold'
+                #       -> #SBATCH --comment="my run hold"
+                #          (--hold gone, from a CORRECTLY QUOTED value)
+                #
+                # The second is the one that settles it: `shlex` has already
+                # stripped the quotes, so the value arrives holding a space, and
+                # requiring `prev` to be space-free leaves it alone. sbatch
+                # rejected `#SBATCH --run` loudly; a dropped `--hold` runs.
+                #
+                # The fold keeps the script VALID for a caller that ignores
+                # `reassembled`; the caller that reads it refuses outright, so
+                # nothing is lost quietly either way.
+                if reassembled is not None:
+                    reassembled.append((prev.split("=", 1)[0], tok))
+                flags[-1] = f"{prev} {tok}"
+                continue
             tok = f"--{tok}"
         flags.append(tok)
     return flags
 
 
-def _normalize_custom_flags(custom_sbatch: Any) -> list[str]:
+def _normalize_custom_flags(
+    custom_sbatch: Any, reassembled: list[tuple[str, str]] | None = None
+) -> list[str]:
     """Coerce ``custom_sbatch`` (list | str | None) into a clean list of flags.
 
     Single place that (a) tolerates a bare string from a direct API caller — which
@@ -240,11 +332,11 @@ def _normalize_custom_flags(custom_sbatch: Any) -> list[str]:
         return []
     if isinstance(custom_sbatch, str):
         from .tui import _parse_custom_flags
-        custom_sbatch = _parse_custom_flags(custom_sbatch)
+        custom_sbatch = _parse_custom_flags(custom_sbatch, reassembled)
     cleaned = [
         str(raw).replace("\r", " ").replace("\n", " ").strip() for raw in custom_sbatch
     ]
-    return _join_flag_values([c for c in cleaned if c])
+    return _join_flag_values([c for c in cleaned if c], reassembled)
 
 
 def _split_flag(flag: str) -> tuple[str, str]:
@@ -265,6 +357,15 @@ def _split_flag(flag: str) -> tuple[str, str]:
 # Custom-flag names that collide with a directive the builder emits itself.
 _MEM_FLAG_NAMES = ("--mem",)
 _MEM_PER_CPU_FLAG_NAMES = ("--mem-per-cpu",)
+# The third member of Slurm's mutually exclusive memory family. slurmate has no
+# option of its own for it, so --custom-sbatch=--mem-per-gpu=1G is the only way
+# to ask for per-GPU memory — and it has to suppress the auto --mem the same way
+# a custom --mem/--mem-per-cpu does. Measured on Slurm 20.11.8: a script with
+# both is not merely overridden, it is refused outright — `sbatch: fatal: --mem,
+# --mem-per-cpu, and --mem-per-gpu are mutually exclusive.` — so slurmate emitted
+# an unsubmittable script for a GPU job whose user never mentioned memory at all
+# (the --mem comes from the partition default).
+_MEM_PER_GPU_FLAG_NAMES = ("--mem-per-gpu",)
 _CONSTRAINT_FLAG_NAMES = ("--constraint", "-C")
 _OUTPUT_FLAG_NAMES = ("--output", "-o")
 _ERROR_FLAG_NAMES = ("--error", "-e")
@@ -365,6 +466,28 @@ def command_injects_directives(command: Any) -> str:
     return ""
 
 
+def unquoted_custom_values(custom_sbatch: Any) -> list[tuple[str, str]]:
+    """``(flag, whole value)`` for each custom flag whose value was unquoted.
+
+    Empty when every value was quoted, which is what ``--help`` asks for and what
+    the vast majority of invocations do.  Reported so the fold that keeps the
+    script valid is not also silent: the user typed something with two readings
+    and gets told which one was taken.
+    """
+    notes: list[tuple[str, str]] = []
+    flags = _normalize_custom_flags(custom_sbatch, notes)
+    if not notes:
+        return []
+    folded = {name for name, _fragment in notes}
+    out: list[tuple[str, str]] = []
+    for flag in flags:
+        name = flag.split("=", 1)[0].strip().split()[0] if flag.strip() else ""
+        if name in folded:
+            _n, value = _split_flag(flag)
+            out.append((name, value))
+    return out
+
+
 def managed_custom_flags(custom_sbatch: Any) -> list[tuple[str, str]]:
     """``(custom_flag, owning_slurmate_flag)`` for each conflicting custom flag.
 
@@ -408,21 +531,32 @@ def custom_ntasks(custom_sbatch: Any) -> int | None:
     return total
 
 
-def _custom_mem_override(flags: list[str]) -> tuple[str | None, str | None]:
-    """``(mem, mem_per_cpu)`` as supplied by custom flags, or ``(None, None)``.
+def _custom_mem_override(
+    flags: list[str],
+) -> tuple[str | None, str | None, str | None]:
+    """``(mem, mem_per_cpu, mem_per_gpu)`` from custom flags, else all ``None``.
+
+    All three of Slurm's memory directives are reported, because all three are
+    mutually exclusive of one another: whichever one a custom flag carries, the
+    auto directive must give way or the controller refuses the script. Matched on
+    the exact flag name, so ``--mem-bind`` — which merely starts the same — is
+    left alone and does not silently drop the memory request.
 
     Last occurrence wins, mirroring Slurm's own "later option overrides earlier"
     behaviour, and both the ``=`` and space spellings count.
     """
     mem: str | None = None
     mem_per_cpu: str | None = None
+    mem_per_gpu: str | None = None
     for flag in flags:
         name, value = _split_flag(flag)
         if name in _MEM_FLAG_NAMES:
             mem = value
         elif name in _MEM_PER_CPU_FLAG_NAMES:
             mem_per_cpu = value
-    return mem, mem_per_cpu
+        elif name in _MEM_PER_GPU_FLAG_NAMES:
+            mem_per_gpu = value
+    return mem, mem_per_cpu, mem_per_gpu
 
 
 def _has_custom_flag(flags: list[str], names: tuple[str, ...]) -> bool:
@@ -521,10 +655,13 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     # the auto directive in the builder, so showing the (now unused) answer value
     # here made the summary and the generated script disagree.
     custom_flags = _normalize_custom_flags(answers.get("custom_sbatch"))
-    custom_mem, custom_mem_per_cpu = _custom_mem_override(custom_flags)
-    if custom_mem_per_cpu or custom_mem:
-        # A custom flag wins. Both can be present (Slurm would reject that, but
+    custom_mem, custom_mem_per_cpu, custom_mem_per_gpu = _custom_mem_override(
+        custom_flags
+    )
+    if custom_mem_per_cpu or custom_mem or custom_mem_per_gpu:
+        # A custom flag wins. Several can be present (Slurm would reject that, but
         # it's the user's script) — show whatever the script really says.
+        add("Mem per GPU", custom_mem_per_gpu)
         add("Mem per CPU", custom_mem_per_cpu)
         add("Memory", custom_mem)
     elif answers.get("mem_per_cpu"):
@@ -806,10 +943,12 @@ def build_sbatch_script(
     # before their own directive is emitted.
     custom_flags = _normalize_custom_flags(custom_sbatch)
     # If the user supplied their own memory directive via custom flags, don't also
-    # emit the auto one: Slurm rejects a script that sets both --mem and
-    # --mem-per-cpu, so a user override wins (mirrors the GPU-flag dedup below).
-    _cm, _cmpc = _custom_mem_override(custom_flags)
-    _custom_mem = bool(_cm or _cmpc)
+    # emit the auto one: Slurm rejects a script that sets --mem, --mem-per-cpu or
+    # --mem-per-gpu together, so a user override wins (mirrors the GPU-flag dedup
+    # below). All three count — --mem-per-gpu has no slurmate option, so the
+    # passthrough is the only way to ask for it.
+    _cm, _cmpc, _cmpg = _custom_mem_override(custom_flags)
+    _custom_mem = bool(_cm or _cmpc or _cmpg)
     # Memory: --mem-per-cpu takes precedence over --mem when set (Slurm treats the
     # two as mutually exclusive). A blank memory omits the directive entirely — what
     # whole-node/exclusive sites need: e.g. TACC rejects any script that sets --mem.
@@ -835,7 +974,26 @@ def build_sbatch_script(
         lines.append(f"#SBATCH --nodes={nodes}")
     if ntasks_per_node is not None:
         lines.append(f"#SBATCH --ntasks-per-node={_fold_directive(str(ntasks_per_node))}")
-    elif nodes is not None and nodes > 1:
+    elif nodes is not None and nodes > 1 and custom_ntasks(custom_sbatch) is None:
+        # The auto directive gives way to a custom task count, for the reason
+        # `_custom_mem_override` already states about the memory trio: "whichever
+        # one a custom flag carries, the auto directive must give way or the
+        # controller refuses the script." This was the one auto directive that
+        # did not follow it, and slurmate has no `--ntasks` of its own, so
+        # `--custom-sbatch=--ntasks=N` is the only way to express an MPI job --
+        # a likely path rather than an exotic one, as `custom_ntasks` says.
+        #
+        # Measured on Slurm 20.11.8. `--nodes=4 --ntasks=8` is accepted; the same
+        # request with `--ntasks-per-node=1` added is refused with "Requested node
+        # configuration is not available", because one task per node over 8 tasks
+        # asks for 8 nodes and `--nodes` caps it at 4. So slurmate built a script
+        # its own pre-submit check then refused -- `--nodes 4
+        # --custom-sbatch=--ntasks=8` printed exactly that.
+        #
+        # Only the *fallback* gives way. An explicit `--ntasks-per-node` above is
+        # the user's own instruction and is emitted whatever else is set; a custom
+        # `--ntasks-per-node` is a duplicate rather than a conflict and keeps its
+        # existing `_MANAGED_CUSTOM_FLAGS` warning.
         lines.append("#SBATCH --ntasks-per-node=1")
 
     # Node-feature constraint(s) (Slurm -C), e.g. NERSC Perlmutter's mandatory

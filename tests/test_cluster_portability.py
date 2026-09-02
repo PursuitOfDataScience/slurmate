@@ -309,12 +309,12 @@ class TestBatchClusterCheck:
     def _args(self, **over):
         import argparse
 
-        base = dict(
-            job_name="t", account=None, partition="cpu-shared", qos=None,
-            cpus=1, memory="1G", time="00:10:00", nodes=1, gpus=0,
-            gpu_type=None, array=None, modules=None, env=None, env_type=None,
-            command="echo hi", custom_sbatch=None, yes=False, force=False,
-        )
+        base = {
+            "job_name": "t", "account": None, "partition": "cpu-shared", "qos": None,
+            "cpus": 1, "memory": "1G", "time": "00:10:00", "nodes": 1, "gpus": 0,
+            "gpu_type": None, "array": None, "modules": None, "env": None, "env_type": None,
+            "command": "echo hi", "custom_sbatch": None, "yes": False, "force": False,
+        }
         base.update(over)
         return argparse.Namespace(**base)
 
@@ -736,6 +736,48 @@ class TestConfigKeyVocabulary:
         # depending on how the user happened to type it.
         assert self._load(tmp_path, text) == {"time_limit": "01:00:00"}
         assert "'time' ignored" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("text", "winner", "loser"),
+        [
+            ('job-name = "a"\njob_name = "b"\n', "b", "job-name"),
+            ('job_name = "b"\njob-name = "a"\n', "a", "job_name"),
+        ],
+    )
+    def test_two_spellings_of_one_key_name_the_loser(
+        self, tmp_path, capsys, text, winner, loser
+    ):
+        # `job-name` and `job_name` are two legal, distinct TOML keys that
+        # normalise onto one slot, so one of the two values is discarded. Neither
+        # is the other's alias, so the alias rule above cannot separate them and
+        # the drop happened in total silence -- the later line won, and swapping
+        # the two lines silently changed which name the job ran under.
+        assert self._load(tmp_path, text) == {"job_name": winner}
+        assert f"'{loser}' ignored" in capsys.readouterr().err
+
+    def test_a_section_still_beats_the_top_level_across_spellings(self, tmp_path):
+        # Control for the above: naming the loser must not change WHICH value
+        # wins. [defaults] overrides the top level, and it has to keep doing so
+        # when the two entries are spelled differently -- a rule that made the
+        # canonical spelling win regardless of position would silently invert it.
+        assert self._load(
+            tmp_path, 'job_name = "top"\n[defaults]\njob-name = "sect"\n'
+        ) == {"job_name": "sect"}
+        assert self._load(
+            tmp_path, 'job-name = "top"\n[defaults]\njob_name = "sect"\n'
+        ) == {"job_name": "sect"}
+
+    def test_control_one_spelling_per_key_is_never_called_a_dupe(
+        self, tmp_path, capsys
+    ):
+        # The notice must fire only on a genuine collision. An ordinary file --
+        # dashed names, distinct keys, a key whose own name contains dashes --
+        # loses nothing and must stay silent, or every run nags.
+        cfg = self._load(
+            tmp_path, 'job-name = "y"\nmem-per-cpu = "2G"\nntasks-per-node = 4\n'
+        )
+        assert cfg == {"job_name": "y", "mem_per_cpu": "2G", "ntasks_per_node": 4}
+        assert "ignored" not in capsys.readouterr().err
 
     def test_unknown_section_is_reported(self, tmp_path, capsys):
         assert self._load(tmp_path, '[job]\npartition = "caslake"\n') == {}
@@ -1411,6 +1453,71 @@ class TestCapacityRefusal:
     def test_no_partition_object_claims_nothing(self):
         assert su.capacity_refusal(None, {"cpus": 999}) == ""
 
+    def test_maxarraysize_is_refused_with_no_partition_at_all(self):
+        # `if not part: return ""` dropped every rule, including the one that
+        # never reads a partition. MaxArraySize is a controller-wide slurm.conf
+        # value: measured on midway3 (MaxArraySize=65533), `sbatch --test-only
+        # -A rcc-staff -t 1 --wrap=true --array=1-99999` is refused
+        # "allocation failure: Invalid job array specification" with `-p amd`
+        # (rc=1) AND with no `-p` at all (rc=1, site default), while --array=1-2
+        # is placed (rc=0). So a blank partition is not a reason to go silent.
+        answers = {"cpus": 1, "array_spec": "1-99999"}
+        for part in (None, {}):
+            assert "MaxArraySize (65533)" in su.capacity_refusal(part, answers, 65533)
+
+    def test_it_words_the_array_refusal_exactly_as_the_validator_does(self):
+        # One fact, one sentence. The ETA fallback and the warnings panel can
+        # appear on the same screen, and they used to describe this refusal
+        # differently ("is beyond MaxArraySize (N)" vs "is at or beyond this
+        # cluster's MaxArraySize (N)"), which reads as two findings.
+        answers = {"cpus": 1, "array_spec": "1-99999"}
+        refusal = su.capacity_refusal(None, answers, 65533)
+        warnings = [
+            m for lvl, m in validate_job_config(
+                {**answers, "_partition_obj": None}, max_array_size=65533
+            )
+            if "MaxArraySize" in m
+        ]
+        assert warnings == [refusal]
+
+    def test_an_unknown_maxarraysize_still_claims_nothing_without_a_partition(self):
+        # None = "could not read slurm.conf". An unknown limit must not become a
+        # claim about one, with or without a partition.
+        answers = {"cpus": 1, "array_spec": "1-99999"}
+        assert su.capacity_refusal(None, answers, None) == ""
+        assert su.capacity_refusal(None, {"cpus": 1}, 65533) == ""
+
+    def test_a_named_partition_is_judged_exactly_as_before(self):
+        # CONTROL. Pinned as an ordered list: the reason a refusal gives is which
+        # rule fired FIRST, so a reorder changes what the user is told even though
+        # every individual rule still works. Exact strings, so a doubled or
+        # reworded message fails here too.
+        part = _part(
+            name="amd", nodes=8, cpus_per_node=48, mem_per_node_mb=1024,
+            gpus_per_node=4, timelimit="02:00:00",
+        )
+        cases = [
+            ({"nodes": 20, "cpus": 1}, "partition 'amd' has only 8 node(s)"),
+            ({"cpus": 1, "time_limit": "99:00:00"}, "partition time limit is 02:00:00"),
+            ({"cpus": 999}, "no node in 'amd' has 999 cores"),
+            ({"cpus": 25, "ntasks_per_node": 2}, "no node in 'amd' has 50 cores"),
+            ({"cpus": 1, "memory": "500G"}, "no node in 'amd' has 512000 MB"),
+            ({"cpus": 1, "gpus": 99}, "no node in 'amd' has 99 GPUs"),
+            ({"cpus": 4}, ""),
+        ]
+        assert [su.capacity_refusal(part, a, 65533) for a, _ in cases] == [
+            expected for _, expected in cases
+        ]
+        # And the array rule keeps its place in that order: it loses to the node
+        # count and beats the time limit.
+        over = {"cpus": 1, "array_spec": "1-99999"}
+        assert su.capacity_refusal(part, {**over, "nodes": 20}, 65533) == (
+            "partition 'amd' has only 8 node(s)"
+        )
+        assert "MaxArraySize (65533)" in su.capacity_refusal(
+            part, {**over, "time_limit": "99:00:00"}, 65533
+        )
+
     def test_unknown_capacity_claims_nothing(self):
         # The synthetic record for a manually-typed partition carries zeroes;
         # zero must read as "unknown", not "nothing fits".
@@ -1637,41 +1744,86 @@ class TestCustomSbatchFlagForm:
     the cause nor the fix.
     """
 
+    #: slurmate's own single-dash options, which is what decides the answer.
+    SHORTS = frozenset({"-J", "-A", "-p", "-q", "-c", "-t", "-N", "-G", "-e",
+                        "-C", "-a", "-o"})
+
     @pytest.mark.parametrize("value", ["--exclusive", "-x", "--hold"])
     def test_the_broken_form_is_explained(self, value, capsys):
         from slurmate.main import _check_custom_sbatch_form
         with pytest.raises(SystemExit) as exc:
-            _check_custom_sbatch_form(["--custom-sbatch", value])
+            _check_custom_sbatch_form(["--custom-sbatch", value], self.SHORTS)
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert "must use the '=' form" in err
         assert f"--custom-sbatch='{value}'" in err
 
+    def test_a_short_option_slurmate_owns_is_explained_too(self, capsys):
+        """`-C bigmem` was the one form that fell through to argparse.
+
+        SM-30's third item: the space-separated form of the flag the help text
+        itself invites got argparse's generic "expected one argument" plus a full
+        usage dump, while `--custom-sbatch '--exclusive'` got slurmate's targeted
+        message. They are the same mistake.
+        """
+        from slurmate.main import _check_custom_sbatch_form
+        with pytest.raises(SystemExit) as exc:
+            _check_custom_sbatch_form(["--custom-sbatch", "-C bigmem"], self.SHORTS)
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "must use the '=' form" in err
+        assert "--custom-sbatch='-C bigmem'" in err
+
     @pytest.mark.parametrize(
         "value",
         [
-            "-C bigmem",                                  # argparse allows a space
             '--comment="my run"',
             '--exclusive,--comment="my run",-C bigmem',   # the report's own string
             "plain",
+            "-Z bigmem",   # a short option slurmate does NOT own
         ],
     )
     def test_forms_argparse_already_accepts_are_untouched(self, value):
         # Rejecting these would break the multi-flag invocation the portability
-        # report exercised — argparse only mistakes a value for an option when it
-        # starts with "-" and contains no space.
+        # report exercised. A long option with a space is a value to argparse,
+        # and a short option slurmate does not define cannot be confused with one.
         from slurmate.main import _check_custom_sbatch_form
-        _check_custom_sbatch_form(["--custom-sbatch", value])
+        _check_custom_sbatch_form(["--custom-sbatch", value], self.SHORTS)
 
     def test_argparse_boundary_is_what_we_assume_it_is(self):
-        # Pin the behaviour the guard is calibrated against, so a change in
-        # argparse shows up here rather than as a mis-rejected flag.
+        """Pin the real boundary, so argparse changing shows up here.
+
+        The premise this guard used to rest on -- "argparse only mistakes a value
+        for an option when it starts with '-' AND contains no space" -- is true of
+        a parser with no matching short option and false of one that has it:
+        `_get_option_tuples` splits a single-dash token after two characters, so
+        `-C bigmem` is read as `-C` carrying ` bigmem`.
+        """
         import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--custom-sbatch", default=None)
-        assert parser.parse_args(["--custom-sbatch", "-C bigmem"]).custom_sbatch == "-C bigmem"
+        bare = argparse.ArgumentParser()
+        bare.add_argument("--custom-sbatch", default=None)
+        assert bare.parse_args(["--custom-sbatch", "-C bigmem"]).custom_sbatch == "-C bigmem"
         with pytest.raises(SystemExit):
-            parser.parse_args(["--custom-sbatch", "--exclusive"])
+            bare.parse_args(["--custom-sbatch", "--exclusive"])
+
+        owns_c = argparse.ArgumentParser()
+        owns_c.add_argument("--custom-sbatch", default=None)
+        owns_c.add_argument("--constraint", "-C", default=None)
+        with pytest.raises(SystemExit):
+            owns_c.parse_args(["--custom-sbatch", "-C bigmem"])
+
+    def test_the_option_set_comes_from_the_parser(self):
+        """Asked, not assumed: `-C` only collides because `--constraint` has it."""
+        import argparse
+
+        from slurmate.main import _short_option_strings, parse_args
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--constraint", "-C", default=None)
+        parser.add_argument("--long-only", default=None)
+        assert _short_option_strings(parser) == frozenset({"-C", "-h"})
+        # And the real parser's set is what the guard is handed.
+        assert "-C" in self.SHORTS
+        assert parse_args(["--print"]).custom_sbatch is None
 
     def test_a_trailing_flag_with_no_value_is_left_to_argparse(self):
         from slurmate.main import _check_custom_sbatch_form
@@ -1773,10 +1925,19 @@ class TestMemoryZeroAndArrayShape:
         assert su.validate_array_spec(spec) is True
 
     @pytest.mark.parametrize(
-        "spec", ["10-1", "1-10:0", "1-", "-5", "1-2-3", "a-b", "1-10%", "1,,3", "1-10%x"]
+        "spec", ["10-1", "1-10:0", "1-", "-5", "1-2-3", "a-b"]
     )
     def test_specs_slurm_rejects(self, spec):
         assert su.validate_array_spec(spec) is False
+
+    # These three were filed under "slurm rejects" and Slurm does not: measured
+    # with `sbatch --test-only`, all three verify. slurmate still refuses them on
+    # purpose (they are typos the controller swallows), so the assertion stands —
+    # only the claim about the scheduler was wrong.
+    @pytest.mark.parametrize("spec", ["1-10%", "1,,3", "1-10%x"])
+    def test_specs_slurm_accepts_that_slurmate_refuses_anyway(self, spec):
+        assert su.validate_array_spec(spec) is False
+        assert su._slurm_would_accept_array_spec(spec) is True
 
     def test_reversed_range_is_caught_before_the_controller(self):
         # The measured failure: `allocation failure: Invalid job array
@@ -1959,6 +2120,91 @@ class TestCustomSbatchConflicts:
         assert script.count("--mem=") == 1 and "--mem=8G" in script
 
 
+class TestCustomMemPerGpuSuppressesTheAutoDirective:
+    """The memory reconcile knew two of Slurm's three memory directives.
+
+    ``--mem-per-gpu`` is the third, it is mutually exclusive with the other two,
+    and slurmate has no option of its own for it — so ``--custom-sbatch`` is the
+    only way to ask for it. The auto ``--mem`` was emitted alongside, and Slurm
+    20.11.8 does not merely override one with the other, it refuses the script:
+
+        $ sbatch --test-only out.sh
+        sbatch: fatal: --mem, --mem-per-cpu, and --mem-per-gpu are mutually
+        exclusive.
+
+    Worst on the path where the user said nothing about memory at all
+    (``slurmate --gpus 1 --custom-sbatch=--mem-per-gpu=1G``): the colliding
+    ``--mem`` was slurmate's own partition default, so the script it printed was
+    unsubmittable for a reason nothing in the invocation named, at exit 0.
+    """
+
+    def _script(self, **kw):
+        from slurmate.builder import build_sbatch_script
+
+        base = dict(
+            job_name="j", partition="p", cpus=1, time_limit="00:10:00",
+            command="true",
+        )
+        base.update(kw)
+        return build_sbatch_script(**base)
+
+    @pytest.mark.parametrize("kw", [
+        # The auto/default --mem, which the user never typed.
+        {"memory": "31G"},
+        # An explicitly given --memory.
+        {"memory": "8G"},
+        # And --mem-per-cpu, equally exclusive with --mem-per-gpu.
+        {"memory": None, "mem_per_cpu": "2G"},
+    ])
+    def test_only_the_custom_directive_is_emitted(self, kw):
+        script = self._script(custom_sbatch=["--mem-per-gpu=1G"], **kw)
+        emitted = [
+            ln for ln in script.splitlines()
+            if ln.startswith("#SBATCH --mem")
+        ]
+        assert emitted == ["#SBATCH --mem-per-gpu=1G"], script
+
+    def test_the_space_spelling_counts_too(self):
+        script = self._script(memory="8G", custom_sbatch=["--mem-per-gpu 1G"])
+        assert "#SBATCH --mem=" not in script
+
+    def test_the_summary_reports_the_value_the_script_requests(self):
+        # Not the suppressed one: a summary saying "Memory: 8G" over a script
+        # that requests 1G/GPU is the disagreement this reconcile exists to stop.
+        from slurmate.builder import job_summary_rows
+
+        rows = job_summary_rows({
+            "job_name": "j", "partition": "p", "cpus": 1, "memory": "8G",
+            "time_limit": "00:10:00", "command": "true",
+            "custom_sbatch": ["--mem-per-gpu=1G"],
+        })
+        text = str(rows)
+        assert "Mem per GPU" in text and "8G" not in text
+
+    def test_it_is_a_passthrough_not_a_refusal(self):
+        # --mem-per-gpu is reconciled, like --mem: refusing it would leave no way
+        # to express per-GPU memory with slurmate at all.
+        from slurmate.builder import managed_custom_flags
+
+        assert managed_custom_flags("--mem-per-gpu=1G") == []
+
+    # ── controls: the match is on the exact flag name ──────────────────────
+    @pytest.mark.parametrize("flag", [
+        # Both merely *start* with "--mem". A prefix test would let either one
+        # delete the memory request, and the job would silently fall back to the
+        # partition default -- a wrong answer where there had been a loud one.
+        "--mem-bind=local",
+        "--mem-per-gpu-is-not-a-flag=1G",
+        "--exclusive",
+    ])
+    def test_a_neighbouring_flag_leaves_the_auto_directive_alone(self, flag):
+        script = self._script(memory="8G", custom_sbatch=[flag])
+        assert "#SBATCH --mem=8G" in script
+
+    def test_no_custom_flag_at_all_is_unchanged(self):
+        assert "#SBATCH --mem=8G" in self._script(memory="8G")
+
+
 class TestNoHomeDirectory:
     """SM-16: `Path.home()` raises RuntimeError when $HOME is unset AND the uid
     has no passwd entry — `sbatch --export=NONE` on a node whose name service
@@ -2066,6 +2312,73 @@ class TestNonUtf8Output:
         finally:
             theme.set_ascii(False)
 
+    def test_the_print_path_uses_the_theme_marker_not_a_literal(self, mocker):
+        """The gap the tests above could not see.
+
+        They assert `theme.g.WARN == "!"`, and that stayed true while three call
+        sites in `main.py` wrote a literal "\u26a0" instead of asking the theme --
+        so `--ascii` on a terminal that had just asked for ASCII still emitted
+        U+26A0. Asserting on the marker is not the same as asserting on the
+        output, so this goes through the real print path.
+        """
+        import io as _io
+
+        from rich.console import Console
+
+        from slurmate import main as m
+        from slurmate import theme
+
+        mocker.patch.object(theme, "output_encoding", return_value="utf-8")
+        theme.set_ascii(True)
+        try:
+            buf = _io.StringIO()
+            m._print_issue(Console(file=buf, width=100, no_color=True), "warning", "a message")
+            out = buf.getvalue()
+            assert "!" in out
+            assert "\u26a0" not in out, out
+            buf = _io.StringIO()
+            m._print_issue(Console(file=buf, width=100, no_color=True), "error", "a message")
+            assert "x" in buf.getvalue()
+            assert "\u2717" not in buf.getvalue()
+        finally:
+            theme.set_ascii(False)
+
+    def test_the_control_unicode_markers_still_reach_the_output(self, mocker):
+        """The control: emitting ASCII unconditionally would also satisfy the
+        test above."""
+        import io as _io
+
+        from rich.console import Console
+
+        from slurmate import main as m
+        from slurmate import theme
+
+        mocker.patch.object(theme, "output_encoding", return_value="utf-8")
+        theme.set_ascii(False)
+        buf = _io.StringIO()
+        m._print_issue(Console(file=buf, width=100, no_color=True), "warning", "a message")
+        assert "\u26a0" in buf.getvalue()
+
+    def test_a_wrapped_warning_keeps_its_indent(self):
+        """The two-space prefix used to be literal text inside the markup, so rich
+        indented only the first line and wrapped the rest to column 0. The
+        log-directory warning is three lines wide at 80 columns, so this was the
+        normal case rather than an edge one.
+        """
+        import io as _io
+
+        from rich.console import Console
+
+        from slurmate import main as m
+
+        buf = _io.StringIO()
+        long_msg = "word " * 60
+        m._print_issue(Console(file=buf, width=60, no_color=True), "warning", long_msg.strip())
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        assert len(lines) > 2, "the message did not wrap; the test proves nothing"
+        for ln in lines:
+            assert ln.startswith("  "), f"continuation lost its indent: {ln!r}"
+
     def test_env_var_forces_ascii(self, monkeypatch, mocker):
         from slurmate import theme
         mocker.patch.object(theme, "output_encoding", return_value="utf-8")
@@ -2105,6 +2418,82 @@ class TestNonUtf8Output:
         from slurmate.theme import _encode_fallback
         with pytest.raises(UnicodeDecodeError):
             _encode_fallback(UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"))
+
+    # ── The banner: the one output path that bypassed the module's own safety ──
+    # `banner_lines()` existed and folded the block art to ASCII, but
+    # `print_banner` read `BANNER_LINES` directly in all five of its branches.
+    # So the first thing printed was also the only thing that ignored
+    # `use_ascii()`: under a valid non-UTF-8 locale the codec handler had no
+    # `_TRANSLITERATE` entry for `█` or the six box pieces and fell through to
+    # `backslashreplace`, turning six lines of art into ~440 `\uXXXX` escapes
+    # before the tool had said anything. Escaping is right for *data* and wrong
+    # for decoration -- which is exactly what has a fallback table.
+
+    def _banner(self, capsys, mocker, monkeypatch, encoding, ascii_flag):
+        from slurmate import theme
+        monkeypatch.delenv("SLURMATE_NO_BANNER", raising=False)
+        monkeypatch.delenv("SLURMATE_ASCII", raising=False)
+        monkeypatch.delenv("SLURMATE_BANNER_ANIMATE", raising=False)
+        mocker.patch.object(theme, "output_encoding", return_value=encoding)
+        theme.set_ascii(ascii_flag)
+        try:
+            theme.print_banner(interactive=False)
+        finally:
+            theme.set_ascii(False)
+        return capsys.readouterr().out
+
+    def test_the_banner_folds_to_ascii_when_the_output_cannot_carry_it(
+        self, capsys, mocker, monkeypatch
+    ):
+        out = self._banner(capsys, mocker, monkeypatch, "latin-1", False)
+        assert "\u2588" not in out, "the banner still emits a full block"
+        for piece in "\u2550\u2551\u2554\u2557\u255a\u255d":
+            assert piece not in out, f"box-drawing {piece!r} survived the fold"
+        assert "#######" in out, out
+
+    def test_the_banner_honours_the_ascii_flag_on_a_utf8_terminal(
+        self, capsys, mocker, monkeypatch
+    ):
+        # `--ascii` was ignored here too: asking for ASCII output still got
+        # block art on a terminal that could have carried either.
+        out = self._banner(capsys, mocker, monkeypatch, "utf-8", True)
+        assert "\u2588" not in out and "#######" in out, out
+
+    def test_the_control_the_banner_keeps_its_block_art_when_it_can(
+        self, capsys, mocker, monkeypatch
+    ):
+        """The control: folding to ASCII unconditionally would also satisfy the
+        two tests above, and would silently downgrade every UTF-8 terminal."""
+        out = self._banner(capsys, mocker, monkeypatch, "utf-8", False)
+        assert "\u2588" in out, out
+        assert "#######" not in out, out
+
+    def test_the_banner_survives_a_real_ascii_encoder(self):
+        """The end-to-end one: the two above mock `output_encoding`, so they
+        cannot see whether the bytes actually make it through an encoder that
+        has no room for U+2588. This drives the real one.
+        """
+        src = str(pathlib.Path(su.__file__).resolve().parents[1])
+        env = {**os.environ, "PYTHONPATH": src, "PYTHONIOENCODING": "ascii"}
+        for name in ("SLURMATE_NO_BANNER", "SLURMATE_ASCII", "SLURMATE_BANNER_ANIMATE"):
+            env.pop(name, None)
+        done = subprocess.run(
+            [sys.executable, "-c",
+             "from slurmate import theme\n"
+             "theme.make_output_safe()\n"
+             "theme.print_banner(interactive=False)\n"],
+            capture_output=True, env=env, timeout=120,
+        )
+        assert done.returncode == 0, done.stderr
+        assert b"\\u2588" not in done.stdout, "banner came out as escape soup"
+        assert b"#######" in done.stdout, done.stdout
+        # The banner keeps its shape: same line count, same width per line.
+        art = [
+            ln for ln in done.stdout.decode("ascii").splitlines()
+            if ln.strip() and set(ln) <= set("#+=| ")
+        ]
+        assert len(art) == 6, art
+        assert len({len(ln) for ln in art}) == 1, [len(ln) for ln in art]
 
 
 class TestClockSkewInTheEta:
@@ -4411,7 +4800,14 @@ class TestSchedulerRefusalReachesEveryMode:
             # COLUMNS is load-bearing: at rich's 80-column default the reason
             # wraps mid-sentence and a substring assertion silently stops
             # matching the thing it is meant to pin.
+            # PYTHONDONTWRITEBYTECODE is explicit because this `env` REPLACES the
+            # parent's rather than extending it, so the setting a developer or CI
+            # exported does not reach the child -- and without it every run of
+            # this class dropped `src/slurmate/__pycache__/*.pyc` into the working
+            # tree. A test that leaves artefacts behind is a test that makes
+            # `git status` unreadable.
             env={"PATH": str(bindir), "NO_COLOR": "1", "COLUMNS": "220",
+                 "PYTHONDONTWRITEBYTECODE": "1",
                  "PYTHONPATH": str(pathlib.Path(__file__).parent.parent / "src"),
                  "HOME": os.environ.get("HOME", "/tmp")},
         )
@@ -4450,6 +4846,67 @@ class TestSchedulerRefusalReachesEveryMode:
         assert all("--test-only" in c for c in calls), (
             f"--yes submitted for real after a refusal: {calls}"
         )
+
+    # ── --force: the refusal is a verdict about THIS cluster ─────────────────
+    #
+    # SM-30 review, 2026-08-27. `--force` is documented as "Downgrade cluster
+    # checks (unknown partition/account) to warnings -- for writing a script to
+    # carry to another cluster", which is exactly the case where a flag this
+    # Slurm rejects may be valid on the target. Classifying the refusal permanent
+    # was right; letting it outrank `--force` left the flag unable to do the one
+    # thing it exists for.
+
+    def test_force_downgrades_the_scheduler_refusal_to_a_warning(self, fake_cluster):
+        bindir, _log = fake_cluster
+        done = self._run(bindir, "--dry-run", ["--force"])
+        combined = done.stdout + done.stderr
+        assert self.REASON in combined, "--force must not silence the finding"
+        assert "not enforced" in combined, (
+            "the finding was kept but still presented as a decision"
+        )
+        assert "✗" not in combined and "Slurm refuses this job:" not in combined, (
+            f"still rendered as a hard error under --force:\n{combined}"
+        )
+
+    def test_force_lets_yes_submit(self, fake_cluster):
+        """The consistency argument, not a preference.
+
+        An unknown partition is also a certain rejection, and `--force` already
+        lets that submit. Blocking here while that goes through would make
+        `--force` able to override the checks slurmate derives and not the one the
+        controller itself rendered -- the wrong way round.
+        """
+        bindir, log = fake_cluster
+        done = self._run(bindir, "--yes", ["--force"])
+        calls = log.read_text().splitlines() if log.exists() else []
+        real = [c for c in calls if "--test-only" not in c]
+        assert real, f"--force --yes still refused to submit; sbatch saw {calls}"
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    def test_without_force_the_gate_is_unchanged(self, fake_cluster):
+        # The control. This is the finding SM-30 filed, and --force must not have
+        # widened its way into the default path.
+        bindir, log = fake_cluster
+        done = self._run(bindir, "--yes")
+        assert done.returncode == 1
+        calls = log.read_text().splitlines() if log.exists() else []
+        assert calls and all("--test-only" in c for c in calls), calls
+        combined = done.stdout + done.stderr
+        assert "not enforced" not in combined
+
+    def test_force_does_not_relabel_a_transient_refusal(self, transient_cluster):
+        """--force changes the standing of a verdict, not its classification.
+
+        A submit-count cap means wait, not fix; it already renders as a warning
+        and already submits. If `--force` started calling it "reported, not
+        enforced" the user would read a temporary condition as a cluster
+        mismatch, which is a new wrong answer rather than a downgraded one.
+        """
+        bindir, _log = transient_cluster
+        done = self._run(bindir, "--dry-run", ["--force"])
+        combined = done.stdout + done.stderr
+        assert "cannot take this job right now" in combined, combined
+        assert "not enforced" not in combined, combined
 
     # ── the other half: a refusal about the moment, not the request ──────────
 
@@ -4492,6 +4949,38 @@ class TestSchedulerRefusalReachesEveryMode:
             f"--yes refused a valid job over a transient limit: {calls}"
         )
         assert done.returncode == 0
+
+    def test_the_transient_wording_is_the_same_in_every_mode(self, transient_cluster):
+        """Polish pass, 2026-08-27: one condition, one sentence.
+
+        `--dry-run` said "the script is valid; this clears on its own" and
+        `--print` said "the script itself is valid" — the same transient refusal
+        described two ways depending on which mode the reader happened to be in.
+        The two halves agreed on the prefix and diverged on the part that tells
+        the user what to do, which is the half worth getting right.
+
+        Compared mode-to-mode rather than against a literal, so the check is that
+        they AGREE; rewording both together stays legal.
+        """
+        bindir, _log = transient_cluster
+        printed = self._run(bindir, "--print")
+        dry = self._run(bindir, "--dry-run")
+
+        def qualifier(text):
+            line = next(
+                (ln for ln in text.splitlines() if "cannot take this job right now" in ln),
+                "",
+            )
+            assert line, f"no transient line found in:\n{text}"
+            return line[line.index("cannot take this job right now"):]
+
+        p_out = qualifier(printed.stdout + printed.stderr)
+        d_out = qualifier(dry.stdout + dry.stderr)
+        assert "clears on its own" in p_out, p_out
+        assert p_out.split(":", 1)[0] == d_out.split(":", 1)[0]
+        assert p_out.endswith(d_out[-len("clears on its own)"):]), (
+            f"--print says {p_out!r}\n--dry-run says {d_out!r}"
+        )
 
 
 class TestRefusalAttribution:
@@ -4582,11 +5071,71 @@ class TestRefusalClassification:
          True, "not available"),
         ("allocation failure: Requested node configuration is not available now",
          False, "not available now"),
+        # midway3, Slurm 20.11.8: the SAME two mistakes the entries above cover
+        # for 25.11, worded differently by the older controller. Measured with
+        # `sbatch --test-only -A rcc-staff -p amd --cpus 9999 -t 1:00:00`.
+        # Unclassified, these fell through to the "refused" label -- the fallback
+        # for a refusal whose permanence is unknown -- while the README documents
+        # `ETA:  never` for this exact message.
+        ("allocation failure: More processors requested than permitted",
+         True, "More processors requested than permitted"),
+        ("allocation failure: More nodes requested than permitted",
+         True, "More nodes requested than permitted"),
+        # midway3, Slurm 20.11.8. A directive naming something the cluster's
+        # configuration does not contain. Measured by generating a script with
+        # `--custom-sbatch` and handing it to `sbatch --test-only`:
+        # `--nodelist=nosuchnode1` and `--exclude=nosuchnode1` both answer
+        # "Invalid node name specified"; `--nodelist=beagle3-0001 -p amd` (a real
+        # node, wrong partition) answers "Requested nodes not in this partition";
+        # `--licenses=nosuchlic:1` answers "Invalid license specification".
+        # Unclassified, each of the three made `--print` exit 0 -- with only the
+        # "slurmate cannot tell whether this clears on its own" advisory -- for a
+        # script sbatch had just refused.
+        ("allocation failure: Invalid node name specified",
+         True, "Invalid node name specified"),
+        ("allocation failure: Requested nodes not in this partition",
+         True, "Requested nodes not in this partition"),
+        ("allocation failure: Invalid license specification",
+         True, "Invalid license specification"),
     ])
     def test_measured_refusals_are_classified(self, out, permanent, shown):
         _eta, reason = su._read_test_only_output("", out, 1)
         assert shown in reason
         assert su.refusal_is_permanent(reason) is permanent
+
+    def test_a_per_user_cap_is_not_swept_up_by_the_new_markers(self):
+        """The control. Both new markers are per-JOB ceilings (partition/QoS
+        MaxCPUs, MaxNodes), so "permanent" is right for them -- but the per-USER
+        counterparts clear when someone else's job finishes, and treating those as
+        permanent would refuse to submit a job that would have run. Slurm words
+        them as their own tokens, and the transient list is consulted first.
+        """
+        assert su.refusal_is_transient("QOSMaxSubmitJobPerUserLimit") is True
+        assert su.refusal_is_permanent("QOSMaxSubmitJobPerUserLimit") is False
+        assert su.refusal_is_permanent("QOSMaxCpuPerUserLimit") is False
+        # ...while the per-job spelling of the same resource stays permanent.
+        assert su.refusal_is_permanent("QOSMaxCpuPerJobLimit") is True
+
+    def test_a_node_refusal_about_the_moment_is_still_transient(self):
+        """The control for the three node/licence markers. They are about the
+        configuration -- a name that is not in the node, partition or licence
+        table -- and Slurm has a *separate*, equally node-shaped refusal that is
+        about the moment: the nodes exist and are in the partition, they are just
+        down or drained right now. A marker loose enough to catch "node" would
+        swallow it and turn a wait into "this job can never run".
+        """
+        moment = ("Nodes required for job are DOWN, DRAINED or reserved for "
+                  "jobs in higher priority partitions")
+        assert su.refusal_is_transient(moment) is True
+        assert su.refusal_is_permanent(moment) is False
+        # Slurm's own "now" still marks the transient variant of the node-config
+        # refusal, and the new markers must not have overridden it.
+        assert su.refusal_is_permanent(
+            "Requested node configuration is not available now"
+        ) is False
+        # ...and the new markers must not fire on a refusal that merely mentions
+        # nodes. Only the measured wordings graduate to "permanent".
+        assert su.refusal_is_permanent("Requested nodes are busy") is False
 
     def test_an_unrecognised_refusal_is_not_permanent(self):
         # Guessing "permanent" for wording we have never seen would refuse jobs
@@ -5630,7 +6179,12 @@ class TestUnlimitedTimeIsAcceptedAndBounded:
     def test_accepted(self, value):
         assert su.validate_time(value) is True
 
-    @pytest.mark.parametrize("value", ["inf", "INF", "notatime", "forever", "1:99"])
+    # "1:99" used to sit in this list. It does not belong: sbatch verifies it
+    # (as 2 minutes), so it was never evidence of the inverse bug — see
+    # TestTimeFormsSlurmAcceptsAreNotRefused. The members that remain are all
+    # measured "Invalid --time specification".
+    @pytest.mark.parametrize("value", ["inf", "INF", "notatime", "forever",
+                                       "1:0:0:0", "1.5"])
     def test_rejected(self, value):
         assert su.validate_time(value) is False, (
             "accepting what sbatch rejects is the inverse of the bug being fixed"
@@ -5821,6 +6375,143 @@ class TestTrailingPercentIsRefusedTruthfully:
         )
         assert done.returncode == 1
         assert "no number" in done.stderr
+
+
+# Module level, not a class attribute: a comprehension in a class body cannot
+# see the class's own names, only globals and its outermost iterable.
+_SPECS_SLURMATE_ALLOWS_ANYWAY = ["1 ,3", "1-10 %4", "3:2", "1,3:2"]
+
+
+class TestSpecsSlurmAcceptsAreNotCalledInvalid:
+    """`array_spec_reason` said "Invalid array specification" for shapes the
+    controller takes, which is a false claim about the scheduler in the same
+    class as the trailing-`%` case above.
+
+    Every row below was measured this session with `sbatch --test-only -A
+    rcc-staff -p amd` against a live Slurm 20.11.8 controller (no job submitted).
+    slurmate goes on refusing all of them — each is a typo Slurm accepts in
+    silence instead of reporting — but the *reason* must not assert invalidity.
+    """
+
+    # (spec, does `sbatch --test-only` verify it?)
+    MEASURED = [
+        # accepted: empty entries are dropped from the index list
+        ("1,,3", True), ("1,,,3", True), (",1,3", True), ("1,3,", True),
+        ("1-10,,2-3", True), ("1-10,,", True), (",", True), (",,", True),
+        # accepted: the text after the first `%` is never checked
+        ("1-10%%4", True), ("1-10%%", True), ("1-10%x", True), ("1-10%abc", True),
+        ("1-10%4x", True), ("1-10%-4", True), ("1-10%4%5", True), ("1-10%4,5", True),
+        ("1-10% 4", True), ("1-10:2%%4", True), ("%%4", True), (",%4", True),
+        # accepted: strtol skips whitespace *before* a number
+        ("1, 3", True), ("1- 5", True), ("0- 9:2", True), ("1-10: 2", True),
+        # rejected: whitespace *after* a number is a parse error
+        ("1 ,3", False), ("1 -5", False), ("1 ,,3", False), ("1-10 ,,2", False),
+        ("1-10 :2", False), ("1-10 : 2", False), ("1-10 %4", False), ("1, ,3", False),
+        # rejected: a step needs a range to step through
+        ("3:2", False), ("1,3:2", False), ("1,3: 2", False), ("1,,3:2", False),
+        # rejected: malformed index, whatever the throttle says
+        ("10-1", False), ("10-1%%4", False), ("a-b", False), ("1--5", False),
+        ("1-2-3", False), ("1,,a", False), ("1-", False), ("-5", False),
+        ("1-10:0", False),
+    ]
+    ACCEPTED = [s for s, ok in MEASURED if ok]
+    # Slurm refuses these AND slurmate refuses them: the control group, where
+    # "invalid" is the accurate word and must survive the softer wording.
+    # `validate_array_spec` lets the four in ALLOWED_ANYWAY through entirely, so
+    # there is no reason string to check — a separate, pre-existing laxity in the
+    # other direction (slurmate passes a script the controller then refuses),
+    # reported rather than fixed here.
+    ALLOWED_ANYWAY = _SPECS_SLURMATE_ALLOWS_ANYWAY
+    REJECTED = [s for s, ok in MEASURED
+                if not ok and s not in _SPECS_SLURMATE_ALLOWS_ANYWAY]
+
+    @pytest.mark.parametrize("spec, accepted", MEASURED)
+    def test_the_helper_matches_the_controller(self, spec, accepted):
+        assert su._slurm_would_accept_array_spec(spec) is accepted, spec
+
+    # The two shapes this fix was filed for.
+    @pytest.mark.parametrize("spec", ["1,,3", "1-10%%4"])
+    def test_the_filed_shapes_are_no_longer_called_invalid(self, spec):
+        reason = su.array_spec_reason(spec)
+        assert "invalid" not in reason.lower(), (
+            f"slurmate calls {spec!r} invalid; sbatch --test-only verifies it"
+        )
+        assert "Slurm accepts this" in reason
+
+    @pytest.mark.parametrize("spec", ACCEPTED)
+    def test_no_accepted_spec_is_ever_called_invalid(self, spec):
+        # Either slurmate accepts it too (no reason at all), or it refuses it
+        # with a reason that does not blame the scheduler.
+        reason = su.array_spec_reason(spec)
+        assert not reason.startswith("Invalid array specification"), spec
+        if reason:
+            assert "invalid" not in reason.lower(), spec
+            assert "Slurm accepts this" in reason, spec
+
+    @pytest.mark.parametrize("spec", ["1,,3", "1-10%%4", "1-10: 2", ","])
+    def test_the_refusal_still_stands(self, spec):
+        # The defect was the wording, not the policy: these stay refused.
+        assert su.validate_array_spec(spec) is False
+        assert su.array_spec_reason(spec) != ""
+
+    @pytest.mark.parametrize("spec, fix", [
+        ("1,,3", "'1,3'"),                 # the surviving indices, spelled out
+        ("1-10,,2-3", "'1-10,2-3'"),
+        ("1-10%%4", "'1-10%4'"),
+        ("1-10: 2", "'1-10:2'"),
+        ("1,,3%%4", "'1,3%4'"),            # both faults at once
+    ])
+    def test_the_reason_names_the_spec_that_was_meant(self, spec, fix):
+        assert fix in su.array_spec_reason(spec)
+
+    def test_both_faults_are_reported_not_just_the_first(self):
+        reason = su.array_spec_reason("1,,3%%4")
+        assert "empty entry" in reason and "after the '%'" in reason
+
+    # ---- the control: a spec Slurm really does refuse keeps its own reason ----
+    @pytest.mark.parametrize("spec", REJECTED)
+    def test_genuinely_invalid_specs_still_say_invalid(self, spec):
+        # Every one of these was measured "Invalid job array specification" by
+        # the controller, so "invalid" is the accurate word and must survive the
+        # softer wording added for the accepted shapes.
+        assert su.validate_array_spec(spec) is False, spec
+        assert su.array_spec_reason(spec) == f"Invalid array specification: {spec}", spec
+
+    def test_the_control_is_not_vacuous(self):
+        # If the truthful branch ever swallowed everything, REJECTED would go
+        # empty or stop reaching the "Invalid" return; pin both.
+        assert len(self.REJECTED) >= 15
+        assert su.array_spec_reason("10-1%%4").startswith("Invalid")
+
+    @pytest.mark.parametrize("spec", ALLOWED_ANYWAY)
+    def test_a_separate_laxity_the_controller_still_catches(self, spec):
+        # Documented, not endorsed: trailing whitespace inside an entry and a
+        # step on a bare index are both "Invalid job array specification" at the
+        # controller, but `validate_array_spec` strips entries and does not
+        # require a range before a `:`, so slurmate emits the script anyway.
+        # `_slurm_would_accept_array_spec` knows better, which is what keeps
+        # `array_spec_reason` from making a false claim about them.
+        assert su._slurm_would_accept_array_spec(spec) is False
+        assert su.validate_array_spec(spec) is True     # the gap, as it stands
+        assert su.array_spec_reason(spec) == ""
+
+    def test_valid_specs_still_have_no_reason(self):
+        for spec in ("1-10", "1-10%4", "%4", "1-10%0", "1,2-4:2", ""):
+            assert su.array_spec_reason(spec) == "", spec
+
+    def test_it_reaches_the_cli(self):
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "cpu-shared", "--cpus", "1",
+             "--memory", "1G", "--time", "00:05:00", "--array", "1,,3",
+             "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert done.returncode == 1
+        assert "empty entry" in done.stderr
+        assert "Invalid array specification" not in done.stderr
 
 
 class TestSavedScriptIsPrivate:
@@ -6922,9 +7613,12 @@ class TestNodeLocalLogDirIsFlagged:
             left, _, right = line.partition(" - ")
             point = left.split()[4]
             fs = right.split()[0]
-            if path == point or path.startswith(point.rstrip("/") + "/"):
-                if len(point) >= len(best):
-                    best, best_type = point, fs
+            # One condition, mirroring `mount_fs_type`'s own shape: this double
+            # exists to reproduce it, so the two should read alike.
+            if (
+                path == point or path.startswith(point.rstrip("/") + "/")
+            ) and len(point) >= len(best):
+                best, best_type = point, fs
         return best_type
 
     def test_tmp_is_flagged(self):
@@ -7009,3 +7703,243 @@ class TestMountFsTypeParsesMountinfo:
     def test_an_unreadable_mountinfo_claims_nothing(self, mocker):
         mocker.patch("builtins.open", side_effect=OSError("nope"))
         assert su._mount_fs_type("/tmp") == ""
+
+
+class TestTimeFormsSlurmAcceptsAreNotRefused:
+    """`validate_time` capped minute/second fields at 0-59 and the days-hours
+    field at two digits, and its comment justified that by asserting sbatch
+    "still rejected client-side" values like ``1:60:60`` and ``1-99:99:99``.
+
+    Measured this session against a live Slurm 20.11.8 controller with
+    ``sbatch --test-only -A rcc-staff -p amd --wrap=true -t <value>`` (verify
+    only; no job submitted, nothing billed): sbatch takes all of them. Slurm's
+    ``--time`` grammar constrains the *shape* — how many colon-separated fields,
+    with a digit in each — and never the magnitude of a field.
+
+    So the cap was a false refusal of a request the scheduler accepts, and
+    ``slurmate --time 1:60`` exited 1 on it. `_parse_slurm_time_to_minutes`
+    already read every one of these correctly, which is how the controller's own
+    interpretation could be checked field by field (see MINUTES below).
+    """
+
+    # (value, does `sbatch --test-only -t <value>` verify it?)
+    MEASURED = [
+        # accepted: a seconds field over 59 just carries into the minutes
+        ("1:60", True), ("1:99", True), ("0:60", True), ("0:99", True),
+        ("99:99", True), ("1:999", True), ("999:999", True),
+        # accepted: same for minutes and seconds in HH:MM:SS
+        ("1:60:60", True), ("1:60:00", True), ("1:5:99", True),
+        ("999:999:999", True), ("100:00:00", True),
+        # accepted: the days-hours field is not two digits wide
+        ("1-99", True), ("1-100", True), ("1-999", True), ("0-999", True),
+        ("2-99", True), ("365-0", True),
+        # accepted: out-of-range fields after the day dash, too
+        ("1-0:60", True), ("1-0:99", True), ("1-1:99:99", True),
+        ("1-99:99:99", True), ("1-1:999:999", True), ("1-999:999:999", True),
+        # accepted: the ordinary spellings, as a sanity anchor
+        ("1", True), ("90", True), ("0", True), ("5:3", True), ("1:2:3", True),
+        ("1-24", True), ("1-23:59:59", True), ("01:02:03", True),
+        ("001:002:003", True), ("7-0", True), ("1000000", True),
+        # rejected: a shape error, not a magnitude. A fourth field ...
+        ("1:0:0:0", False), ("1-1:1:1:1", False),
+        # ... an empty field ...
+        ("1:", False), (":5", False), ("1:2:", False), ("1-:2", False),
+        ("1--2", False), ("1-2-3", False),
+        # ... a sign, or anything that is not a digit.
+        ("+5", False), ("1:+2", False), ("1:-2", False), ("1.5", False),
+        ("10m", False), ("1h", False), ("1_2", False), ("1;2", False),
+        ("inf", False),
+    ]
+    ACCEPTED = [v for v, ok in MEASURED if ok]
+    REJECTED = [v for v, ok in MEASURED if not ok]
+
+    #: What the controller itself made of the out-of-range values, pinned down
+    #: with ``--time-min``: sbatch refuses a ``--time-min`` above ``--time``, so
+    #: bisecting it reads back the minutes sbatch stored. Measured:
+    #:   -t 0:99        accepts --time-min 2,    refuses 3
+    #:   -t 1:60        accepts --time-min 2,    refuses 3
+    #:   -t 1:60:60     accepts --time-min 121,  refuses 122
+    #:   -t 1-99:99:99  accepts --time-min 7481, refuses 7482
+    MINUTES = [("0:99", 2), ("1:60", 2), ("1:60:60", 121), ("1-99:99:99", 7481)]
+
+    # The four values the previous comment named as "rejected client-side".
+    FILED = ["1:60", "1:60:60", "1-99:99:99", "1:5:99"]
+
+    @pytest.mark.parametrize("value", ACCEPTED)
+    def test_no_value_the_controller_accepts_is_refused(self, value):
+        assert su.validate_time(value) is True, (
+            f"slurmate refuses --time {value!r}; sbatch --test-only verifies it"
+        )
+
+    @pytest.mark.parametrize("value", FILED)
+    def test_the_filed_values_validate(self, value):
+        assert su.validate_time(value) is True
+
+    @pytest.mark.parametrize("value, minutes", MINUTES)
+    def test_the_parser_agrees_with_the_controller(self, value, minutes):
+        # Rounded up, because Slurm stores whole minutes and a partial minute
+        # still consumes one. This is what makes accepting the value safe: the
+        # cost estimate and any MaxTime comparison land on sbatch's own figure.
+        assert math.ceil(su._parse_slurm_time_to_minutes(value)) == minutes, value
+
+    @pytest.mark.parametrize("value", ["1:60", "1-99:99:99", "1-100"])
+    def test_it_reaches_the_cli(self, value):
+        # The user-visible half of the defect: main.py hard-validates --time and
+        # exits 1 before any partition lookup happens, so the whole run died on a
+        # value sbatch would have taken.
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "cpu-shared", "--cpus", "1",
+             "--memory", "1G", "--time", value, "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert done.returncode == 0, done.stderr
+        assert "Invalid time limit" not in done.stderr
+        assert f"--time={value}" in done.stdout
+
+    def test_the_cli_control_a_malformed_time_still_exits_1(self):
+        # Control: the refusal path itself is intact and still names the forms.
+        env = {**os.environ, "PYTHONPATH": os.path.abspath("src"),
+               "SLURMATE_MOCK": "1", "NO_COLOR": "1", "COLUMNS": "220"}
+        done = subprocess.run(
+            [sys.executable, "-m", "slurmate", "--print", "--force",
+             "--job-name", "x", "--partition", "cpu-shared", "--cpus", "1",
+             "--memory", "1G", "--time", "1:0:0:0", "--command", "echo hi"],
+            capture_output=True, text=True, timeout=180, env=env,
+        )
+        assert done.returncode == 1
+        assert "Invalid time limit value: 1:0:0:0" in done.stderr
+
+    # ---- the control: a shape Slurm really does refuse stays refused ----
+    @pytest.mark.parametrize("value", REJECTED)
+    def test_genuinely_malformed_times_stay_refused(self, value):
+        # Every one of these was measured "sbatch: error: Invalid --time
+        # specification" by the controller, so refusing them is correct and must
+        # survive the relaxation made for the accepted magnitudes.
+        assert su.validate_time(value) is False, value
+
+    def test_the_control_is_not_vacuous(self):
+        # If the relaxed grammar ever degenerated into "anything goes", REJECTED
+        # would stop failing; pin its size and two representative members.
+        assert len(self.REJECTED) >= 15
+        assert su.validate_time("1:0:0:0") is False
+        assert su.validate_time("inf") is False
+
+    def test_the_word_forms_and_empty_are_untouched(self):
+        # Control: the pre-existing special cases are orthogonal to the grammar
+        # and must read the same before and after.
+        assert su.validate_time("") is True
+        assert su.validate_time("UNLIMITED") is True
+        assert su.validate_time("infinite") is True
+        assert su.validate_time("abc") is False
+
+
+class TestTheMemoryAdviceNamesOnlyFormsSbatchTakes:
+    """`MEMORY_FORMS` is printed on a rejection, so it has to name a form that works.
+
+    It said *"Slurm's per-node and per-cpu suffixes are accepted too (`16GN`,
+    `16GC`)"*. Slurm accepts neither: `sbatch --mem=16GN` answers
+    `sbatch: error: Invalid --mem specification` with rc=255, and the sbatch man
+    page gives the units as `[K|M|G|T]`. The `n`/`c` suffix belongs to `sacct`'s
+    ReqMem *output* (`4Gn`, `4Gc`), and the two were conflated.
+
+    Nothing unsubmittable was ever emitted -- `normalize_memory` strips the suffix
+    and `builder.py:970` writes the normalised value -- so this is a false claim
+    about the scheduler on an error path, not a broken script. `validate_memory`
+    stays lenient on input, which is the point: a value pasted out of `sacct` is
+    accepted and canonicalised rather than refused.
+
+    Every row was measured this session with
+    `sbatch --test-only -A rcc-staff -p amd -t 1 --wrap=true --mem=<value>`
+    against a live Slurm 20.11.8 controller; no job was submitted. The column
+    records whether the *format* parses: rc=255 ("Invalid --mem specification") is
+    a grammar refusal, while rc=1 is a capacity verification failure on a
+    well-formed value, which `1T` and `99999999G` hit on this partition.
+    """
+
+    # (value, does sbatch consider the FORMAT valid?)
+    MEASURED = [
+        # plain megabytes, and every documented unit
+        ("4096", True), ("16G", True), ("512M", True), ("4096K", True),
+        ("1T", True), ("99999999G", True),
+        # lower case works
+        ("16g", True), ("512m", True), ("1t", True),
+        # a trailing B is taken
+        ("16GB", True), ("16kb", True),
+        # 0 is the whole-node idiom
+        ("0", True), ("0G", True),
+        # the two the advice used to recommend: NOT Slurm grammar
+        ("16GN", False), ("16GC", False), ("16gn", False), ("16gc", False),
+        # a fraction is not taken either
+        ("1.5G", False), ("0.5T", False),
+        # ordinary nonsense
+        ("-4", False), ("abc", False), ("16Gx", False), ("16P", False),
+        ("16GiB", False), ("16B", False),
+    ]
+
+    ACCEPTED = {v for v, ok in MEASURED if ok}
+
+    def test_every_form_the_advice_names_is_one_sbatch_takes(self):
+        """The fix, stated so it cannot drift: read the forms out of the string.
+
+        Hard-coding "the advice does not say 16GN" would pass the moment someone
+        recommended `16GT` instead. This parses every backtick-quoted form out of
+        the sentence the user is actually shown and checks it against the measured
+        matrix, so any future addition has to be a form that works.
+        """
+        from slurmate.system_utils import MEMORY_FORMS
+
+        named = re.findall(r"`([^`]+)`", MEMORY_FORMS)
+        assert named, "the advice names no forms at all"
+        bad = [f for f in named if f not in self.ACCEPTED]
+        assert bad == [], (
+            "the memory advice recommends %s, which sbatch answers "
+            '"Invalid --mem specification" for' % bad
+        )
+
+    def test_the_advice_no_longer_presents_the_suffix_as_slurm_grammar(self):
+        from slurmate.system_utils import MEMORY_FORMS
+
+        assert "16GN" not in MEMORY_FORMS and "16GC" not in MEMORY_FORMS
+
+    def test_normalize_strips_the_sacct_suffix_rather_than_preserving_it(self):
+        """Pins what the code does, against a docstring that claimed the opposite.
+
+        `normalize_memory` said "Preserves Slurm N/C suffix if present". It strips
+        it -- and stripping is the only safe answer, because the preserved form is
+        the one sbatch refuses.
+        """
+        from slurmate.system_utils import normalize_memory
+
+        assert normalize_memory("16GN") == "16G"
+        assert normalize_memory("16GC") == "16G"
+        assert normalize_memory("16gn") == "16G"
+        # ...and the emitted directive is therefore one the controller takes.
+        assert normalize_memory("16GN") in self.ACCEPTED
+
+    def test_the_suffix_is_still_tolerated_on_input(self):
+        """CONTROL -- passes before and after; the leniency is deliberate.
+
+        A fix that "corrected" this by making `validate_memory` refuse `16GN`
+        would satisfy every test above and turn a value copied out of `sacct` into
+        a hard rejection, which is the opposite of the intent.
+        """
+        from slurmate.system_utils import validate_memory
+
+        assert validate_memory("16GN") is True
+        assert validate_memory("16GC") is True
+
+    def test_a_genuinely_invalid_value_is_still_refused(self):
+        """CONTROL -- the leniency must not have become "accept anything"."""
+        from slurmate.system_utils import validate_memory
+
+        for value in ("abc", "16Gx", "-4", ""):
+            assert validate_memory(value) is False, value
+
+    def test_the_control_is_not_vacuous(self):
+        """The matrix must actually contain both verdicts, or nothing is pinned."""
+        assert any(ok for _, ok in self.MEASURED)
+        assert any(not ok for _, ok in self.MEASURED)
+        assert "16GN" in {v for v, ok in self.MEASURED if not ok}

@@ -1,6 +1,13 @@
 """Tests for the CLI entry point and batch mode."""
 
-from slurmate.main import _parse_custom_flags, parse_args, run_batch
+# `_parse_custom_flags` from its real home. `main` used to re-export it by
+# accident of an eager `from .tui import ...`, which cost 269 ms of
+# prompt_toolkit on every non-interactive run; that import is deferred now, so
+# the re-export is gone.
+import pytest
+
+from slurmate.main import parse_args, run_batch
+from slurmate.tui import _parse_custom_flags
 
 
 class TestParseArgs:
@@ -216,13 +223,13 @@ class TestBatchModeDetection:
 class TestBatchNumericValidation:
     def _ns(self, **over):
         import argparse
-        base = dict(
-            job_name=None, account=None, partition="cpu-shared", qos=None,
-            cpus=None, memory=None, time=None, nodes=None, ntasks_per_node=None,
-            gpus=None, gpu_type=None, gpu_format=None, array=None, modules=None,
-            env=None, env_type=None, output_dir=None, output_file=None,
-            command="echo hi", custom_sbatch=None, yes=False,
-        )
+        base = {
+            "job_name": None, "account": None, "partition": "cpu-shared", "qos": None,
+            "cpus": None, "memory": None, "time": None, "nodes": None, "ntasks_per_node": None,
+            "gpus": None, "gpu_type": None, "gpu_format": None, "array": None, "modules": None,
+            "env": None, "env_type": None, "output_dir": None, "output_file": None,
+            "command": "echo hi", "custom_sbatch": None, "yes": False,
+        }
         base.update(over)
         return argparse.Namespace(**base)
 
@@ -726,3 +733,20 @@ class TestModuleEntryPoint:
                            capture_output=True, text=True, timeout=60)
         assert r.returncode == 0
         assert "slurmate" in r.stdout.lower()
+
+
+class TestTheHelpNamesTheCommand:
+    def test_usage_says_slurmate_not_main_py(self, capsys):
+        """Without an explicit prog, argparse takes it from sys.argv[0], so
+        `python -m slurmate --help` announced itself as `usage: __main__.py`.
+        The other four tools in this family all pin it; slurmate is the name a
+        user types, and the one its help should print.
+        """
+        from slurmate.main import parse_args
+
+        with pytest.raises(SystemExit):
+            parse_args(["--help"])
+        out = capsys.readouterr().out
+        assert out.startswith("usage: slurmate"), out.splitlines()[0]
+        assert "__main__.py" not in out
+

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import difflib
 import getpass
 import json
@@ -10,7 +11,8 @@ import re
 import shlex
 import shutil
 import subprocess
-from collections.abc import Iterable
+import time
+from collections.abc import Iterable, Iterator
 from datetime import datetime
 from typing import Any
 
@@ -53,21 +55,115 @@ _RUN_TIMEOUT = 30
 # waited on.
 _ADVISORY_TIMEOUT = 10
 
+# Total wall clock every Slurm query in one *phase* may spend between them.
+#
+# The per-call bound above is correct and was the only one there was, so against
+# an unresponsive `slurmctld` the worst case was their SUM: one `--dry-run`
+# makes four invocations (2x sinfo, squeue, sbatch --test-only), each granted the
+# full 30 s independently, so ~120 s of silence with the process looking hung --
+# and every fix that teaches slurmate to consult more of the cluster (the
+# SelectType read, the association check, the QOS MaxWall) adds another 30 s to
+# it.
+#
+# rapidu solved this in `quota.py:_budget` and wrote down why, and the last
+# clause of that docstring applies here verbatim: *"a hanging `lfs quota` is not
+# exotic; it is what a Lustre client does when an MDS is degraded, which is the
+# same afternoon someone reaches for this tool."* A slow controller is exactly
+# when somebody opens a submission helper to see what the cluster looks like.
+#
+# 45 s: comfortably more than the ~2 s a healthy controller needs for all four
+# calls, and short enough that a dead one does not look like a hang. Overridable
+# because a site with a genuinely slow controller should be able to wait longer
+# rather than lose the enrichment.
+DEFAULT_TOTAL_TIMEOUT = 45.0
+_TOTAL_TIMEOUT_ENV = "SLURMATE_TIMEOUT"
+
+#: Wall-clock instant every query in the current phase must finish by, or None
+#: when no phase has been opened -- in which case each call keeps its own
+#: timeout, which is the right behaviour for a long-lived interactive session
+#: and for a direct API caller.
+_DEADLINE: float | None = None
+#: The budget the current phase was opened with, so the "budget exceeded"
+#: message names the figure that actually applied rather than re-deriving the
+#: default -- which differs whenever a caller passed one explicitly.
+_PHASE_BUDGET: float = DEFAULT_TOTAL_TIMEOUT
+
+
+def total_timeout() -> float:
+    """The per-phase budget, from ``$SLURMATE_TIMEOUT`` or the default."""
+    raw = os.environ.get(_TOTAL_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            asked = float(raw)
+        except ValueError:
+            logger.debug(f"ignoring non-numeric {_TOTAL_TIMEOUT_ENV}={raw!r}")
+        else:
+            if asked > 0:
+                return asked
+    return DEFAULT_TOTAL_TIMEOUT
+
+
+@contextlib.contextmanager
+def slurm_deadline(total: float | None = None) -> Iterator[float]:
+    """Bound the *total* time Slurm queries may take inside this block.
+
+    Opened around each batch of queries rather than once per process, because
+    the wizard is interactive: a user takes minutes to answer, and a
+    process-wide deadline would expire while they were reading the screen and
+    then report the cluster as unreachable.  Nested blocks keep the OUTER
+    deadline -- a phase cannot extend its own budget by opening another one.
+    """
+    global _DEADLINE, _PHASE_BUDGET
+    if _DEADLINE is not None:
+        yield _DEADLINE
+        return
+    budget = total if total is not None else total_timeout()
+    _DEADLINE = time.monotonic() + budget
+    _PHASE_BUDGET = budget
+    try:
+        yield _DEADLINE
+    finally:
+        _DEADLINE = None
+
+
+def _budget(timeout: float) -> float:
+    """``timeout``, capped by whatever is left of the phase deadline.
+
+    Ported from `rapidu.quota._budget`, including its shape: a call that falls
+    entirely past the deadline gets 0 and returns the existing timeout message,
+    so the partition list still renders and only the optional enrichment is
+    skipped. That is the right degradation for a tool whose core output is the
+    script.
+    """
+    if _DEADLINE is None:
+        return timeout
+    return max(0.0, min(timeout, _DEADLINE - time.monotonic()))
+
 
 def _run_command(
     cmd: list[str], timeout: int = _RUN_TIMEOUT, stdin: str | None = None
 ) -> tuple[str, str, int]:
+    allowed = _budget(timeout)
+    if allowed <= 0:
+        # Not run at all. `subprocess.run(timeout=0)` starts the process and
+        # then kills it, which is a fork, an exec and a controller connection
+        # spent to learn nothing -- and against a wedged controller those are
+        # the expensive part.
+        return "", (
+            f"Slurm queries exceeded the {_PHASE_BUDGET:.0f}s total budget "
+            f"(${_TOTAL_TIMEOUT_ENV} to change it); skipped {cmd[0]}"
+        ), -1
     try:
         # Force UTF-8 decoding with a lossy fallback: under a C/POSIX locale
         # `text=True` would otherwise decode with ASCII and raise on any
         # non-ASCII byte in the command output (crashing the wizard/batch run).
         result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, timeout=timeout,
+            cmd, capture_output=True, text=True, check=False, timeout=allowed,
             encoding="utf-8", errors="replace", input=stdin,
         )
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
-        return "", f"Command timed out after {timeout}s", -1
+        return "", f"Command timed out after {allowed:.0f}s", -1
     except OSError as e:
         # A Slurm binary that is present but not runnable (bad arch, permission,
         # missing loader) raises here rather than being caught by shutil.which;
@@ -281,7 +377,11 @@ def validate_memory(value: str) -> bool:
     Accepts formats:
     - Plain digits: "16"
     - With units: "16G", "16g", "512M", "1T"
-    - With Slurm N/C suffix: "16GN", "16GC"
+    - With `sacct`'s N/C suffix: "16GN", "16GC" -- tolerated on INPUT only.
+      `sbatch --mem` does not take it (measured: rc=255, "Invalid --mem
+      specification"), so this is deliberate leniency towards a value copied out
+      of `sacct`'s ReqMem column; `normalize_memory` strips it before the
+      directive is written. Do not read this line as Slurm grammar.
 
     Zero is accepted, in every unit spelling. ``--mem=0`` is documented Slurm and
     means *all the memory on the node* — the whole-node idiom — and it was
@@ -308,28 +408,44 @@ def validate_memory(value: str) -> bool:
     # (no unit) and --mem=16GiB both get "Invalid --mem specification". Rejecting
     # "16GB" was a false refusal of the most natural way to write memory, and
     # normalize_memory drops the B so the emitted directive stays canonical.
-    m = re.match(r"^(\d+(?:\.\d+)?)([KMGT])B?(?:[NC])?$", v.upper())
-    if m:
-        return True
-    return False
+    return bool(re.match(r"^(\d+(?:\.\d+)?)([KMGT])B?(?:[NC])?$", v.upper()))
 
 
-# Slurm's accepted --time grammar, allowing 1–2 digit lead fields:
+# Slurm's accepted --time grammar: six shapes, each field a run of digits.
 #   minutes | minutes:seconds | hours:minutes:seconds |
 #   days-hours | days-hours:minutes | days-hours:minutes:seconds
-# Minute/second fields are range-limited to [0-5]?\d (0–59, one or two digits):
-# obviously out-of-range values like "1:60:60" or "1-99:99:99" are still
-# rejected client-side, while unpadded fields Slurm accepts ("5:3", "1:2:3")
-# are no longer falsely rejected (the parser already reads them correctly).
-# (Lead fields stay \d+ / \d{1,2}: hours in hh:mm:ss can legitimately exceed 24,
-# and Slurm accepts a bare "0" as "no limit".)
+#
+# **No field is range- or width-limited**, because sbatch does not limit them.
+# This block used to cap minute/second fields at [0-5]?\d and the days-hours
+# field at \d{1,2}, on the stated grounds that "obviously out-of-range values
+# like '1:60:60' or '1-99:99:99' are still rejected client-side". They are not.
+# Measured against this controller (Slurm 20.11.8), sbatch takes every one of
+# them and carries the value straight into the time limit:
+#
+#   sbatch --test-only -t 0:99         -> PASSED  (--time-min 2    ok, 3 refused)
+#   sbatch --test-only -t 1:60         -> PASSED  (--time-min 2    ok, 3 refused)
+#   sbatch --test-only -t 1:60:60      -> PASSED  (--time-min 121  ok, 122 refused)
+#   sbatch --test-only -t 1-99:99:99   -> PASSED  (--time-min 7481 ok, 7482 refused)
+#   sbatch --test-only -t 1-100        -> PASSED
+#   sbatch --test-only -t 999:999:999  -> PASSED
+#
+# and `_parse_slurm_time_to_minutes` already returns exactly the figure sbatch
+# arrived at in each case (1.65 / 2.0 / 121.0 / 7480.65 minutes). So the cap was a
+# pure false refusal: `slurmate --time 1:60` exited 1 on a request the scheduler
+# would have accepted and measured identically -- the same mistake the
+# `--time UNLIMITED` and `--mem 0` refusals nearby were fixed for.
+#
+# What sbatch *does* reject is a shape error, never a magnitude: a fourth field
+# ("1:0:0:0"), an empty field ("1:", ":5", "1-:2"), a sign ("+5", "1:-2"), a
+# non-digit ("1.5", "10m"), or surrounding whitespace. The six anchored patterns
+# below still refuse all of those.
 _TIME_PATTERNS = (
-    r"^\d+$",                              # minutes
-    r"^\d+:[0-5]?\d$",                     # minutes:seconds
-    r"^\d+:[0-5]?\d:[0-5]?\d$",            # hours:minutes:seconds
-    r"^\d+-\d{1,2}$",                      # days-hours
-    r"^\d+-\d{1,2}:[0-5]?\d$",             # days-hours:minutes
-    r"^\d+-\d{1,2}:[0-5]?\d:[0-5]?\d$",    # days-hours:minutes:seconds
+    r"^\d+$",                  # minutes
+    r"^\d+:\d+$",              # minutes:seconds
+    r"^\d+:\d+:\d+$",          # hours:minutes:seconds
+    r"^\d+-\d+$",              # days-hours
+    r"^\d+-\d+:\d+$",          # days-hours:minutes
+    r"^\d+-\d+:\d+:\d+$",      # days-hours:minutes:seconds
 )
 
 
@@ -383,13 +499,56 @@ def validate_time(val: str) -> bool:
     return any(re.match(p, v) for p in _TIME_PATTERNS)
 
 
+#: What a rejected value should have looked like, phrased for a terminal.
+#:
+#: Beside the validators rather than at the call sites, so the sentence cannot
+#: drift from the grammar it describes -- the time forms are read straight out of
+#: `_TIME_PATTERNS`' own comments and the unlimited words out of the set.
+#:
+#: These exist because three hard rejections (`--memory`, `--mem-per-cpu`,
+#: `--time`) printed the offending value and exited 1 without saying what a valid
+#: one looks like. Every other refusal in this package names the remedy -- an
+#: unknown partition lists the real ones, a rejected flag names `--force` -- so
+#: these three were the odd ones out, and they are the errors a first-time user is
+#: most likely to hit.
+#: Measured against this controller rather than written from the docstrings
+#: below, because those disagreed with sbatch: they present the `N`/`C` suffix as
+#: Slurm grammar, and `sbatch --mem=16GN` answers
+#: "sbatch: error: Invalid --mem specification" (rc=255). Advice on an error path
+#: has to name a form that works, so the suffix is not offered here -- slurmate
+#: tolerates it on input and `normalize_memory` strips it, which is a kindness to
+#: anyone pasting a value out of `sacct`'s ReqMem, not a spelling to recommend.
+#: `sbatch --mem` documents its units as [K|M|G|T]; the trailing `B` is measured
+#: accepted (`16GB`), and a fraction is not (`1.5G` -> rc=255).
+MEMORY_FORMS = (
+    "a number of megabytes (`4096`), or a whole number with a unit "
+    "(`16G`, `512M`, `1T`; lower case works, and a trailing B is fine: `16GB`). "
+    "`0` means \"all the memory on the node\""
+)
+
+
+def time_forms() -> str:
+    """Slurm's ``--time`` spellings, listed from the patterns that accept them."""
+    words = "/".join(sorted(w.upper() for w in SLURM_UNLIMITED_TIME_WORDS))
+    return (
+        "minutes (`90`), `MM:SS`, `HH:MM:SS`, `D-HH`, `D-HH:MM`, "
+        "`D-HH:MM:SS`, or " + words
+    )
+
+
 def normalize_memory(value: str) -> str:
     """Normalize memory value to a standard format.
 
     Returns:
     - Plain digits prefixed with "M": "16" -> "16M"
     - Units already present: "16G" -> "16G"
-    - Preserves Slurm N/C suffix if present
+    - STRIPS `sacct`'s per-node/per-cpu suffix: "16GN"/"16GC" -> "16G". This
+      previously claimed to preserve it, and preserving it would emit a directive
+      sbatch refuses outright ("Invalid --mem specification"). The suffix belongs
+      to `sacct`'s ReqMem *output* (`4Gn`, `4Gc`), not to `--mem` input, so a
+      value pasted from there is accepted and canonicalised rather than rejected.
+    - Folds a fraction into the next unit down: "1.5G" -> "1536M", because sbatch
+      takes only whole numbers.
     """
     v = value.strip().upper()
     if not v:
@@ -722,15 +881,75 @@ def array_task_count(spec: str) -> int | None:
     return total or None
 
 
+def _slurm_reads_as_index_number(text: str) -> bool:
+    """Whether Slurm's array parser reads ``text`` as a number.
+
+    ``strtol`` semantics, which is what the controller uses: whitespace *before*
+    the digits is skipped, whitespace *after* them is a parse error. Measured —
+    ``1- 5`` and ``1-10: 2`` verify, ``1 -5`` and ``1-10 :2`` do not.
+    """
+    return text.lstrip(" \t").isdigit()
+
+
+def _slurm_would_accept_array_spec(spec: str) -> bool:
+    """Whether *sbatch* takes this spec - a laxer question than slurmate's check.
+
+    Deliberately not :func:`validate_array_spec`, which is slurmate's own shape
+    check and stricter on purpose. Written from ``sbatch --test-only`` probes
+    against a live controller, because Slurm is lax and strict in places an
+    intuition-built reimplementation gets backwards:
+
+    * **Empty entries are dropped.** ``1,,3``, ``,1,3``, ``1,3,``, ``1-10,,2-3``
+      and even a bare ``,`` all verify.
+    * **The text after the first ``%`` is never checked.** ``1-10%``,
+      ``1-10%%4``, ``1-10%abc``, ``1-10%4x``, ``1-10%-4``, ``1-10%4%5`` verify.
+      A malformed *index* is still refused whatever the throttle says, which is
+      why ``10-1%%4`` fails for the range and not for the ``%``.
+    * **A step needs a range to step through.** ``1,2-4:2`` verifies but ``3:2``
+      and ``1,3:2`` do not - and :func:`validate_array_spec` accepts both, so
+      delegating to it would claim the controller takes ``1,,3:2``, which it
+      refuses.
+    * **Trailing whitespace is fatal, leading whitespace is not** - see
+      :func:`_slurm_reads_as_index_number`. ``validate_array_spec`` strips each
+      entry, so delegating there would also claim ``1 ,,3`` is accepted.
+
+    Exists so :func:`array_spec_reason` can tell a refusal the controller agrees
+    with from one it contradicts, and never call the second kind "invalid".
+    """
+    body = str(spec or "").strip().partition("%")[0]
+    for entry in body.split(","):
+        if entry == "":
+            continue                       # Slurm drops empty entries
+        index, colon, step = entry.partition(":")
+        if colon and not (_slurm_reads_as_index_number(step)
+                          and int(step) > 0 and "-" in index):
+            return False
+        bounds = index.split("-")
+        if len(bounds) > 2 or not all(_slurm_reads_as_index_number(b) for b in bounds):
+            return False
+        if len(bounds) == 2 and int(bounds[1]) < int(bounds[0]):
+            return False
+    return True
+
+
 def array_spec_reason(spec: str) -> str:
     """Why this array spec is refused, phrased truthfully, or "".
 
-    Most refusals here are things sbatch refuses too, so "invalid" is accurate.
-    The trailing ``%`` is the exception: measured, sbatch **accepts** ``1-10%``
-    and silently drops the throttle, so calling it invalid is a false claim about
-    the scheduler. slurmate still refuses it — a ``%`` with no number is a lost
-    digit, and running an unthrottled array is very unlikely to be what was meant
-    — but the reason given should be the real one.
+    Some refusals here are ones sbatch makes too - a reversed range, a
+    non-numeric index, a zero step - and for those "invalid" is accurate. The
+    rest are shapes the controller **accepts**, and for those "invalid" is a
+    false claim about the scheduler: slurmate still refuses them, because each is
+    a typo Slurm swallows in silence rather than reports, but the reason has to
+    be the real one. Measured accepted-yet-refused, via
+    :func:`_slurm_would_accept_array_spec`:
+
+    * ``1-10%`` - a ``%`` with no number at all; sbatch drops the throttle and
+      runs the array with no cap, which is not what a ``%`` was typed for.
+    * ``1-10%%4``, ``1-10%4x`` - any other non-numeric throttle; sbatch never
+      reads the text after the ``%`` as one, so the cap is not the written one.
+    * ``1,,3`` - an empty entry in the index list; sbatch drops it, so a doubled
+      separator quietly runs a smaller array than the one asked for.
+    * ``1-10: 2`` - a space inside the spec; sbatch skips over it silently.
     """
     text = str(spec or "").strip()
     if not text or validate_array_spec(text):
@@ -742,6 +961,26 @@ def array_spec_reason(spec: str) -> str:
             f"and runs the array with *no* throttle at all, which is unlikely to "
             f"be what a '%' was typed for — write '%N' (e.g. '{body}%4') to cap "
             f"concurrent tasks, or drop the '%'"
+        )
+    if _slurm_would_accept_array_spec(text):
+        faults: list[str] = []
+        if body and any(entry == "" for entry in body.split(",")):
+            faults.append("an empty entry in the index list, which Slurm drops")
+        if any(ch.isspace() for ch in body):
+            faults.append("a space inside the indices, which Slurm skips over")
+        if sep and not throttle.isdigit():
+            faults.append(
+                f"'{throttle}' after the '%', which Slurm does not read as a "
+                f"concurrency number"
+            )
+        kept = [re.sub(r"\s+", "", e) for e in body.split(",") if e.strip()]
+        example = (",".join(kept) or "1-10") + ("%4" if sep else "")
+        return (
+            f"array spec '{text}' has "
+            f"{' and '.join(faults or ['a shape slurmate does not accept'])}. "
+            f"Slurm accepts this rather than reporting it, so the typo would "
+            f"survive into a running array — write it as '{example}' if that is "
+            f"what was meant"
         )
     return f"Invalid array specification: {text}"
 
@@ -1206,9 +1445,13 @@ def _mount_fs_type(path: str) -> str:
             fields[4].replace("\\040", " ").replace("\\011", "\t")
             .replace("\\012", "\n").replace("\\134", "\\")
         )
-        if target == point or target.startswith(point.rstrip("/") + "/"):
-            if len(point) >= len(best):
-                best, best_type = point, rest[0]
+        # One condition: this mount contains the target AND it is at least as
+        # specific as the best seen so far. The two were nested, which read as if
+        # the second were a separate concern.
+        if (
+            target == point or target.startswith(point.rstrip("/") + "/")
+        ) and len(point) >= len(best):
+            best, best_type = point, rest[0]
     return best_type
 
 
@@ -1505,12 +1748,25 @@ def capacity_refusal(
     figures are floors, not ceilings — ``sinfo`` printed its smallest node — so a
     bigger node in the same partition may well take the job, and claiming "never"
     there would trade one confident wrong answer for another. Node counts, array
-    indices and the partition time limit are exact and so always count.
+    indices and the partition time limit are exact and so always count. The array
+    index is the one rule here that reads no partition figure at all, so it is
+    also the only answer available when no partition was chosen.
 
     Pure: no subprocess calls, so the ETA path can consult it for free.
     """
     if not part:
-        return ""
+        # A blank partition is a legitimate answer ("use the site default"), and
+        # returning "" for it dropped the one rule here that never looks at a
+        # partition. MaxArraySize is a controller-wide slurm.conf value, not an
+        # advertised partition figure: measured, `sbatch --test-only
+        # --array=1-99999` against this site's 65533 is refused "Invalid job
+        # array specification" both under `-p amd` and under the site default.
+        # Same shape as validate_job_config's blank-partition early return, and
+        # it calls the same rule body rather than carrying a second copy of the
+        # condition -- two surfaces disagreeing about one fact is the failure
+        # this module works hardest to avoid.
+        issues = _array_size_issues(answers, max_array_size)
+        return issues[0][1] if issues else ""
     soft = bool(part.get("heterogeneous"))
 
     def _as_int(value: Any) -> int | None:
@@ -1526,10 +1782,12 @@ def capacity_refusal(
     if req_nodes and total_nodes and req_nodes > total_nodes:
         return f"partition '{part.get('name')}' has only {total_nodes} node(s)"
 
-    if max_array_size:
-        top = _max_array_index(str(answers.get("array_spec") or ""))
-        if top is not None and top >= max_array_size:
-            return f"array index {top} is beyond MaxArraySize ({max_array_size})"
+    # Left in place rather than hoisted above the no-partition return: the order
+    # of these rules is what a refusal *says* when a request breaks several at
+    # once, so the node count keeps winning over the array as it always did.
+    array_issues = _array_size_issues(answers, max_array_size)
+    if array_issues:
+        return array_issues[0][1]
 
     requested_time = str(answers.get("time_limit") or "")
     if requested_time:
@@ -1586,6 +1844,55 @@ def _limit_phrase(part: dict[str, Any], amount: str, *, exact: bool = False) -> 
     if part.get("heterogeneous"):
         return f"exceeds the smallest node in this partition ({amount}); nodes differ"
     return f"exceeds partition limit ({amount})"
+
+
+def _managed_flag_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
+    """Custom ``#SBATCH`` flags that repeat a directive slurmate emits itself.
+
+    Partition-independent: it reads only ``custom_sbatch``, so it is one of the
+    two rules :func:`validate_job_config` still runs when no partition is known.
+    Reported here (not only on the batch path) so the wizard's live panel, its
+    summary and the pre-submit guard all see it.
+    """
+    from .builder import managed_custom_flags
+
+    return [
+        (
+            "error",
+            f"custom flag {name} duplicates a directive slurmate manages; "
+            f"Slurm would honour it over --{owner.lstrip('-')} and the summary "
+            f"would describe the wrong value",
+        )
+        for name, owner in managed_custom_flags(answers.get("custom_sbatch"))
+    ]
+
+
+def _array_size_issues(
+    answers: dict[str, Any], max_array_size: int | None
+) -> list[tuple[str, str]]:
+    """Array indices vs the site's ``MaxArraySize``.
+
+    ``max_array_size`` is passed in, never fetched here — this runs on every TUI
+    redraw. ``None`` means unknown, and an unknown limit must not become a claim
+    about one.
+
+    Partition-independent: ``MaxArraySize`` is a controller-wide ``slurm.conf``
+    value, so the refusal it predicts does not depend on which partition (or
+    none) was chosen — measured with ``sbatch --test-only ... --array=1-99999``
+    against this site's 65533, which is refused with "Invalid job array
+    specification".
+    """
+    if not max_array_size:
+        return []
+    top = _max_array_index(str(answers.get("array_spec") or ""))
+    if top is None or top < max_array_size:
+        return []
+    return [(
+        "warning",
+        f"Array index {top} is at or beyond this cluster's MaxArraySize "
+        f"({max_array_size}); Slurm rejects the job with 'Invalid job "
+        f"array specification'",
+    )]
 
 
 def partition_capacity(part: dict[str, Any], key: str) -> tuple[int, bool]:
@@ -1653,9 +1960,25 @@ def validate_job_config(
     is the whole point of the check, so the two cannot share a spelling.
     """
     part = answers.get("_partition_obj")
-    if not part:
-        return []
     out: list[tuple[str, str]] = []
+    if not part:
+        # No partition is a legitimate answer, not an incomplete one: it means
+        # "use the site default", and the builder emits no --partition directive
+        # for it (SM-15). The wizard reaches it by confirming an empty value in
+        # the "Enter partition name manually..." row, which leaves
+        # ``_partition_obj`` None for the rest of the session.
+        #
+        # So the partition-DEPENDENT checks below have nothing to compare against
+        # and must stay silent — but returning [] silenced the whole function,
+        # including the rules that never look at a partition at all. A duplicated
+        # ``--job-name`` in --custom-sbatch then produced a second #SBATCH line
+        # that Slurm accepts (measured: `sbatch --test-only ... -J first -J
+        # second` is ***PASSED***) and silently honours over slurmate's, while
+        # the summary described the value that lost — the one failure mode this
+        # check exists to catch, dropped for a reason unrelated to it.
+        out.extend(_managed_flag_issues(answers))
+        out.extend(_array_size_issues(answers, max_array_size))
+        return out
 
     # Cores requested per node (cpus-per-task x tasks-per-node), shared by the CPU
     # check and the --mem-per-cpu total below.
@@ -1686,23 +2009,22 @@ def validate_job_config(
     from .builder import (
         _custom_mem_override,
         _normalize_custom_flags,
-        managed_custom_flags,
     )
-    # Also reported here (not only on the batch path) so the wizard's summary and
-    # the pre-submit guard see it too.
-    for _name, _owner in managed_custom_flags(answers.get("custom_sbatch")):
-        out.append((
-            "error",
-            f"custom flag {_name} duplicates a directive slurmate manages; "
-            f"Slurm would honour it over --{_owner.lstrip('-')} and the summary "
-            f"would describe the wrong value",
-        ))
-    _c_mem, _c_mem_per_cpu = _custom_mem_override(
+    out.extend(_managed_flag_issues(answers))
+    _c_mem, _c_mem_per_cpu, _c_mem_per_gpu = _custom_mem_override(
         _normalize_custom_flags(answers.get("custom_sbatch"))
     )
     mem_limit, mem_exact = partition_capacity(part, "mem")
     eff_mem_per_cpu = _c_mem_per_cpu or answers.get("mem_per_cpu")
-    eff_mem = _c_mem if (_c_mem or _c_mem_per_cpu) else answers.get("memory")
+    # A custom --mem-per-gpu suppresses the auto directive too, so neither the
+    # answers' `memory` nor its `mem_per_cpu` is what the script requests.
+    if _c_mem_per_gpu:
+        eff_mem_per_cpu = _c_mem_per_cpu
+    eff_mem = (
+        _c_mem
+        if (_c_mem or _c_mem_per_cpu or _c_mem_per_gpu)
+        else answers.get("memory")
+    )
     if eff_mem_per_cpu and validate_memory(str(eff_mem_per_cpu)):
         # --mem-per-cpu is per core, so the per-node request is that x the cores
         # requested on the node. Without this, --mem-per-cpu=64G on an 8-core task
@@ -1794,18 +2116,10 @@ def validate_job_config(
     except (ValueError, TypeError):
         pass
 
-    # Array indices vs the site's MaxArraySize. Passed in, never fetched here —
-    # this function runs on every TUI redraw. None means unknown, and an unknown
-    # limit must not become a claim about one.
-    if max_array_size:
-        top = _max_array_index(str(answers.get("array_spec") or ""))
-        if top is not None and top >= max_array_size:
-            out.append((
-                "warning",
-                f"Array index {top} is at or beyond this cluster's MaxArraySize "
-                f"({max_array_size}); Slurm rejects the job with 'Invalid job "
-                f"array specification'",
-            ))
+    # Array indices vs the site's MaxArraySize — see _array_size_issues, which
+    # the no-partition path above shares because the limit is a cluster
+    # constant rather than a partition figure.
+    out.extend(_array_size_issues(answers, max_array_size))
 
     # A partition slurmate could not resolve has no limits, so every check above
     # compared against nothing and stayed quiet. That inverts the failure mode a
@@ -2837,6 +3151,81 @@ _TEST_ONLY_LIMIT_RE = re.compile(
     r"^\s*sbatch:\s*error:\s*([A-Za-z][A-Za-z0-9]{5,})\s*$", re.MULTILINE
 )
 
+# sbatch rejecting the SCRIPT'S OWN directives, before the controller sees it.
+#
+# A third case beside the two `_test_only_refusal` was written for, and it fell
+# into the wrong one. It carries neither `allocation failure:` nor `Reason:`, so
+# "positive evidence or nothing" -- correctly -- produced no refusal, and the
+# caller then fell through to the free-capacity estimate and reported a script
+# sbatch had just rejected as `ETA: now`. That is the whole point of `--dry-run`
+# answered backwards.
+#
+# It is still positive evidence, just of a different thing: these are getopt's
+# and sbatch's own messages about an option in the file, they name the offending
+# token, and none of them is emitted for an unreachable controller or a broken
+# binary -- which is what the "nothing" branch exists to protect. A malformed
+# directive is also permanently malformed, so `refusal_is_permanent` classifies
+# it as such rather than inviting a retry.
+# `sbatch:` is MANDATORY, and the token it names is captured.
+#
+# Optional, the prefix made any line starting with the phrase a permanent
+# refusal -- `"   unrecognized option -- policy change 2026"` from a site banner
+# was enough. Slurm's clients always prefix their own diagnostics.
+_TEST_ONLY_USAGE_RE = re.compile(
+    r"^\s*sbatch:\s*(?:error:\s*)?("
+    r"unrecognized option\s+(?P<a>\S+)"
+    r"|invalid option\s*--\s*(?P<b>\S+)"
+    r"|option\s+(?P<c>\S+)\s+requires an argument"
+    r"|option requires an argument\s*--\s*(?P<d>\S+)"
+    r"|unrecognized argument\s+(?P<e>\S+)"
+    r")\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+#: Options slurmate passes to `sbatch` ITSELF to run the probe, as opposed to
+#: directives it wrote into the script.
+#:
+#: sbatch rejecting one of these is not a statement about the job -- it is a
+#: broken or wrapped local `sbatch`, which is the "controller unreachable" case
+#: and must fall through to the estimate. A site wrapper that forwards a
+#: whitelist (this module's `parse_submitted_job_id` documents such wrappers)
+#: can accept `--parsable` and reject `--test-only`, and reading that as "your
+#: job can never run" refused a submit the same wrapper would have accepted.
+#: Matched by EQUALITY on the de-quoted option name, never as a substring.
+#:
+#: `any(own in named for own in ...)` excused any directive whose name merely
+#: contained one of these: `--wrapper` contains `--wrap`, `--test-only-ish`
+#: contains `--test-only`. Both then got "no verdict", so `--dry-run` fell
+#: through to the free-capacity estimate and printed an ETA for a script sbatch
+#: had just rejected -- which is SM-30 itself, re-opened for a class of names.
+#:
+#: The list covers every option slurmate puts on the probe command line, not
+#: only the three that identify the probe. All of them are directives slurmate
+#: MANAGES and validates -- `managed_custom_flags` refuses a custom flag that
+#: duplicates one -- so a rejection naming one of them is evidence about the
+#: local `sbatch` (a site wrapper forwarding a whitelist) and not about the job.
+_PROBE_OWN_OPTIONS = frozenset({
+    "--test-only", "--parsable", "--wrap",
+    "-p", "--partition", "-q", "--qos", "-A", "--account",
+    "-N", "--nodes", "-c", "--cpus-per-task", "-t", "--time",
+    "--mem", "--gres", "--array", "--constraint",
+})
+
+
+def _probe_own_option(named: str) -> bool:
+    """Whether a rejected token is one slurmate itself passed to the probe.
+
+    Handles both spellings the messages use: `unrecognized option '--gres=gpu:2'`
+    quotes the whole option, while getopt's `invalid option -- q` names a short
+    option by its BARE letter, with no dash for the set below to match.
+    """
+    name = named.strip().strip("'\"").split("=", 1)[0].strip()
+    if not name:
+        return False
+    return name in _PROBE_OWN_OPTIONS or (
+        not name.startswith("-") and "-" + name in _PROBE_OWN_OPTIONS
+    )
+
 # Anything a `--test-only` run prints as `sbatch: error: <text>` is the site's
 # own text: Slurm puts its verdict on the unprefixed `allocation failure:` line,
 # and its scaffolding ("Batch job submission failed: …") belongs to a real
@@ -2868,6 +3257,8 @@ _TRANSIENT_REFUSAL_MARKERS = (
 # whitelist of measured wordings — anything unrecognised stays advisory, because
 # a new gate that guesses "permanent" blocks jobs that would have run.
 _PERMANENT_REFUSAL_MARKERS = (
+    # An option sbatch cannot parse is not going to start parsing later.
+    "rejected an option in the script",
     "invalid account",
     "invalid qos",
     "invalid partition",
@@ -2886,6 +3277,38 @@ _PERMANENT_REFUSAL_MARKERS = (
     # their own — a confident false claim about a job that can never run.
     "node count specification invalid",
     "requested time limit is invalid",
+    # The same two mistakes as above, worded the way an older controller words
+    # them. Slurm 25.11 on Mercury answers "node count specification invalid";
+    # Slurm 20.11.8 on midway3 answers "More nodes requested than permitted" for
+    # the identical request, and "More processors requested than permitted" for
+    # the CPU equivalent. Measured with `sbatch --test-only -p amd --cpus 9999`:
+    # the label came out "refused" -- the fallback for a refusal whose permanence
+    # is unknown -- where the README documents "never" for that very message.
+    # Both are per-job ceilings (partition/QoS MaxCPUs, MaxNodes), so no amount
+    # of waiting fits the request; a *PerUser* cap is worded as its own
+    # QOSMax...PerUserLimit token and is caught by the transient list first.
+    "more processors requested than permitted",
+    "more nodes requested than permitted",
+    # A directive that names something this cluster's *configuration* does not
+    # have. Measured on midway3 (Slurm 20.11.8) by generating a script with
+    # `--custom-sbatch` and handing it to `sbatch --test-only`:
+    #   --nodelist=nosuchnode1     -> "Invalid node name specified"
+    #   --exclude=nosuchnode1      -> "Invalid node name specified"
+    #   --nodelist=beagle3-0001 -p amd
+    #                              -> "Requested nodes not in this partition"
+    #   --licenses=nosuchlic:1     -> "Invalid license specification"
+    # Unclassified, all three produced the "slurmate cannot tell whether this
+    # clears on its own" advisory and an exit status of 0 for a script sbatch had
+    # just refused -- so `--print` reported success on a script that can never
+    # run, which is the same defect the two markers above were added for.
+    # These are the node/partition/license *tables*, not queue state: no amount
+    # of waiting adds a node to a partition or a license to slurm.conf, exactly
+    # as with "invalid partition"/"invalid feature" already listed above. A cap
+    # that really does clear is worded as its own QOSMax.../Max...PerUser token
+    # and is caught by the transient list first.
+    "invalid node name specified",
+    "requested nodes not in this partition",
+    "invalid license specification",
 )
 
 # Slurm's own limit tokens split cleanly on one word. A "...PerJob" limit is a
@@ -3134,6 +3557,23 @@ def _test_only_refusal(output: str) -> str:
     as "your job can never run" trades one confident wrong answer for another.
     Positive evidence or nothing.
     """
+    # Checked first: sbatch never reaches the controller when it cannot parse
+    # its own arguments, so there is no `allocation failure:` to find and the
+    # verdict is unambiguous.
+    usage = _TEST_ONLY_USAGE_RE.search(output)
+    if usage:
+        named = next(
+            (usage.group(g) for g in ("a", "b", "c", "d", "e") if usage.group(g)),
+            "",
+        )
+        if _probe_own_option(named):
+            # Our own probe flag, not the script's. See `_PROBE_OWN_OPTIONS`:
+            # positive evidence about `sbatch` here, none about the job.
+            logger.debug(f"sbatch rejected our own probe option {named!r}; no verdict")
+            return ""
+        return "sbatch rejected an option in the script: {}".format(
+            " ".join(usage.group(1).split())
+        )
     reason = _TEST_ONLY_REASON_RE.search(output)
     failure = _TEST_ONLY_FAILURE_RE.search(output)
     specific = reason.group(1).strip() if reason else ""
@@ -3300,14 +3740,20 @@ def resolve_request_mem_mb(answers: dict[str, Any]) -> int:
     try:
         from .builder import _custom_mem_override, _normalize_custom_flags
 
-        custom_mem, custom_per_cpu = _custom_mem_override(
+        custom_mem, custom_per_cpu, custom_per_gpu = _custom_mem_override(
             _normalize_custom_flags(answers.get("custom_sbatch"))
         )
     except Exception:  # pragma: no cover - builder import is not worth failing an ETA
-        custom_mem, custom_per_cpu = None, None
+        custom_mem, custom_per_cpu, custom_per_gpu = None, None, None
 
-    per_cpu = custom_per_cpu or answers.get("mem_per_cpu")
-    flat = custom_mem if (custom_mem or custom_per_cpu) else answers.get("memory")
+    per_cpu = custom_per_cpu if custom_per_gpu else (
+        custom_per_cpu or answers.get("mem_per_cpu")
+    )
+    flat = (
+        custom_mem
+        if (custom_mem or custom_per_cpu or custom_per_gpu)
+        else answers.get("memory")
+    )
     if per_cpu and validate_memory(str(per_cpu)):
         cores = answers.get("cpus") or 1
         try:
@@ -3969,28 +4415,22 @@ def _normalize_config_keys(config: dict[str, Any], path: Any) -> dict[str, Any]:
                 continue
             if exact and not prev_exact:
                 _dropped(prev_raw, str(raw_key))
+            elif prev_raw != str(raw_key):
+                # Two spellings of the SAME key: `job-name` and `job_name` are
+                # distinct TOML keys but normalise onto one slot, so neither is
+                # the other's alias and the pair above cannot separate them. The
+                # later one still wins (Slurm's own "last option wins", and the
+                # order `_flatten_config` builds means a [defaults] entry keeps
+                # beating a top-level one) -- but the loser has to be *named*.
+                # It was dropped in silence, which is precisely the failure this
+                # notice exists for: `job-name = "a"` above `job_name = "b"` ran
+                # under "b" with nothing on stderr, and swapping the two lines
+                # silently changed the answer.
+                _dropped(prev_raw, str(raw_key))
         out[key] = value
         filled[key] = (str(raw_key), exact)
     return out
 
-
-def _announce_config(config: dict[str, Any], path: Any) -> None:
-    """Say which file supplied defaults, and what it set.
-
-    A ``.slurmate.toml`` travels with a project into git and onto the next
-    cluster, so its values can arrive without the user knowing the file exists.
-    Emitting the directives it produced with no mention of where they came from
-    is the config-file form of the cross-cluster trap this package exists to
-    close. On stderr, so ``--print`` stdout stays script-only.
-    """
-    if not config:
-        return
-    _config_notice(
-        path,
-        "loaded",
-        f"slurmate: using defaults from {_config_display_path(path)}: "
-        f"{', '.join(config)}",
-    )
 
 def load_config() -> dict[str, Any]:
     """Load configuration defaults, merging the global and project files.
@@ -4056,10 +4496,9 @@ def load_config() -> dict[str, Any]:
         base = None                  # no home is discoverable; the CWD one stands
     if base is not None:
         paths.append(base / "slurmate" / "config.toml")
-    try:
+    # cwd deleted under us — nothing to read there.
+    with contextlib.suppress(OSError):
         paths.append(Path.cwd() / ".slurmate.toml")
-    except OSError:
-        pass                         # cwd deleted under us — nothing to read there
 
     merged: dict[str, Any] = {}
     origin: dict[str, Any] = {}   # which file each surviving key came from
@@ -4108,6 +4547,12 @@ def load_config() -> dict[str, Any]:
         if not contributed:
             continue
         contributors.append(path)
+        # Emitted here rather than through a helper, because the useful version
+        # of this sentence needs `contributed` -- the keys this file actually WON
+        # -- which only the merge loop knows. A helper taking one file's whole
+        # config was carried above for a while and could only name every key it
+        # offered, so with two config files the loser claimed keys it had lost.
+        # It is gone; this is the only place the sentence is spelled.
         _config_notice(
             path,
             "loaded",

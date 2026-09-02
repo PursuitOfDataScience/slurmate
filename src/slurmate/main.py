@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import subprocess
@@ -8,10 +9,10 @@ import sys
 import tempfile
 from typing import Any, overload
 
-from prompt_toolkit.key_binding import KeyBindings
 from rich.cells import cell_len
 from rich.console import Console
 from rich.markup import escape
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -27,10 +28,12 @@ from .builder import (
     job_summary_rows,
     managed_custom_flags,
     sanitize_job_name,
+    unquoted_custom_values,
 )
 from .system_utils import (
     GPU_COUNT_FLAG,
     GPU_SPELLING_FORMATS,
+    MEMORY_FORMS,
     array_spec_reason,
     array_task_count,
     capacity_refusal,
@@ -62,7 +65,9 @@ from .system_utils import (
     refusal_is_permanent,
     refusal_is_transient,
     resolve_request_mem_mb,
+    slurm_deadline,
     submit_sbatch,
+    time_forms,
     unsupported_gpu_format,
     validate_array_spec,
     validate_cluster_targets,
@@ -72,12 +77,87 @@ from .system_utils import (
     write_private_text,
 )
 from .theme import c, g, make_output_safe, print_banner, set_ascii
-from .tui import Wizard, _parse_custom_flags
 
 logger = logging.getLogger(__name__)
 
 # Sentinel returned by the action menu when the user presses Esc to go back.
 _GO_BACK = "\x00__go_back__"
+
+#: Sentences reaching the screen from more than one place, spelled once.
+#:
+#: `_TRANSIENT_QUALIFIER` is consumed by exactly one caller -- `_transient_line`,
+#: which is itself printed from two. It stays a named constant rather than being
+#: folded in because the paragraph below is about the qualifier, not about the
+#: sentence that carries it, and a comment attached to the whole line would have
+#: to explain two things at once.
+#:
+#: Each of these was written out at every site: the `--force` hint three times,
+#: and the two refusal qualifiers twice each. They agreed, which is the state in
+#: which duplication is invisible -- and the transient pair did NOT: one branch
+#: said "the script is valid; this clears on its own" and the other "the script
+#: itself is valid", so the same condition was described two ways depending on
+#: which mode the reader was in. The more informative wording won, because
+#: "clears on its own" is the part that tells them what to do.
+_FORCE_HINT = (
+    "  [dim]Pass --force to generate the script anyway "
+    "(e.g. for another cluster).[/]"
+)
+
+
+def _print_indented(console: Console, markup: str, indent: int = 2) -> None:
+    """Print pre-composed markup so a wrapped line keeps the indent.
+
+    The indent used to be two literal spaces inside the markup, which rich
+    applies to the first line only -- everything after the wrap point came back
+    at column 0. Every caller here interpolates a string of unbounded length
+    (a controller refusal, a site-check message), so wrapping is the normal
+    case, not the edge one.
+    """
+    console.print(Padding(Text.from_markup(markup), (0, 0, 0, indent)))
+
+
+def _print_issue(console: Console, level: str, msg: str) -> None:
+    """One indented ``Warning:``/``Error:`` line that keeps its indent when it wraps.
+
+    The two-space prefix these lines carry was literal text, so rich indented
+    only the first line and wrapped the remainder to column 0 -- a message long
+    enough to wrap (the log-directory warning is three lines wide at 80 columns)
+    lost its alignment with everything printed around it. Padding indents each
+    wrapped line instead.
+
+    The glyph comes from the theme rather than a literal, because that is what
+    ``--ascii`` acts on: `theme.g` resolves per call precisely so the flag
+    applies after import, and the sites that hardcoded "\u26a0" kept emitting it
+    on a terminal that had just asked for ASCII.
+    """
+    glyph, colour, label = (
+        (g.WARN, "yellow", "Warning") if level == "warning" else (g.ERR, "red", "Error")
+    )
+    _print_indented(console, f"[{colour}]{glyph} {label}: {escape(msg)}[/]")
+#: Why a refusal is being reported rather than enforced. The verdict is about the
+#: cluster the command ran on, and `--force` is the user saying that is not the
+#: target -- so it is evidence, not a decision.
+_FORCE_NOT_ENFORCED = (
+    "[dim](--force: reported, not enforced -- this is a verdict about "
+    "this cluster)[/]"
+)
+#: A refusal about the moment rather than the request. Saying "refuses" without
+#: this sends the user looking for a mistake in a script that has none.
+_TRANSIENT_QUALIFIER = "[dim](the script is valid; this clears on its own)[/]"
+
+
+def _transient_line(detail: str) -> str:
+    """The whole sentence for a refusal that clears on its own.
+
+    A function rather than a format string, because the prefix was the last
+    duplicated half: the two call sites interleave it with differently-named
+    details, so a bare constant left `"Slurm cannot take this job right now: "`
+    written twice.
+    """
+    return (
+        f"[yellow]{g.WARN} Slurm cannot take this job right now: "
+        f"{escape(detail)}[/] {_TRANSIENT_QUALIFIER}"
+    )
 
 # ── Batch mode helpers ───────────────────────────────────────────────────
 
@@ -265,20 +345,30 @@ def _check_cluster_targets(
     for _level, msg in issues:
         head, *rest = msg.splitlines()
         if force:
-            err_console.print(f"  [yellow]{g.WARN} Warning: {escape(head)}[/]")
+            _print_issue(err_console, "warning", head)
         else:
-            err_console.print(f"  [red]{g.ERR} Error: {escape(head)}[/]")
+            _print_issue(err_console, "error", head)
         for line in rest:
             err_console.print(f"    [dim]{escape(line)}[/]")
     if not force:
-        err_console.print(
-            "  [dim]Pass --force to generate the script anyway "
-            "(e.g. for another cluster).[/]"
-        )
+        err_console.print(_FORCE_HINT)
         sys.exit(1)
 
 
 def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]) -> dict[str, Any]:
+    """Assemble the answer set from flags and config, checking it as it goes.
+
+    Wrapped in one Slurm deadline: this function is the whole non-interactive
+    path and every cluster query it makes belongs to a single decision, so the
+    right bound is on their total rather than on each of them. See
+    :func:`~slurmate.system_utils.slurm_deadline`.
+    """
+    with slurm_deadline():
+        return _run_batch(args, console, config)
+
+
+def _run_batch(args: argparse.Namespace, console: Console,
+               config: dict[str, Any]) -> dict[str, Any]:
     err_console = Console(stderr=True)
 
     # Get values fallback from config
@@ -388,6 +478,7 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     # or not supplied at all \u2014 that case is sized from the partition below).
     if memory_val is not None and not mem_omit and not validate_memory(str(memory_val)):
         err_console.print(f"  {c.RED}\u2717 Error: Invalid memory value: {memory_val}{c.RESET}")
+        err_console.print(f"  [dim]Give {MEMORY_FORMS}.[/]")
         sys.exit(1)
 
     # --mem-per-cpu (validated as a memory value); takes precedence over --mem.
@@ -397,7 +488,10 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
         None, field="mem_per_cpu", err_console=err_console)
     if mem_per_cpu:
         if not validate_memory(str(mem_per_cpu)):
-            err_console.print(f"  {c.RED}\u2717 Error: Invalid --mem-per-cpu value: {mem_per_cpu}{c.RESET}")
+            err_console.print(
+                f"  {c.RED}\u2717 Error: Invalid --mem-per-cpu value: {mem_per_cpu}{c.RESET}"
+            )
+            err_console.print(f"  [dim]Give {MEMORY_FORMS}.[/]")
             sys.exit(1)
         mem_per_cpu = normalize_memory(str(mem_per_cpu))
 
@@ -410,6 +504,7 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     # Hard-validate time limit
     if not validate_time(str(time_val)):
         err_console.print(f"  {c.RED}\u2717 Error: Invalid time limit value: {time_val}{c.RESET}")
+        err_console.print(f"  [dim]Give {time_forms()}.[/]")
         sys.exit(1)
 
     all_parts = fetch_partitions()
@@ -512,15 +607,33 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
         env_type = "conda"
 
     custom_sbatch_val = getattr(args, "custom_sbatch", None)
+    # The custom flags AS WRITTEN, whichever surface supplied them. The two
+    # refusals below read this rather than `args.custom_sbatch`, because a
+    # config file is a way of supplying them too: `custom_sbatch = "--comment=my
+    # run"` in a .slurmate.toml reached `unquoted_custom_values(None)`, so the
+    # value that is a hard error when typed as a flag was folded to
+    # `#SBATCH --comment="my run"` with rc=0 and nothing on stderr -- on the path
+    # a Makefile or a CI job uses, where nobody is watching. The raw form is what
+    # has to be checked: the ambiguity lives in the *unsplit* string, and
+    # `_parse_custom_flags` has already resolved it by the time the list exists
+    # (which is why passing the parsed list detects nothing). A TOML **list** is
+    # left as a list on purpose -- there the user delimited the flags themselves,
+    # so `["--comment=my run"]` has only one reading and must not be refused.
+    custom_sbatch_raw: Any = custom_sbatch_val
     if custom_sbatch_val is None:
         cfg_custom = config.get("custom_sbatch")
+        custom_sbatch_raw = cfg_custom
         if isinstance(cfg_custom, list):
             custom_sbatch_list = [str(f) for f in cfg_custom]
         elif isinstance(cfg_custom, str):
+            from .tui import _parse_custom_flags
+
             custom_sbatch_list = _parse_custom_flags(cfg_custom)
         else:
             custom_sbatch_list = None
     else:
+        from .tui import _parse_custom_flags
+
         custom_sbatch_list = _parse_custom_flags(custom_sbatch_val)
 
     args_job_name = getattr(args, "job_name", None)
@@ -544,7 +657,33 @@ def run_batch(args: argparse.Namespace, console: Console, config: dict[str, Any]
     # routes straight past the checks that exist to catch exactly those two.
     # Refused rather than reconciled: for every directive in this set slurmate
     # already has a flag that is validated and reflected everywhere.
-    conflicts = managed_custom_flags(getattr(args, "custom_sbatch", None))
+    # An unquoted value has two readings and slurmate must not pick one silently.
+    #
+    # This was a warning, and a warning is not enough: whichever reading is
+    # taken, the other one's information is gone. `--custom-sbatch='--array=1-10
+    # hold'` is either an array spec of `1-10 hold` or `--array=1-10 --hold`, and
+    # a tool that guesses either writes a script the user did not ask for. So it
+    # is refused, naming both readings -- the same choice SM-15 settled for a
+    # custom flag that duplicates a managed directive: reject rather than
+    # silently disagree.
+    ambiguous = unquoted_custom_values(custom_sbatch_raw)
+    if ambiguous:
+        for name, value in ambiguous:
+            head, _, tail = value.partition(" ")
+            err_console.print(
+                f"  {c.RED}\u2717 Error: --custom-sbatch {name}={head} is "
+                f"followed by {tail!r}, which cannot be an sbatch option "
+                f"(no leading dash).{c.RESET}"
+            )
+            err_console.print(
+                f"  {c.GRAY}Two readings, and slurmate will not choose: "
+                f"--custom-sbatch='{name}=\"{value}\"' if it is part of the "
+                f"value, or --custom-sbatch='{name}={head} "
+                f"--{tail.split()[0]}' if it is another flag.{c.RESET}"
+            )
+        sys.exit(1)
+
+    conflicts = managed_custom_flags(custom_sbatch_raw)
     if conflicts:
         for name, owner in conflicts:
             # When the owner *is* the flag they typed — now the common case, since
@@ -634,9 +773,14 @@ def _partition_issues(
     all ``fetch_partitions`` records), so skipping the lookup for it is safe.
     Single source of truth shared by the CLI summary and the pre-submit guard.
     """
-    part = answers.get("_partition_obj")
-    if not part:
-        return []
+    # ``or {}``, not an early return: the wizard leaves ``_partition_obj`` None
+    # when the partition is blank (its legitimate "site default"), and returning
+    # [] here dropped the rules that never consult a partition — so the live
+    # panel and this summary must agree that a duplicated custom directive or an
+    # over-MaxArraySize --array is still an issue. validate_job_config gates the
+    # partition-dependent rules itself; the lookup below is skipped because it
+    # keys on the partition name, which is exactly what is missing.
+    part = answers.get("_partition_obj") or {}
     # A site limit, so it needs a live query — done by the caller rather than
     # inside validate_job_config, which the TUI calls on every redraw and which
     # must stay subprocess-free. Fetched here only when the caller did not
@@ -715,13 +859,10 @@ def _check_gpu_format(
         )
         return "gres_type"
     if force:
-        err_console.print(f"  [yellow]{g.WARN} Warning: {escape(reason)}[/]")
+        _print_issue(err_console, "warning", reason)
         return None
-    err_console.print(f"  [red]{g.ERR} Error: {escape(reason)}[/]")
-    err_console.print(
-        "  [dim]Pass --force to generate the script anyway "
-        "(e.g. for another cluster).[/]"
-    )
+    _print_issue(err_console, "error", reason)
+    err_console.print(_FORCE_HINT)
     sys.exit(1)
 
 
@@ -744,14 +885,11 @@ def _check_modules_exist(
         return
     for _level, msg in issues:
         if force:
-            err_console.print(f"  [yellow]\u26a0 Warning: {escape(msg)}[/]")
+            _print_issue(err_console, "warning", msg)
         else:
-            err_console.print(f"  [red]\u2717 Error: {escape(msg)}[/]")
+            _print_issue(err_console, "error", msg)
     if not force:
-        err_console.print(
-            "  [dim]Pass --force to generate the script anyway "
-            "(e.g. for another cluster).[/]"
-        )
+        err_console.print(_FORCE_HINT)
         sys.exit(1)
 
 
@@ -772,7 +910,7 @@ def _warn_runtime_targets(
     except Exception as e:                       # never fail a summary over a check
         logger.debug(f"log dir check failed: {e}")
     for _level, msg in issues:
-        console.print(f"  [yellow]\u26a0 Warning: {escape(msg)}[/]")
+        _print_issue(console, "warning", msg)
 
 
 def _validate_partition_limits(
@@ -783,9 +921,9 @@ def _validate_partition_limits(
     # equivalent to escaping each interpolated value and can't accidentally miss one.
     for level, msg in _partition_issues(answers, max_array):
         if level == "error":
-            console.print(f"  [red]\u2717 Error: {escape(msg)}[/]")
+            _print_issue(console, "error", msg)
         else:
-            console.print(f"  [yellow]\u26a0 Warning: {escape(msg)}[/]")
+            _print_issue(console, "warning", msg)
 
 
 def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
@@ -889,6 +1027,16 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
                 f"custom flag {name} duplicates a directive slurmate manages; "
                 f"use {owner} instead",
             ))
+        # The wizard's half, and an error for the same reason: whichever reading
+        # is taken, the other one's information is gone.
+        for name, value in unquoted_custom_values(answers.get("custom_sbatch")):
+            head, _, tail = value.partition(" ")
+            out.append((
+                "error",
+                f"--custom-sbatch {name}={head} is followed by {tail!r}, which "
+                f"cannot be an sbatch option; quote it into the value or write "
+                f"it with a leading dash",
+            ))
     except Exception as e:            # a probe failure must never block a job
         logger.debug(f"site checks failed: {e}")
     return out
@@ -917,7 +1065,26 @@ def _warn_missing_required(answers: dict[str, Any], console: Console) -> list[st
     return missing
 
 
-def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict[str, Any]]:
+def build_and_show(
+    answers: dict[str, Any], console: Console, *, force: bool = False
+) -> tuple[str, dict[str, Any]]:
+    """Render the script and the summary, with the queue/ETA probe bounded.
+
+    Its own phase rather than the caller's: on the interactive path this runs
+    after the wizard, which may have been on screen for minutes, and a deadline
+    opened back then would already have expired. Nested inside `run_batch`'s
+    deadline on the batch path, where `slurm_deadline` keeps the outer one.
+
+    ``force`` is the user's claim that this cluster is not the target. It does
+    not change the classification -- see `_forced_advisory`.
+    """
+    with slurm_deadline():
+        return _build_and_show(answers, console, force=force)
+
+
+def _build_and_show(answers: dict[str, Any],
+                    console: Console,
+                    *, force: bool = False) -> tuple[str, dict[str, Any]]:
     script = build_from_answers(answers)
 
     su_estimate = estimate_su(
@@ -970,6 +1137,25 @@ def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict
                           # statement about the request, not about right now.
                           "refusal_is_permanent": True}
 
+    # --force says "this cluster is not the target". A permanent refusal is a
+    # verdict about THIS controller, so under --force it is reported and not
+    # enforced -- the treatment an unknown partition or account already gets, for
+    # the same reason. `refusal_is_permanent` is deliberately left alone: the
+    # finding stands and is still printed; only its severity and whether it
+    # blocks change. See `_forced_advisory`.
+    #
+    # PERMANENT only. A transient refusal (a submit-count cap) already renders as
+    # a warning and already submits, so --force has nothing to downgrade -- and
+    # relabelling it "reported, not enforced" would tell the reader a condition
+    # that clears on its own is a cluster mismatch. That is a new wrong answer,
+    # not a softened one; the control test pins it.
+    if (
+        force
+        and not queue_info.get("feasible", True)
+        and bool(queue_info.get("refusal_is_permanent", True))
+    ):
+        queue_info = {**queue_info, "refusal_forced_advisory": True}
+
     _validate_partition_limits(answers, console, max_array)
     # The wizard never passed through the batch path's cluster checks, so a
     # manually-typed partition/account/qos went unvalidated there. Reported here,
@@ -978,7 +1164,7 @@ def build_and_show(answers: dict[str, Any], console: Console) -> tuple[str, dict
     for level, msg in site_check_issues(answers):
         head = str(msg).splitlines()[0]
         marker, colour = (g.ERR, "red") if level == "error" else (g.WARN, "yellow")
-        console.print(f"  [{colour}]{marker} {escape(head)}[/]")
+        _print_indented(console, f"[{colour}]{marker} {escape(head)}[/]")
     _warn_runtime_targets(script, answers, console)
     _show_script_and_summary(console, script, answers, su_estimate, queue_info)
     # After the summary, so the reader has the request in view when told it was
@@ -1011,6 +1197,17 @@ def _qualified_eta(queue_info: dict[str, Any]) -> str:
     return f"{label} ({note})" if note else label
 
 
+def _forced_advisory(queue_info: dict[str, Any]) -> bool:
+    """True when ``--force`` has downgraded a refusal to a warning.
+
+    One predicate, read by the summary row, the advisory line and the submit
+    gate, so the three cannot disagree about whether a refusal is being enforced
+    -- which is exactly how the ETA row came to say "never" in red while the line
+    under it called the script valid.
+    """
+    return bool(queue_info.get("refusal_forced_advisory"))
+
+
 def _note_scheduler_refusal(queue_info: dict[str, Any], console: Console) -> None:
     """Say, as an error, that this job has already been refused.
 
@@ -1031,28 +1228,38 @@ def _note_scheduler_refusal(queue_info: dict[str, Any], console: Console) -> Non
     reason = str(queue_info.get("reason") or "").strip()
     if not reason:
         return
-    if queue_info.get("source") != "scheduler":
-        console.print(
-            f"  [red]{g.ERR} This job cannot run as requested: {escape(reason)}[/]"
+    if _forced_advisory(queue_info):
+        # Kept, not suppressed -- the reader is told exactly what this cluster
+        # said. What --force changes is the frame: the verdict is about the
+        # cluster the command ran on, and the user has said that is not the
+        # target, so it is evidence rather than a decision.
+        whose = (
+            "Slurm refuses this job here"
+            if queue_info.get("source") == "scheduler"
+            else "This job cannot run as requested here"
+        )
+        _print_indented(
+            console, f"[yellow]{g.WARN} {whose}: {escape(reason)}[/] {_FORCE_NOT_ENFORCED}"
+        )
+    elif queue_info.get("source") != "scheduler":
+        _print_indented(
+            console, f"[red]{g.ERR} This job cannot run as requested: {escape(reason)}[/]"
         )
     elif queue_info.get("refusal_is_permanent", True):
-        console.print(f"  [red]{g.ERR} Slurm refuses this job: {escape(reason)}[/]")
+        _print_indented(console, f"[red]{g.ERR} Slurm refuses this job: {escape(reason)}[/]")
     elif queue_info.get("refusal_is_transient", False):
         # The request is fine; the moment isn't. Saying "refuses" here would send
         # the user looking for a mistake in a script that has none.
-        console.print(
-            f"  [yellow]{g.WARN} Slurm cannot take this job right now: "
-            f"{escape(reason)}[/] [dim](the script is valid; this clears on its "
-            f"own)[/]"
-        )
+        _print_indented(console, _transient_line(reason))
     else:
         # Refused, and neither list recognises the wording. Report what the
         # controller said and stop there: claiming it clears on its own is how a
         # job asking for too many nodes got told its script was fine.
-        console.print(
-            f"  [yellow]{g.WARN} Slurm would not accept this job: "
+        _print_indented(
+            console,
+            f"[yellow]{g.WARN} Slurm would not accept this job: "
             f"{escape(reason)}[/] [dim](the controller's own words; slurmate "
-            f"cannot tell whether this clears on its own)[/]"
+            f"cannot tell whether this clears on its own)[/]",
         )
 
 
@@ -1270,7 +1477,12 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
             # valid and the condition temporary.
             label = str(queue_info.get("eta_label") or "never")
             permanent = bool(queue_info.get("refusal_is_permanent", True))
-            rows.append(("ETA:", f"{label} — {reason}", "red" if permanent else "#ffaa00"))
+            forced = _forced_advisory(queue_info)
+            rows.append((
+                "ETA:",
+                f"{label} — {reason}" + (" (--force: not enforced)" if forced else ""),
+                "#ffaa00" if forced or not permanent else "red",
+            ))
         elif part_unknown:
             rows.append(("ETA:", f"unknown — {why_unknown}", "#ffaa00"))
         else:
@@ -1510,7 +1722,24 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
 
 # ── CLI ──────────────────────────────────────────────────────────────────
 
-def _check_custom_sbatch_form(argv: list[str]) -> None:
+def _short_option_strings(parser: argparse.ArgumentParser) -> frozenset[str]:
+    """``{"-A", "-c", "-C", ...}`` for this parser.
+
+    Single-dash options only: they are the ones `argparse._get_option_tuples`
+    matches on a two-character prefix, which is what makes a *value* like
+    ``-C bigmem`` indistinguishable from the option itself.
+    """
+    return frozenset(
+        opt
+        for action in parser._actions
+        for opt in action.option_strings
+        if len(opt) == 2 and opt.startswith("-") and not opt.startswith("--")
+    )
+
+
+def _check_custom_sbatch_form(
+    argv: list[str], short_options: frozenset[str] = frozenset()
+) -> None:
     """Give a usable error for ``--custom-sbatch --exclusive``.
 
     argparse treats a value starting with ``-`` as the next option, so the one
@@ -1527,11 +1756,27 @@ def _check_custom_sbatch_form(argv: list[str]) -> None:
         if token != "--custom-sbatch":
             continue
         nxt = argv[i + 1]
-        # argparse only mistakes a value for an option when it starts with "-"
-        # AND contains no space: `-C bigmem` and `--comment="my run"` are already
-        # accepted (verified against argparse), and rejecting those would break
-        # the multi-flag form the portability report exercised.
-        if nxt.startswith("-") and len(nxt) > 1 and " " not in nxt:
+        # Every value argparse will read as one of slurmate's OWN options, and
+        # no others.
+        #
+        # The rule used to be "starts with `-` and has no space", on the reading
+        # that argparse always accepts a value containing a space. It does not,
+        # and the exception is not obscure: `_get_option_tuples` splits a
+        # single-dash token after two characters, so `-C bigmem` is read as
+        # slurmate's own `-C/--constraint` carrying ` bigmem` -- and
+        # `--custom-sbatch '-C bigmem'`, the exact form the help text invites for
+        # a space-separated value, fell through to argparse's generic "expected
+        # one argument" plus a full usage dump, while `--custom-sbatch
+        # '--exclusive'` got this targeted message. Same mistake, two answers.
+        #
+        # Asked of the parser rather than assumed, because the answer changes
+        # whenever a short option is added: `-C` only collides because
+        # `--constraint` has one. `--comment="my run"` and the report's
+        # `--exclusive,--comment="my run",-C bigmem` are still accepted, and
+        # rejecting those would break the multi-flag form.
+        if nxt.startswith("-") and len(nxt) > 1 and (
+            " " not in nxt or nxt[:2] in short_options
+        ):
             print(
                 f"  {c.RED}\u2717 Error: --custom-sbatch {nxt}: a value starting "
                 f"with '-' must use the '=' form{c.RESET}\n"
@@ -1545,8 +1790,13 @@ def _check_custom_sbatch_form(argv: list[str]) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     from . import __version__
-    _check_custom_sbatch_form(list(argv) if argv is not None else sys.argv[1:])
-    parser = argparse.ArgumentParser(description="Slurmate \u2014 sbatch wizard")
+    # Without an explicit prog, argparse takes it from sys.argv[0], so
+    # `python -m slurmate --help` announced itself as `usage: __main__.py`.
+    # The other tools in this family all pin it; slurmate is the command name
+    # users type, and the one the help should name.
+    parser = argparse.ArgumentParser(
+        prog="slurmate", description="Slurmate \u2014 sbatch wizard"
+    )
     parser.add_argument("--job-name", "-J", default=None, help="Job name")
     parser.add_argument("--account", "-A", default=None, help="Slurm account")
     parser.add_argument("--partition", "-p", default=None, help="Target partition")
@@ -1628,6 +1878,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-save-script", action="store_true",
                         help="Do not auto-save a <job>-<id>.sh copy on submit")
     parser.add_argument("--version", action="version", version=f"slurmate {__version__}")
+    # After the parser is built and before it runs: the check needs the parser's
+    # own short options to know which values argparse will mistake for one.
+    _check_custom_sbatch_form(
+        list(argv) if argv is not None else sys.argv[1:],
+        _short_option_strings(parser),
+    )
     args = parser.parse_args(argv)
     _normalize_gpus_flag(args)
     return args
@@ -1661,9 +1917,11 @@ def _is_batch_mode(args: argparse.Namespace, config: dict[str, Any] | None = Non
         return True
     if getattr(args, "yes", False):
         return True
-    if (getattr(args, "print", False) or getattr(args, "dry_run", False)) and config:
-        return True
-    return False
+    # `bool(...)`, not the expression: `config` is a dict, so returning the `and`
+    # directly would hand back the config itself from a function annotated `-> bool`.
+    return bool(
+        (getattr(args, "print", False) or getattr(args, "dry_run", False)) and config
+    )
 
 
 def _isatty(stream: Any) -> bool:
@@ -1792,6 +2050,35 @@ def _resolve_gpu_spellings(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    """Entry point.
+
+    A thin wrapper so the Slurm deadline can be opened once, mid-run, and closed
+    when the process leaves -- the batch path makes cluster queries in two
+    separate phases (`run_batch`, then `build_and_show`) and they belong to one
+    decision, so the bound has to span both. Measured against a controller that
+    never answers: **141 s** with no total bound, and the sum of the phases with
+    one bound per phase.
+    """
+    # Ctrl-C is a normal way to stop this, so report it as one. Without this a
+    # SIGINT while waiting on a slow `sinfo`/`sacctmgr` escaped as a
+    # `KeyboardInterrupt` traceback out of `subprocess.communicate`'s selector
+    # poll -- and that wait is where it happens, because it is the only part of a
+    # run long enough to interrupt. Three of the five sibling tools already did
+    # this; the comment in one of them names the same six-line traceback.
+    #
+    # 130 is the shell's convention for "terminated by SIGINT", so a wrapper
+    # script can tell a cancellation from a failure.
+    try:
+        with contextlib.ExitStack() as stack:
+            _main(stack)
+    except KeyboardInterrupt:
+        # A newline first: the ^C is echoed at the cursor, so without it the next
+        # shell prompt lands mid-line.
+        sys.stderr.write("\n")
+        raise SystemExit(130) from None
+
+
+def _main(stack: contextlib.ExitStack) -> None:
     # Before any output: a non-encodable character must not be able to abort the
     # run. A *valid* non-UTF-8 locale (en_US is latin-1; el7 has no C.UTF-8) made
     # a "⚠" in a warning raise UnicodeEncodeError mid-print, killing the run and
@@ -1824,15 +2111,44 @@ def main() -> None:
         print_banner(interactive=not batch)
 
     answers_opt: dict[str, Any] | None = None
-    wizard: Wizard | None = None
+    wizard: Any = None
+    # One deadline for the whole non-interactive run, not one per phase.
+    #
+    # `run_batch` and `build_and_show` each open their own -- they have to, since
+    # on the interactive path they are minutes apart -- and `slurm_deadline`
+    # keeps the outer one when nested, so entering it here makes the batch path's
+    # bound 45 s in total rather than 45 s twice.
+    #
+    # Deliberately NOT for the wizard: a user takes minutes to answer, and a
+    # deadline opened before the first question would expire while they read the
+    # screen and then report the cluster as unreachable.
+    #
+    # And it is CLOSED again before the action menu further down -- batch mode
+    # without --yes/--print/--dry-run reaches that menu, and a deadline still open
+    # across a human's time in $EDITOR turns every submit-time gate into a silent
+    # pass. See the `stack.close()` there.
     if batch:
-        # Keep --print's stdout to just the raw script; the mode banner is noise.
+        stack.enter_context(slurm_deadline())
+        # Keep --print's stdout to just the raw script; the banner is noise.
         if not (args.print or args.dry_run):
-            print(f"  {c.CYAN}{g.BULLET}{c.RESET} {c.GRAY}Running in batch mode{c.RESET}\n")
+            print(f"  {c.CYAN}{g.BULLET}{c.RESET} "
+                  f"{c.GRAY}Running in batch mode{c.RESET}\n")
         answers_opt = run_batch(args, console, config)
     else:
-        wizard = Wizard()
-        answers_opt = wizard.run()
+        # Imported here, not at module scope. `slurmate.tui` pulls
+        # `prompt_toolkit` in, which is **269 ms of a 364 ms import** and 176
+        # modules -- paid by `--version`, `--print`, `--dry-run` and every CI or
+        # cron invocation that never draws a prompt. `questionary` and
+        # `theme.questionary_style` were already deferred for this reason; the
+        # wizard itself and the key-binding type were the two that were not.
+        from .tui import Wizard, restore_terminal_on_fatal_signal
+
+        # A `SIGTERM` or `SIGHUP` arriving mid-prompt used to end the process with
+        # the terminal still in prompt_toolkit's raw, alternate-screen state. See
+        # `restore_terminal_on_fatal_signal` for the measurements.
+        with restore_terminal_on_fatal_signal():
+            wizard = Wizard()
+            answers_opt = wizard.run()
 
     if not answers_opt:
         if not (args.print or args.dry_run):
@@ -1861,7 +2177,7 @@ def main() -> None:
             marker, colour = (
                 (g.ERR, "red") if _level == "error" else (g.WARN, "yellow")
             )
-            err.print(f"  [{colour}]{marker} {escape(head)}[/]")
+            _print_indented(err, f"[{colour}]{marker} {escape(head)}[/]")
             fatal = fatal or _level == "error"
         # will_create=False: --print is the only mode that hands over a script
         # slurmate will never submit, so it is the only one where a missing log
@@ -1876,32 +2192,41 @@ def main() -> None:
         # controller refuses outright — printed with zero bytes on stderr and
         # rc=0. Script-based, so it needs no answers, and it submits nothing.
         refusal = check_script_with_scheduler(script)
-        if refusal and refusal_is_permanent(refusal):
-            err.print(f"  [red]{g.ERR} Slurm refuses this job: {escape(refusal)}[/]")
+        forced = bool(getattr(args, "force", False))
+        if refusal and refusal_is_permanent(refusal) and forced:
+            # --force is about to let the script out, so the marker has to agree
+            # with what happens next. Printing a red `✗ Slurm refuses this job`
+            # and then the script, rc=0, is the tool contradicting itself in
+            # eight lines; the finding is the same, its standing is not.
+            _print_indented(
+                err,
+                f"[yellow]{g.WARN} Slurm refuses this job here: "
+                f"{escape(refusal)}[/] {_FORCE_NOT_ENFORCED}",
+            )
+        elif refusal and refusal_is_permanent(refusal):
+            _print_indented(err, f"[red]{g.ERR} Slurm refuses this job: {escape(refusal)}[/]")
             fatal = True
         elif refusal and refusal_is_transient(refusal):
             # Reported, not fatal: a transient limit says nothing about the
             # script, and failing here would turn "you already have a job
             # queued" into a red CI build.
-            err.print(
-                f"  [yellow]{g.WARN} Slurm cannot take this job right now: "
-                f"{escape(refusal)}[/] [dim](the script itself is valid)[/]"
-            )
+            _print_indented(err, _transient_line(refusal))
         elif refusal:
             # Unrecognised wording: still not fatal (guessing "permanent" fails
             # builds over conditions that clear), but it must not carry the
             # reassurance either.
-            err.print(
-                f"  [yellow]{g.WARN} Slurm would not accept this job: "
+            _print_indented(
+                err,
+                f"[yellow]{g.WARN} Slurm would not accept this job: "
                 f"{escape(refusal)}[/] [dim](slurmate cannot tell whether this "
-                f"clears on its own)[/]"
+                f"clears on its own)[/]",
             )
         # Reporting an error and then handing over the artifact anyway is the
         # inverse of the silence problem: the tool states the script is wrong and
         # emits it regardless. --force still overrides, as it does for the
         # partition/account checks, since writing a script for another cluster is
         # legitimate.
-        if fatal and not getattr(args, "force", False):
+        if fatal and not forced:
             err.print(
                 "  [dim]Pass --force to print it anyway "
                 "(e.g. for another cluster).[/]"
@@ -1912,7 +2237,9 @@ def main() -> None:
 
     # build_and_show prints the summary panel, partition-limit warnings, CPU-hours/ETA,
     # and missing-field reminders. --dry-run stops here without submitting.
-    script, queue_info = build_and_show(answers, console)
+    script, queue_info = build_and_show(
+        answers, console, force=bool(getattr(args, "force", False))
+    )
 
     if args.dry_run:
         print(f"  {c.GRAY}Dry run — not submitted.{c.RESET}")
@@ -1943,10 +2270,16 @@ def main() -> None:
         # valid job on Mercury purely because another job was already queued).
         # The message was already printed by build_and_show, so this only
         # decides — repeating it here would say the same thing twice.
+        # A third narrowing: --force. It is documented as downgrading cluster
+        # checks to warnings, and an unknown partition -- a certain rejection --
+        # already submits under it. Blocking here while that goes through would
+        # make --force able to override the checks slurmate derives and not the
+        # one the controller itself rendered, which is the wrong way round.
         refused = (
             not queue_info.get("feasible", True)
             and queue_info.get("source") == "scheduler"
             and bool(queue_info.get("refusal_is_permanent", True))
+            and not _forced_advisory(queue_info)
         )
         if errs or refused:
             for m in errs:
@@ -1956,6 +2289,27 @@ def main() -> None:
             sys.exit(1)
         _submit_and_report(script, answers, console, save_script=save_script)
         return
+
+    # Everything below this line waits on a human, so the Slurm deadline has to
+    # be closed before it.
+    #
+    # The batch branch above opens one deadline for the whole non-interactive run,
+    # which is right for `--print`/`--dry-run`/`--yes` -- those return before this
+    # point and their queries really are one decision. But batch mode WITHOUT any
+    # of those three falls through to the menu below, and a user who picks "Open
+    # script in $EDITOR" is gone for as long as it takes them to edit. The budget
+    # expires while they are in vim, and then every submit-time gate gets rc=-1
+    # from `_run_command`'s "skipped" branch -- which reads as *no problem*.
+    # Measured: inside an expired deadline, a script containing
+    # `#SBATCH --nosuchopt` gives `check_script_with_scheduler(...) == ''`, where
+    # outside it gives "sbatch rejected an option in the script: unrecognized
+    # option '--nosuchopt'". A safety gate that silently answers "fine" is worse
+    # than one that is slow.
+    #
+    # `stack.close()` rather than a narrower handle because the deadline is the
+    # only thing on the stack at this point; the gates below then run unbounded,
+    # like every other interactive query, each with its own per-command timeout.
+    stack.close()
 
     import questionary
 
@@ -1992,6 +2346,8 @@ def main() -> None:
             instruction="(Esc to go back)" if can_edit else None,
         )
         kb = q.application.key_bindings
+        from prompt_toolkit.key_binding import KeyBindings
+
         if can_edit and isinstance(kb, KeyBindings):
             @kb.add("escape", eager=True)
             def _back(event: Any) -> None:
@@ -2010,7 +2366,9 @@ def main() -> None:
             answers = wizard.edit()
             manually_edited = False
             default_name = f"{answers.get('job_name', '') or 'slurm'}.sh"
-            script, queue_info = build_and_show(answers, console)
+            script, queue_info = build_and_show(
+                answers, console, force=bool(getattr(args, "force", False))
+            )
             continue
         if action is None or action.startswith("Quit"):
             print(f"  {c.YELLOW}Not submitted.{c.RESET}")

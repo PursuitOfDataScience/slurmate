@@ -389,6 +389,50 @@ class TestQosCoerceAndPathCompleter:
         assert any("alpha.txt" in n for n in names)
         assert all("beta.txt" not in n for n in names)
 
+    def test_comma_completer_ignores_a_trailing_space(self):
+        """`gc ` + Tab offered every module in the list instead of `gcc`.
+
+        The token was only `lstrip`ed, so a trailing space survived into the fuzzy
+        pattern -- and no module name contains a space, which made the pattern
+        match everything. The sibling path completer never had this because
+        splitting on whitespace makes a trailing space an empty token.
+        """
+        from prompt_toolkit.completion import CompleteEvent
+        from prompt_toolkit.document import Document
+
+        from slurmate.tui import LastTokenCommaCompleter
+
+        cc = LastTokenCommaCompleter(["cuda", "cudnn", "python/anaconda", "gcc", "openmpi"])
+
+        def texts(buf):
+            doc = Document(buf, len(buf))
+            return [c.text for c in cc.get_completions(doc, CompleteEvent())]
+
+        assert texts("gc ") == ["gcc"]
+        assert texts("cu ") == ["cuda", "cudnn"]
+        assert texts("cuda,  cud ") == ["cuda", "cudnn"]
+
+    def test_the_control_the_comma_completer_still_works_without_a_space(self):
+        """The control: stripping too eagerly, or matching nothing at all, would
+        also silence the test above."""
+        from prompt_toolkit.completion import CompleteEvent
+        from prompt_toolkit.document import Document
+
+        from slurmate.tui import LastTokenCommaCompleter
+
+        cc = LastTokenCommaCompleter(["cuda", "cudnn", "python/anaconda", "gcc", "openmpi"])
+
+        def comps(buf):
+            doc = Document(buf, len(buf))
+            return list(cc.get_completions(doc, CompleteEvent()))
+
+        assert [c.text for c in comps("cu")] == ["cuda", "cudnn"]
+        assert [c.text for c in comps("cuda, cu")] == ["cuda", "cudnn"]
+        assert comps("") == [] and comps("cuda,") == []
+        # The whole token including its trailing space is replaced, so accepting a
+        # completion cannot leave "cu cuda".
+        assert all(c.start_position == -3 for c in comps("cu "))
+
     def test_path_steps_flagged(self):
         from slurmate.tui import STEPS
         path_keys = {s.key for s in STEPS if getattr(s, "path", False)}
@@ -945,12 +989,702 @@ class TestGpuTypeTextPersistsOnBack:
         w._go_back()
         assert w.answers.get("gpu_type") == "h100"
 
-    def test_blank_does_not_overwrite_a_prior_answer(self):
+    def test_a_radio_reset_to_any_does_not_overwrite_a_prior_answer(self):
+        """The *select* sub-mode still saves nothing on Back — deliberately.
+
+        This is the concern the original fix recorded ("doing the same for the
+        select sub-mode would let a radio reset to 'Any' overwrite a previously
+        typed model with None"), and it is still guarded. It used to be asserted
+        of the *text* sub-mode instead, where an emptied field now means "no
+        model", exactly as it does when Enter is pressed — see
+        TestClearedFieldIsClearedByBackToo.
+        """
         w = Wizard()
-        w.answers.update({"partition": "cpu-shared", "_partition_obj": None,
+        # gpu-shared advertises typed GPUs in mock data -> radio sub-mode.
+        w.answers.update({"partition": "gpu-shared", "_partition_obj": None,
                           "gpus": 2, "gpu_type": "a100"})
         w.idx = _idx("gpu_type")
         w._setup_gpu_type("forward")
-        w.text_area.text = ""
+        assert w.step_cache.get("gpu_sub") == "select"
+        w._set_radio_default("Any")
         w._go_back()
         assert w.answers.get("gpu_type") == "a100"
+
+
+class TestUnknownPartitionIsFlagged:
+    """A manually-typed partition the cluster does not have must SAY it wasn't checked.
+
+    Every capacity field on the synthetic record is 0/None, which is what keeps
+    the limit checks quiet instead of warning against a limit of zero — so
+    without an explicit ``_unknown`` marker the wizard's live panel said nothing
+    at all about a 999-CPU request, i.e. the less valid request produced the more
+    reassuring screen. The CLI's copy of this record carried the flag; the
+    wizard's did not, and the wizard is both the default interface and the only
+    one with an "Enter partition name manually..." row.
+    """
+
+    OVERSIZED = {"cpus": 999, "memory": "9999G", "time_limit": "999:00:00",
+                 "nodes": 50, "gpus": 8}
+    REAL_PART = {"name": "amd", "nodes": 4, "nodes_up": 4, "cpus_per_node": 128,
+                 "mem_per_node_mb": 256000, "gpu_types": [], "timelimit": "36:00:00",
+                 "is_public": True, "is_default": False}
+
+    def _typed_manually(self, name, all_parts):
+        """Drive the real CUSTOM (manual-entry) confirm handler, not a stub."""
+        w = Wizard()
+        w.idx = _idx("partition")
+        w.transient["all_parts"] = list(all_parts)
+        w.step_cache["partition_sub"] = "text"
+        w.text_area.text = name
+        w.answers.update(self.OVERSIZED)
+        w._handle_partition_confirm()
+        return w
+
+    def test_manual_entry_marks_the_record_unknown(self):
+        w = self._typed_manually("typo-partition", [self.REAL_PART])
+        assert w.answers["partition"] == "typo-partition"
+        part = w.answers["_partition_obj"]
+        assert part["_unknown"] is True
+        # 'absent' vs 'unreadable': the partition list WAS readable here, so this
+        # name is genuinely not on the cluster.
+        assert part["_unknown_reason"] == "absent"
+
+    def test_live_panel_says_the_limits_were_not_checked(self):
+        w = self._typed_manually("typo-partition", [self.REAL_PART])
+        w.idx = _idx("cpus")
+        msgs = [m for _lvl, m in w._config_warnings()]
+        assert any("Capacity limits NOT checked" in m for m in msgs), msgs
+        assert any("'typo-partition' is not on this cluster" in m for m in msgs), msgs
+
+    def test_unreadable_list_does_not_claim_the_partition_is_absent(self):
+        # No Slurm / sinfo failed: nothing is known about ANY partition, so
+        # "not on this cluster" would be a false rejection.
+        w = self._typed_manually("amd", [])
+        assert w.answers["_partition_obj"]["_unknown_reason"] == "unreadable"
+        w.idx = _idx("cpus")
+        msgs = [m for _lvl, m in w._config_warnings()]
+        assert any("could not be read" in m for m in msgs), msgs
+        assert all("is not on this cluster" not in m for m in msgs), msgs
+
+    def test_control_a_real_partition_is_not_flagged_unknown(self):
+        """Control: the flag must mark ONLY the synthetic fallback.
+
+        Flagging a partition that WAS found would put "limits not checked" on
+        every ordinary run, which is the opposite failure — a warning nobody can
+        act on, on the path where the limits were in fact checked.
+        """
+        from slurmate.tui import _get_partition
+        found = _get_partition([self.REAL_PART], "amd")
+        assert found is self.REAL_PART
+        assert "_unknown" not in found
+        assert "_unknown_reason" not in found
+
+        w = Wizard()
+        w.answers.update({"partition": "amd", "_partition_obj": self.REAL_PART,
+                          "cpus": 4, "memory": "16G", "time_limit": "02:00:00",
+                          "nodes": 1, "gpus": 0})
+        w.idx = _idx("cpus")
+        assert all("Capacity limits NOT checked" not in m
+                   for _lvl, m in w._config_warnings())
+
+
+class TestBlankManualPartitionKeepsValidating:
+    """A blank manual partition means "site default", not "stop checking".
+
+    Confirming an EMPTY value in the "Enter partition name manually..." row is a
+    legitimate answer — Slurm uses the site default and the builder emits no
+    ``--partition`` directive for it (SM-15) — but it left ``_partition_obj``
+    None, and ``_config_warnings`` early-returned ``[]`` on that for the whole
+    rest of the session. ``validate_job_config`` consults the partition in only
+    *some* of its rules, so the ones that never look at one were dropped for a
+    reason that has nothing to do with them: a duplicated custom directive
+    (a second ``#SBATCH`` line ``sbatch --test-only`` reports ***PASSED*** and
+    Slurm then silently honours over slurmate's, while the summary describes the
+    value that lost) and an ``--array`` beyond the site's MaxArraySize.
+    """
+
+    REAL_PART = {"name": "amd", "nodes": 4, "nodes_up": 4, "cpus_per_node": 128,
+                 "mem_per_node_mb": 256000, "gpu_types": [], "has_gpu": False,
+                 "timelimit": "36:00:00", "is_public": True, "is_default": True}
+
+    def _blank_manual(self, **answers):
+        """Drive the real CUSTOM row and confirm an empty value, not a stub."""
+        from slurmate.tui import CUSTOM
+        w = Wizard()
+        w.idx = _idx("partition")
+        w.transient["all_parts"] = [self.REAL_PART]
+        w._on_enter_step()
+        assert CUSTOM in [v for v, _ in w.radio_list.values]
+        w._set_radio_default(CUSTOM)
+        w._handle_partition_confirm()          # CUSTOM -> manual-entry text mode
+        assert w.step_cache.get("partition_sub") == "text"
+        w.text_area.text = ""
+        w._handle_partition_confirm()          # confirm the empty value
+        # The blank itself is accepted, not rejected: that is the point.
+        assert w.answers["partition"] == ""
+        assert w.answers["_partition_obj"] is None
+        w.answers.update(answers)
+        return w
+
+    def test_duplicated_custom_directive_is_still_reported(self):
+        w = self._blank_manual(
+            job_name="run", cpus=4,
+            custom_sbatch=["--job-name=OVERRIDE", "--cpus-per-task=1"],
+        )
+        for key in ("cpus", "custom_sbatch", "command", "review"):
+            w.idx = _idx(key)
+            flagged = [m for lvl, m in w._config_warnings()
+                       if lvl == "error" and "duplicates a directive" in m]
+            assert len(flagged) == 2, (key, w._config_warnings())
+
+    def test_the_script_really_carries_the_duplicate_it_warns_about(self):
+        """The harm the warning names, in the generated script itself."""
+        from slurmate.builder import build_from_answers
+        w = self._blank_manual(
+            job_name="run", cpus=4, command="echo hi",
+            custom_sbatch=["--job-name=OVERRIDE"],
+        )
+        names = [ln for ln in build_from_answers(w.answers).splitlines()
+                 if "--job-name" in ln]
+        # Slurm honours the LAST, so the job runs as OVERRIDE while the summary
+        # says "run" — and with no partition nothing said so.
+        assert names == ["#SBATCH --job-name=run", "#SBATCH --job-name=OVERRIDE"]
+        assert any("duplicates a directive" in m for _lvl, m in w._config_warnings())
+
+    def test_over_maxarraysize_is_still_reported(self, mocker):
+        import slurmate.tui as t
+        mocker.patch.object(t, "fetch_max_array_size", return_value=65533)
+        w = self._blank_manual(cpus=4, array_spec="1-99999")
+        w.idx = _idx("review")
+        msgs = [m for _lvl, m in w._config_warnings()]
+        assert any("MaxArraySize (65533)" in m for m in msgs), msgs
+
+    def test_control_a_fitting_array_stays_silent(self, mocker):
+        """Control: the array rule must fire on the limit, not on the blank."""
+        import slurmate.tui as t
+        mocker.patch.object(t, "fetch_max_array_size", return_value=65533)
+        w = self._blank_manual(cpus=4, array_spec="1-100")
+        w.idx = _idx("review")
+        assert w._config_warnings() == []
+
+    def test_control_partition_dependent_checks_stay_silent(self):
+        """Control: this must not become "check everything against nothing".
+
+        With no partition there is no advertised CPU/memory/GPU/time/node figure
+        to compare against, so a limit warning here would be an invented limit —
+        the false-rejection failure mode SM-4's restraint exists to prevent. Both
+        before and after the fix this list is empty; what changed is only the
+        rules above, which never consulted a partition in the first place.
+        """
+        w = self._blank_manual(cpus=999, memory="9999G", time_limit="999:00:00",
+                               nodes=50, gpus=8, gpu_type="a100")
+        for key in ("cpus", "memory", "nodes", "gpus", "review"):
+            w.idx = _idx(key)
+            assert w._config_warnings() == [], key
+
+    def test_control_a_named_partition_is_judged_exactly_as_before(self):
+        """Control: the same answers on a real partition, in the same order.
+
+        The fix shares two rule bodies between the no-partition path and the main
+        one, so this pins the full ordered list a known partition produces —
+        a reordered or doubled message would be a regression the assertions
+        above cannot see.
+        """
+        w = Wizard()
+        w.answers.update({
+            "partition": "amd", "_partition_obj": self.REAL_PART, "job_name": "run",
+            "cpus": 999, "memory": "9999G", "time_limit": "999:00:00",
+            "nodes": 50, "gpus": 8,
+            "custom_sbatch": ["--job-name=OVERRIDE"],
+        })
+        w.idx = _idx("review")
+        assert w._config_warnings() == [
+            ("warning", "CPUs (999) exceeds partition limit (128 per node)"),
+            ("error", "custom flag --job-name duplicates a directive slurmate "
+                      "manages; Slurm would honour it over --job-name and the "
+                      "summary would describe the wrong value"),
+            ("warning", "Memory (9999G) exceeds partition limit (256000 MB per node)"),
+            ("warning", "Time limit (999:00:00) exceeds partition limit (36:00:00)"),
+            ("warning", "Nodes (50) exceeds the 4 node(s) in 'amd'"),
+            ("error", "Partition 'amd' does not support GPUs"),
+        ]
+
+    def test_the_final_summary_agrees_with_the_live_panel(self):
+        """The two surfaces share one validator, so a blank partition must not
+        split them: the wizard's answers go on to the CLI summary, whose
+        ``_partition_issues`` early-returned on the same falsy record."""
+        from slurmate.main import _partition_issues
+        w = self._blank_manual(job_name="run", cpus=4,
+                               custom_sbatch=["--job-name=OVERRIDE"])
+        w.idx = _idx("review")
+        assert _partition_issues(w.answers) == w._config_warnings()
+        assert w._config_warnings()
+
+
+class TestClearedTimeLimitFallsBackToDefault:
+    """Clearing the pre-filled time limit must not silently drop ``--time``.
+
+    ``time_limit`` fell through to ``_coerce``'s bare ``return val``, so an
+    emptied field became ``""`` — and the builder omits ``#SBATCH --time`` for an
+    empty value. The script then had no time limit, the summary had no "Time
+    limit" row, and "Estimated CPU-hours" was still computed from
+    ``estimate_su``'s implicit 120-minute assumption. cpus/nodes/memory all
+    revert to the config/literal default when cleared (the P3-10 invariant);
+    this one did not, and unlike mem_per_cpu/array_spec/constraint its subtitle
+    never offers blank as an answer.
+    """
+
+    def test_cleared_field_uses_the_declared_default(self):
+        w = Wizard()
+        assert w._coerce("", STEPS[_idx("time_limit")]) == "02:00:00"
+
+    def test_cleared_field_prefers_a_configured_default(self):
+        w = Wizard()
+        w._config_defaults["time_limit"] = "08:00:00"
+        assert w._coerce("", STEPS[_idx("time_limit")]) == "08:00:00"
+
+    def test_script_and_summary_still_carry_a_time_limit(self):
+        from slurmate.builder import build_from_answers, job_summary_rows
+        w = Wizard()
+        answers = {"job_name": "j", "partition": "amd", "cpus": 4,
+                   "memory": "16G", "nodes": 1, "command": "echo hi",
+                   "time_limit": w._coerce("", STEPS[_idx("time_limit")])}
+        assert "#SBATCH --time=02:00:00" in build_from_answers(answers)
+        assert ("Time limit", "02:00:00") in job_summary_rows(answers)
+
+    def test_control_a_typed_value_is_returned_verbatim(self):
+        """Control: the default applies to a CLEARED field only.
+
+        Substituting it for a value the user typed would overwrite the answer —
+        and every accepted spelling must survive, not just hh:mm:ss.
+        """
+        w = Wizard()
+        w._config_defaults["time_limit"] = "08:00:00"
+        s = STEPS[_idx("time_limit")]
+        for typed in ("30", "5:00", "01:00:00", "7-00:00:00", "2-12"):
+            assert w._coerce(typed, s) == typed
+
+    def test_control_explicit_empty_config_still_omits_time(self):
+        """Control: an operator who configures a blank time limit keeps the
+        omission — the fallback goes through ``_step_default``, which honours an
+        override of ``""``, rather than hardcoding the step literal."""
+        w = Wizard()
+        w._config_defaults["time_limit"] = ""
+        assert w._coerce("", STEPS[_idx("time_limit")]) == ""
+
+
+class TestCustomFlagsSurviveBack:
+    """A quoted custom ``#SBATCH`` value must survive going Back to its step.
+
+    ``_parse_custom_flags`` *consumes* the user's quotes, so writing the parsed
+    list back into the field verbatim made the next confirm re-split it. Typing
+    ``--comment="my big run"``, pressing Back and confirming again produced
+    ``['--comment=my big', '--run']`` — a fabricated ``#SBATCH --run`` that
+    ``sbatch --test-only -A rcc-staff -p amd -t 1`` refuses outright
+    ("unrecognized option '--run'", rc 255), turning a script sbatch accepted
+    (rc 0) into one it rejects.
+    """
+
+    def _round_trip(self, typed, key="custom_sbatch"):
+        """Answer the step, walk Back into it, confirm it again untouched."""
+        w = Wizard()
+        w._invalidate = lambda: None
+        w.idx = _idx(key)
+        w.text_area.text = typed
+        w._confirm_and_next()
+        forward = w.answers[key]
+        forward = list(forward) if isinstance(forward, list) else forward
+        guard = 0
+        while w.current_step.key != key and guard < 8:
+            w._go_back()
+            guard += 1
+        assert w.current_step.key == key
+        restored = w.text_area.text
+        w._confirm_and_next()
+        after = w.answers[key]
+        return forward, restored, (list(after) if isinstance(after, list) else after)
+
+    def test_quoted_value_with_a_space_survives_back(self):
+        forward, restored, after = self._round_trip(
+            '--comment="my big run" --exclusive'
+        )
+        assert forward == ["--comment=my big run", "--exclusive"]
+        # The field is re-quoted on the way in, so re-parsing it is a no-op.
+        assert '--comment="my big run"' in restored
+        assert after == forward
+
+    def test_no_fabricated_directive_reaches_the_script(self):
+        from slurmate.builder import build_from_answers
+        _forward, _restored, after = self._round_trip('--comment="my big run"')
+        script = build_from_answers({
+            "job_name": "j", "partition": "amd", "cpus": 1, "memory": "1G",
+            "nodes": 1, "time_limit": "1", "command": "true",
+            "custom_sbatch": after,
+        })
+        assert '#SBATCH --comment="my big run"' in script
+        assert "--run" not in script
+
+    def test_control_unquoted_flags_round_trip_too(self):
+        """Control: every custom-flag form whose values hold no whitespace
+        round-tripped before the fix and still does. The defect was specific to
+        a value that had to be quoted, so this half of the matrix pins that the
+        Back-and-reconfirm harness itself is sound rather than vacuous."""
+        for typed in ("--exclusive",
+                      "--exclude=n1,n2 --exclusive",
+                      "-C bigmem",
+                      "--exclusive --reservation=abc",
+                      "--exclusive,--hold"):
+            forward, _restored, after = self._round_trip(typed)
+            assert after == forward, typed
+
+    def test_control_module_list_is_not_requoted(self):
+        """Control: the same write-back serves the modules step, whose entries
+        carry no quoting to restore — it must come back verbatim in both states,
+        so the re-quoting stays scoped to custom_sbatch."""
+        forward, restored, after = self._round_trip(
+            "cuda/11.8, gcc/9.3.0", key="modules"
+        )
+        assert forward == ["cuda/11.8", "gcc/9.3.0"]
+        assert restored == "cuda/11.8, gcc/9.3.0"
+        assert after == forward
+
+
+class TestPrivatePartitionListKeepsTheCurrentChoice:
+    """Opening "Include private partitions" must not silently re-pick.
+
+    ``_setup_partition`` deliberately highlights the already-chosen partition so
+    a stray Enter doesn't drop into the manual-entry flow. The private list is
+    one keypress away from that one and was built with its cursor on row 0, so a
+    user who went Back to look at the private partitions and pressed Enter had
+    the job moved to whatever partition sorts first — taking the derived memory
+    default, the GPU-type list and the QoS list with it.
+    """
+
+    def _chose(self, name):
+        w = Wizard()
+        w._invalidate = lambda: None
+        w.idx = _idx("partition")
+        w._on_enter_step()
+        vals = [v for v, _ in w.radio_list.values]
+        w.radio_list._selected_index = next(
+            i for i, v in enumerate(vals) if v.startswith(name)
+        )
+        w._confirm_and_next()
+        assert w.answers["partition"] == name
+        while w.current_step.key != "partition":
+            w._go_back()
+        return w
+
+    def _open_private(self, w):
+        from slurmate.tui import PRIVATE
+        vals = [v for v, _ in w.radio_list.values]
+        w.radio_list._selected_index = vals.index(PRIVATE)
+        w._confirm_and_next()
+        assert w.step_cache.get("partition_sub") == "all"
+
+    def test_stray_enter_in_the_private_list_keeps_the_partition(self):
+        w = self._chose("gpu-shared")
+        self._open_private(w)
+        assert w._radio_value().startswith("gpu-shared")
+        w._confirm_and_next()          # a stray Enter, cursor never moved
+        assert w.answers["partition"] == "gpu-shared"
+        assert w.answers["_partition_obj"]["name"] == "gpu-shared"
+
+    def test_control_a_moved_cursor_still_selects_that_row(self):
+        """Control: the restore seeds the cursor, it does not pin it — moving to
+        another row in the private list still selects that row in both states.
+        Without this the fix could pass by ignoring the user entirely."""
+        w = self._chose("gpu-shared")
+        self._open_private(w)
+        vals = [v for v, _ in w.radio_list.values]
+        w.radio_list._selected_index = next(
+            i for i, v in enumerate(vals) if v.startswith("debug")
+        )
+        w._confirm_and_next()
+        assert w.answers["partition"] == "debug"
+
+    def test_control_first_visit_opens_on_the_first_row(self):
+        """Control: on a first visit there is no answer to restore, so the list
+        still opens on row 0 — the behaviour the fix must leave alone."""
+        w = Wizard()
+        w._invalidate = lambda: None
+        w.idx = _idx("partition")
+        w._on_enter_step()
+        assert "partition" not in w.answers
+        self._open_private(w)
+        assert w._radio_value() == w.radio_list.values[0][0]
+
+
+class TestClearedFieldIsClearedByBackToo:
+    """Clearing an optional field must clear it whichever key comes next.
+
+    Measured across all 17 free-text steps: Enter committed a cleared field and
+    Back did not, so the same visible field state (empty) meant two different
+    things depending on which key the user pressed. ``ntasks_per_node`` is where
+    that produces a script Slurm refuses *and* a screen that says otherwise: the
+    live panel's warning is computed from the field's live value, so it goes quiet
+    as the field empties — and Back then puts the deleted directive back.
+    Authority, on the real cluster (amd has 128 cores/node):
+
+        sbatch --test-only -A rcc-staff -p amd -t 1 --wrap='true' \\
+            -N2 --ntasks-per-node=64 -c 4      # what Back produced
+        -> allocation failure: Requested node configuration is not available
+
+        sbatch --test-only -A rcc-staff -p amd -t 1 --wrap='true' \\
+            -N2 --ntasks-per-node=1 -c 4       # what Enter produced
+        -> Verification: ***PASSED***   (rc 0)
+    """
+
+    def _on_ntasks_step(self):
+        from slurmate.system_utils import fetch_partitions
+        w = Wizard()
+        # 32 cores/node in mock data, so 64 tasks x 4 cpus is over the limit.
+        part = next(p for p in fetch_partitions() if p["name"] == "cpu-shared")
+        w.answers.update({"partition": "cpu-shared", "_partition_obj": part,
+                          "cpus": 4, "memory": "16G", "time_limit": "01:00:00",
+                          "nodes": 2, "gpus": 0, "ntasks_per_node": 64})
+        w.idx = _idx("ntasks_per_node")
+        w._on_enter_step("forward")
+        return w
+
+    def test_the_screen_confirms_the_clear(self):
+        """Not the fix — the reason it is a defect. The live panel drops the
+        warning as the field empties, i.e. the screen tells the user the clear
+        took effect. Passes in both states."""
+        w = self._on_ntasks_step()
+        assert w.text_area.text == "64"
+        assert any("per node" in m for _lv, m in w._config_warnings())
+        w.text_area.text = ""
+        assert w._config_warnings() == []
+
+    def test_back_on_a_cleared_optional_field_clears_it(self):
+        w = self._on_ntasks_step()
+        w.text_area.text = ""
+        w._go_back()
+        assert w.answers["ntasks_per_node"] is None
+
+    def test_the_deleted_value_leaves_the_script(self):
+        """End-to-end: the script no longer asks for 64 tasks x 4 CPUs on a
+        32-core node. (A multi-node job always carries the directive, so the
+        cleared field shows up as the builder's ``=1``, not as its absence.)"""
+        from slurmate.builder import build_from_answers
+        w = self._on_ntasks_step()
+        w.text_area.text = ""
+        w._go_back()
+        script = build_from_answers(w.answers)
+        assert "#SBATCH --ntasks-per-node=64" not in script
+        assert "#SBATCH --ntasks-per-node=1" in script
+
+    def test_both_gestures_now_agree_on_every_optional_step(self):
+        """The invariant, stated once: wherever blank is an offered answer
+        (``_coerce("") is None``), Enter-on-empty and Back-on-empty produce the
+        same answer."""
+        agree, differ = [], []
+        for s in STEPS:
+            if s.kind not in ("text", "autocomplete", "ntasks_per_node"):
+                continue
+            forward, backward = Wizard(), Wizard()
+            if not forward._blank_is_an_answer(s):
+                continue
+            for w in (forward, backward):
+                w.answers.update({"nodes": 2, s.key: "keep-me"})
+                w.idx = _idx(s.key)
+            forward._confirm_and_next()
+            backward._go_back()
+            pair = (forward.answers.get(s.key), backward.answers.get(s.key))
+            (agree if pair[0] == pair[1] else differ).append((s.key, pair))
+        assert differ == []
+        assert {k for k, _ in agree} == {
+            "account", "mem_per_cpu", "ntasks_per_node", "constraint",
+            "array_spec", "output_dir", "output_file", "custom_sbatch", "modules",
+            # Joined the set when _coerce stopped spelling this field's "unset"
+            # as "" — see TestEnvNameBlankMeansUnset.
+            "env_name",
+        }
+
+    def test_control_a_typed_value_still_survives_back(self):
+        """Control: Back still commits what is *in* the field. Passes in both
+        states — without it the fix could pass by making Back save nothing."""
+        w = Wizard()
+        w.answers.update({"nodes": 2, "ntasks_per_node": 64})
+        w.idx = _idx("ntasks_per_node")
+        w._on_enter_step("forward")
+        w.text_area.text = "8"
+        w._go_back()
+        assert w.answers["ntasks_per_node"] == 8
+
+    def test_control_an_invalid_value_still_leaves_the_prior_answer(self):
+        """Control: the crash guard this branch was written for. A malformed
+        non-empty entry is still not fed to _coerce's int(), so the prior answer
+        stands and Back does not raise. Passes in both states."""
+        w = Wizard()
+        w.answers.update({"cpus": 8})
+        w.idx = _idx("cpus")
+        w._on_enter_step("forward")
+        w.text_area.text = "3.5"
+        w._go_back()
+        assert w.answers["cpus"] == 8
+
+    def test_control_a_default_reverting_field_keeps_its_prior_answer(self):
+        """Control: the scope boundary. On the steps where blank is *not* an
+        offered answer, Back still keeps the prior answer — it is not made to
+        agree with Enter's substituted default. Passes in both states."""
+        w = Wizard()
+        for key, prior in (("memory", "32G"), ("time_limit", "04:00:00"),
+                           ("cpus", 8), ("nodes", 4), ("gpus", 2)):
+            w = Wizard()
+            w.answers.update({"nodes": 4, key: prior})
+            assert not w._blank_is_an_answer(STEPS[_idx(key)])
+            w.idx = _idx(key)
+            w._on_enter_step("forward")
+            w.text_area.text = ""
+            w._go_back()
+            assert w.answers[key] == prior, key
+
+
+class TestEnvNameBlankMeansUnset:
+    """``_coerce("")`` for ``env_name`` was ``""``; the builder reads blank as unset.
+
+    The two disagreed, and the disagreement was ``_coerce``'s. ``env_name`` is the
+    only *optional* text step whose blank did not coerce to ``None``, and it was
+    ``""`` only because it fell off the end of ``_coerce``'s ``if`` chain into the
+    bare ``return val`` — the same way ``time_limit`` used to. Nothing wanted that
+    spelling: ``build_sbatch_script``'s parameter is ``str | None = None`` and it
+    gates on ``if env_name:``; ``env_activation_emitted``, ``check_conda_env`` and
+    ``job_summary_rows``' ``add`` all reduce it through truthiness or ``or ""``;
+    and the wizard's own skip path (``_setup_env_name`` when env_type is "None
+    (skip)") already writes ``None``. So one user-visible state had two encodings,
+    and the ``""`` one made ``_blank_is_an_answer`` — which reads ``_coerce`` — say
+    blank was not an answer for a field where it is.
+
+    What that cost, driven headlessly from the env_name step with ``env_type =
+    Conda`` and ``env_name = stale-env`` already answered, field cleared, one
+    keystroke apart:
+
+        ENTER -> ... python train.py
+        BACK  -> source "$(conda info --base)/etc/profile.d/conda.sh"
+                 conda activate stale-env || { echo '...aborting' >&2; exit 1; }
+
+                 python train.py
+
+    Back is the wrong script twice over: it activates an environment the user
+    deleted from the field, and the abort guard makes that fatal — the job exits 1
+    at activation and ``python train.py`` never runs. ``sbatch --test-only`` cannot
+    adjudicate it (an activation line is script body, not a directive), so the
+    evidence is the two scripts built from the same visible state.
+    """
+
+    ANSWERS = {
+        "job_name": "train", "partition": "amd", "cpus": 4, "memory": "16G",
+        "time_limit": "01:00:00", "nodes": 1, "gpus": 0,
+        "env_type": "Conda", "env_name": "stale-env",
+        "command": "python train.py",
+    }
+
+    def _on_env_name_step(self, monkeypatch, **over):
+        import slurmate.tui as t
+        # Keep the conda picker out of it: a populated list pops the completion
+        # menu, which warns about an unawaited coroutine with no event loop.
+        monkeypatch.setattr(t, "fetch_conda_envs", lambda mods=None: [])
+        w = Wizard()
+        w.answers.update({**self.ANSWERS, **over})
+        w.idx = _idx("env_name")
+        w._on_enter_step("forward")
+        return w
+
+    def test_coerce_reads_blank_as_unset(self):
+        assert Wizard()._coerce("", STEPS[_idx("env_name")]) is None
+        assert Wizard()._blank_is_an_answer(STEPS[_idx("env_name")]) is True
+
+    def test_back_on_a_cleared_env_name_clears_it(self, monkeypatch):
+        w = self._on_env_name_step(monkeypatch)
+        assert w.text_area.text == "stale-env"      # the field was pre-filled
+        w.text_area.text = ""
+        w._go_back()
+        assert w.answers["env_name"] is None
+
+    def test_the_deleted_environment_leaves_the_script(self, monkeypatch):
+        """End-to-end: no resurrected activation, and no guard to abort on."""
+        from slurmate.builder import build_from_answers
+        w = self._on_env_name_step(monkeypatch)
+        w.text_area.text = ""
+        w._go_back()
+        script = build_from_answers(w.answers)
+        assert "conda activate stale-env" not in script
+        assert "conda info --base" not in script
+        assert "python train.py" in script
+
+    def test_both_gestures_build_the_same_script(self, monkeypatch):
+        """The invariant, at script level: from one visible field state, one script."""
+        from slurmate.builder import build_from_answers
+        fwd = self._on_env_name_step(monkeypatch)
+        fwd.text_area.text = ""
+        fwd._confirm_and_next()
+        bwd = self._on_env_name_step(monkeypatch)
+        bwd.text_area.text = ""
+        bwd._go_back()
+        assert fwd.answers["env_name"] == bwd.answers["env_name"]
+        assert build_from_answers(fwd.answers) == build_from_answers(bwd.answers)
+
+    def test_control_a_named_environment_still_activates(self, monkeypatch):
+        """Control: the forward path is unchanged for a NON-blank env_name — it
+        still commits the name and still emits the activation line. Passes in
+        both states; without it the fix could pass by never activating anything."""
+        from slurmate.builder import build_from_answers, job_summary_rows
+        w = self._on_env_name_step(monkeypatch)
+        w.text_area.text = "myenv"
+        w._confirm_and_next()
+        assert w.answers["env_name"] == "myenv"
+        script = build_from_answers(w.answers)
+        assert 'source "$(conda info --base)/etc/profile.d/conda.sh"' in script
+        assert "conda activate myenv" in script
+        assert dict(job_summary_rows(w.answers))["Environment"] == "myenv"
+        # ...and Back still commits a typed value too, not only Enter.
+        b = self._on_env_name_step(monkeypatch)
+        b.text_area.text = "myenv"
+        b._go_back()
+        assert b.answers["env_name"] == "myenv"
+
+    def test_control_the_nine_other_optional_keys_are_untouched(self):
+        """Control: the fix widens the derived rule by exactly one key. The nine
+        the rule already covered still coerce blank to None and still have Enter
+        and Back agreeing. Passes in both states."""
+        nine = ["account", "mem_per_cpu", "ntasks_per_node", "constraint",
+                "array_spec", "output_dir", "output_file", "custom_sbatch",
+                "modules"]
+        for key in nine:
+            s = STEPS[_idx(key)]
+            assert Wizard()._coerce("", s) is None, key
+            assert Wizard()._blank_is_an_answer(s) is True, key
+            fwd, bwd = Wizard(), Wizard()
+            for w in (fwd, bwd):
+                w.answers.update({"nodes": 2, key: "keep-me"})
+                w.idx = _idx(key)
+            fwd._confirm_and_next()
+            bwd._go_back()
+            assert fwd.answers[key] == bwd.answers[key] is None, key
+
+    def test_control_the_required_free_text_steps_still_keep_theirs(self):
+        """Control: the scope boundary the last round drew is still drawn. This
+        is a change to ONE key, not to ``_coerce``'s fallthrough — ``job_name``
+        and ``command`` are in ``main._REQUIRED_FIELDS``, their builder
+        parameters are plain ``str``, and their blank still coerces to ``""`` so
+        Back still keeps the prior answer. Passes in both states."""
+        from slurmate.main import _REQUIRED_FIELDS
+        required = {k for k, _label in _REQUIRED_FIELDS}
+        assert required == {"job_name", "partition", "command"}
+        assert "env_name" not in required
+        for key, prior in (("job_name", "keeper"), ("command", "echo keeper")):
+            s = STEPS[_idx(key)]
+            assert Wizard()._coerce("", s) == ""
+            assert Wizard()._blank_is_an_answer(s) is False
+            w = Wizard()
+            w.answers.update({key: prior})
+            w.idx = _idx(key)
+            w._on_enter_step("forward")
+            if getattr(s, "multiline", False):
+                w.multiline_text_area.text = ""
+            else:
+                w.text_area.text = ""
+            w._go_back()
+            assert w.answers[key] == prior, key

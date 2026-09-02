@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import contextlib
 import os
 import re
 import shutil
@@ -128,10 +129,9 @@ def make_output_safe() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is None:
             continue
-        try:
+        # detached / not reconfigurable
+        with contextlib.suppress(ValueError, OSError, LookupError):
             reconfigure(errors=_ERROR_HANDLER)
-        except (ValueError, OSError, LookupError):  # detached / not reconfigurable
-            pass
 
 
 def _should_use_color() -> bool:
@@ -141,18 +141,40 @@ def _should_use_color() -> bool:
     slurmate's output with ``FORCE_COLOR=1`` produced half-coloured output — rich's
     panels kept their colour while every ``c.*``-prefixed status line lost it.
 
-    The test matches rich's exactly, down to the edges: any **non-empty** value
-    forces colour (including ``FORCE_COLOR=0``, which rich also treats as "on"),
-    while ``FORCE_COLOR=""`` counts as unset — checked against the installed rich
-    rather than assumed. ``NO_COLOR`` still wins. ``CLICOLOR_FORCE`` is
-    deliberately *not* honoured: rich ignores it, so acting on it here would
-    recreate the very mismatch this removes.
+    The test matches rich's, down to the edges: any **non-empty** value forces
+    colour (including ``FORCE_COLOR=0``, which rich also treats as "on"), and
+    ``NO_COLOR`` still wins. ``CLICOLOR_FORCE`` is deliberately *not* honoured:
+    rich ignores it, so acting on it here would recreate the very mismatch this
+    removes.
+
+    **``FORCE_COLOR=""`` does NOT count as unset**, and this used to say it did.
+    Re-measured against the installed rich (15.0.0), on a tty, with the bare
+    ``Console()`` this package actually constructs::
+
+        FORCE_COLOR    rich is_terminal / color_system      here
+        <unset>        True  / 256                          colour
+        ""             False / None                         NO colour
+        " "            True  / 256                          colour
+        "0"            True  / 256                          colour
+        "1"            True  / 256                          colour
+
+    An empty value is the one input rich reads as "not a terminal", so it is the
+    one input where treating it as unset produced the split this function exists
+    to prevent -- inverted. Measured on ``--dry-run`` over a tty with
+    ``FORCE_COLOR=``: rich's styling collapsed from 253 SGR sequences to 1 while
+    the ``c.*``-coloured "Dry run — not submitted." line kept its grey, leaving
+    one coloured line in an otherwise plain screen. Every other value agrees
+    with rich both on a tty and piped, so only the empty case changed.
     """
     if os.environ.get("NO_COLOR"):
         return False
     if os.environ.get("TERM") == "dumb":
         return False
-    if os.environ.get("FORCE_COLOR", "").strip():
+    force = os.environ.get("FORCE_COLOR")
+    if force == "":
+        # Present but empty: rich turns styling off entirely, so we must too.
+        return False
+    if force is not None and force.strip():
         return True
     return sys.stdout.isatty()
 
@@ -211,6 +233,36 @@ BANNER_LINES = [
     r"    ╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝",
 ]
 
+# The banner is the one output path that ignored `use_ascii()`, and it is the
+# first thing printed. Its glyphs are a full block plus six box-drawing pieces,
+# none of which are in `_TRANSLITERATE` — so under a *valid* non-UTF-8 locale
+# (`en_US` is latin-1, the case this module exists for) the codec handler fell
+# through to `backslashreplace` and the six lines came out as ~440 `\uXXXX`
+# escapes: a screen of soup before the tool had said anything. Escaping is the
+# right answer for *data* (a job name is not recoverable from a "?"), which is
+# exactly why it is the wrong answer here — the banner is decoration, and
+# decoration is what has a fallback table. `--ascii`/`SLURMATE_ASCII=1` were
+# ignored too, on a UTF-8 terminal as well, so asking for ASCII output still
+# produced block art.
+#
+# Derived from BANNER_LINES by translation rather than written out a second
+# time: the two lists then cannot drift, and the line *count* and per-line
+# *width* are identical by construction — which the gradient (indexed 0..5) and
+# the animation's save/restore region both depend on.
+_ASCII_BANNER_MAP = str.maketrans({
+    "█": "#",                                            # █ full block
+    "═": "=", "║": "|",                              # ═ ║
+    "╔": "+", "╗": "+", "╚": "+", "╝": "+",  # ╔ ╗ ╚ ╝
+})
+
+BANNER_LINES_ASCII = [line.translate(_ASCII_BANNER_MAP) for line in BANNER_LINES]
+
+
+def banner_lines() -> list[str]:
+    """The banner art, ASCII-folded when the output cannot carry the Unicode."""
+    return BANNER_LINES_ASCII if use_ascii() else BANNER_LINES
+
+
 # Use class-level access (not the `c` instance) so the gradient codes are not
 # blanked by C.__getattribute__'s color gate when this module is imported under
 # a non-TTY/NO_COLOR process. print_banner() decides at call time whether to emit
@@ -246,6 +298,12 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
     if _env_flag("SLURMATE_NO_BANNER"):
         return
 
+    # Resolved once, at call time: `use_ascii()` reads `--ascii` and the output
+    # encoding, neither of which is known at import, and every branch below --
+    # static, animated, and the terminal-height check -- must agree on the same
+    # list or the animation's save/restore region drifts from what was printed.
+    lines = banner_lines()
+
     use_color = _should_use_color()
     use_animation = bool(animate) or _env_flag("SLURMATE_BANNER_ANIMATE")
 
@@ -263,15 +321,15 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
             rows = shutil.get_terminal_size().lines
         except OSError:
             rows = 24
-        if rows < len(BANNER_LINES) + 4:
+        if rows < len(lines) + 4:
             use_animation = False
 
     print()
     if use_color:
-        for i, line in enumerate(BANNER_LINES):
+        for i, line in enumerate(lines):
             print(f"{BANNER_GRADIENT[i]}{c.BOLD}\033[3m{line}\033[23m{c.RESET}")
     else:
-        for line in BANNER_LINES:
+        for line in lines:
             print(line)
     print()
 
@@ -286,14 +344,14 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
         print()
         return
 
-    n = len(BANNER_LINES)
+    n = len(lines)
     print(f"\033[{n + 1}A", end="")
     print("\033[s", end="")
     for _ in range(2):
         crest = -2.0
         while crest <= n + 1.0:
             print("\033[u", end="")
-            for i, line in enumerate(BANNER_LINES):
+            for i, line in enumerate(lines):
                 intensity = max(0.0, 1.0 - abs(i - crest) / 2.0) * 0.8
                 r, g, b = _brighten(BASE_RGB[i], intensity)
                 color = f"\033[38;2;{r};{g};{b}m"
@@ -302,7 +360,7 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
             time.sleep(0.04)
             crest += 0.5
     print("\033[u", end="")
-    for i, line in enumerate(BANNER_LINES):
+    for i, line in enumerate(lines):
         print(f"\033[2K{BANNER_GRADIENT[i]}{c.BOLD}\033[3m{line}\033[23m{c.RESET}")
     print()
     subtitle = f"{c.CYAN}Slurmate{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"

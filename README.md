@@ -193,13 +193,15 @@ Run `slurmate --help` for the full flag list.
 ## ⚙️ Configuration file
 
 Stop retyping the same account and partition every run. Slurmate reads defaults
-from a TOML file (first match wins):
+from TOML files. **Both are read and merged per key**, most specific first:
 
 1. `.slurmate.toml` in the current directory
 2. `~/.config/slurmate/config.toml`
 
-These prefill the wizard **and** act as fallbacks in batch mode. Explicit CLI
-flags always win.
+So a one-line project file naming this cluster's partition wins *that* key and
+leaves the global account, memory, time limit and module list intact — it does
+not replace the global file. These prefill the wizard **and** act as fallbacks
+in batch mode. Explicit CLI flags always win.
 
 ```toml
 # .slurmate.toml — keys may be top-level or under a [defaults]/[slurmate] table

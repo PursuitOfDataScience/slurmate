@@ -1,5 +1,7 @@
 """Tests for the sbatch script builder."""
 
+import pytest
+
 from slurmate.builder import (
     build_from_answers,
     build_sbatch_script,
@@ -475,9 +477,9 @@ class TestOutputPathQuoting:
 class TestCustomFlagGpuDedup:
     def _base(self, **kw):
         from slurmate.builder import build_sbatch_script
-        args = dict(job_name="j", partition="p", cpus=1, memory="1G",
-                    time_limit="01:00:00", gpus=2, gpu_type="v100",
-                    gpu_format="gres_type", command="x")
+        args = {"job_name": "j", "partition": "p", "cpus": 1, "memory": "1G",
+                    "time_limit": "01:00:00", "gpus": 2, "gpu_type": "v100",
+                    "gpu_format": "gres_type", "command": "x"}
         args.update(kw)
         return build_sbatch_script(**args)
 
@@ -518,8 +520,8 @@ class TestCustomFlagGpuDedup:
 class TestCustomFlagQuoting:
     def _base(self, **kw):
         from slurmate.builder import build_sbatch_script
-        args = dict(job_name="j", partition="p", cpus=1, memory="1G",
-                    time_limit="01:00:00", command="x")
+        args = {"job_name": "j", "partition": "p", "cpus": 1, "memory": "1G",
+                    "time_limit": "01:00:00", "command": "x"}
         args.update(kw)
         return build_sbatch_script(**args)
 
@@ -605,8 +607,8 @@ class TestDirectiveNewlineFolding:
 
     def _lines(self, **kw):
         from slurmate.builder import build_sbatch_script
-        args = dict(job_name="j", partition="p", cpus=4, memory="16G",
-                    time_limit="01:00:00", command="echo hi")
+        args = {"job_name": "j", "partition": "p", "cpus": 4, "memory": "16G",
+                    "time_limit": "01:00:00", "command": "echo hi"}
         args.update(kw)
         return build_sbatch_script(**args).splitlines()
 
@@ -657,6 +659,46 @@ class TestDirectiveNewlineFolding:
         # Directives after --mem/--time must survive.
         assert "#SBATCH --time=1:00:00 injected" in lines
         assert "#SBATCH --nodes=1" in lines
+
+    def test_surrounding_whitespace_stripped_from_every_directive(self):
+        """Padding at the ends breaks a directive exactly as a newline does.
+
+        Measured on midway3 (Slurm 20.11.8): generating with
+        `-a " 1-10 " -t " 00:20:00 "` emitted `#SBATCH --array= 1-10 `, and
+        `sbatch --test-only` refused the whole script with *"Invalid directive
+        found in batch script: 1-10"* (exit 255) while slurmate exited 0 --
+        because every consumer of the value already strips (`validate_array_spec`
+        calls the padded spec valid) and only the emitter did not. `--constraint`
+        had already been fixed on its own; see `TestConstraintWhitespace`.
+        """
+        lines = self._lines(partition="  p  ", account="  a  ", qos="  q  ",
+                            array_spec=" 1-10 ", time_limit=" 00:20:00 ",
+                            memory=" 16G ")
+        for directive in ("#SBATCH --partition=p", "#SBATCH --account=a",
+                          "#SBATCH --qos=q", "#SBATCH --array=1-10",
+                          "#SBATCH --time=00:20:00", "#SBATCH --mem=16G"):
+            assert directive in lines, f"{directive!r} not emitted: {lines}"
+        # Nothing may be left dangling as a script-body line either.
+        assert not any(ln.strip() in ("1-10", "00:20:00") for ln in lines)
+
+    def test_whitespace_inside_a_value_is_preserved_not_squeezed(self):
+        """The control, and it holds with or without the strip above: what it
+        forbids is the OTHER way to make padding go away. Squeezing all
+        whitespace out is right for `--constraint` (Slurm's feature grammar has
+        no spaces, so `_clean_constraint` does exactly that) and wrong for
+        everything else -- a log path with a space in it is a real path, and
+        collapsing it silently writes the job's output somewhere else. Interior
+        whitespace survives and `_quote_sbatch_value` quotes it instead.
+        """
+        from slurmate.builder import build_from_answers
+        s = build_from_answers({"job_name": "j", "partition": "p",
+                                "output_file": "my log.out",
+                                "command": "echo hi"}).splitlines()
+        assert '#SBATCH --output="my log.out"' in s
+        assert '#SBATCH --error="my log.err"' in s
+        # A folded newline must still leave the space it folded to, rather than
+        # being squeezed away into "gpux".
+        assert "#SBATCH --partition=gpu x" in self._lines(partition="gpu\nx")
 
 
 class TestArrayLogClobberProtection:
@@ -740,8 +782,8 @@ class TestClusterAgnosticBuilder:
     """Fixes from the cluster-agnostic audit: memory/constraint/GPU-format/conda."""
 
     def _base(self, **kw):
-        args = dict(job_name="j", partition="p", cpus=4, memory="16G",
-                    time_limit="01:00:00", command="echo hi")
+        args = {"job_name": "j", "partition": "p", "cpus": 4, "memory": "16G",
+                    "time_limit": "01:00:00", "command": "echo hi"}
         args.update(kw)
         return build_sbatch_script(**args)
 
@@ -825,8 +867,8 @@ class TestCustomConstraintMerge:
     """
 
     def _b(self, **kw):
-        base = dict(job_name="t", partition="p", cpus=1, memory="16G",
-                    time_limit="01:00:00", command="x")
+        base = {"job_name": "t", "partition": "p", "cpus": 1, "memory": "16G",
+                    "time_limit": "01:00:00", "command": "x"}
         base.update(kw)
         return build_sbatch_script(**base)
 
@@ -1225,7 +1267,9 @@ class TestNoDuplicateOrMalformedDirectives:
         keys = list(matrix)
         checked = 0
         for combo in itertools.product(*(matrix[k] for k in keys)):
-            answers = dict(zip(keys, combo))
+            # `strict=True`: `combo` comes from `itertools.product` over the same
+            # `keys`, so a length mismatch would be a bug in the matrix, not input.
+            answers = dict(zip(keys, combo, strict=True))
             answers.update(job_name="j", partition="p", cpus=4, memory="16G",
                            command="x")
             script = build_from_answers(answers)
@@ -1234,3 +1278,167 @@ class TestNoDuplicateOrMalformedDirectives:
             assert not malformed, f"malformed {malformed} for {answers}"
             checked += 1
         assert checked > 2000
+
+
+def _slurm_directive_parses(value: str) -> bool:
+    """Model of the quote scan Slurm applies to a ``#SBATCH`` directive value.
+
+    A ``'`` or ``"`` outside any region opens one that only the same character
+    closes, a backslash escapes the next character in either region, and a region
+    still open at the end of the value is ``sbatch: fatal: ... Unmatched``.
+    Reproduces all of SLURM_QUOTE_RULE, measured on Slurm 20.11.8.
+    """
+    i, n = 0, len(value)
+    while i < n:
+        ch = value[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            closer, i, closed = ch, i + 1, False
+            while i < n:
+                if value[i] == "\\":
+                    i += 2
+                    continue
+                if value[i] == closer:
+                    closed = True
+                    i += 1
+                    break
+                i += 1
+            if not closed:
+                return False
+            continue
+        i += 1
+    return True
+
+
+#: (directive value, did `sbatch --test-only` accept the script?) -- measured.
+SLURM_QUOTE_RULE = [
+    ("logs/x.out", True),
+    ("logs/it's.out", False),           # the filed bug: one bare apostrophe
+    ('logs/a"b.out', False),
+    ('"logs/it\'s.out"', True),         # wrapping is the remedy
+    ('\'logs/a"b.out\'', True),
+    ('"logs/a\\"b.out"', True),          # an escaped `"` does not close the region
+    ('logs/a"b"c.out', True),          # balanced -- parses, but Slurm strips it
+    ("logs/it's o'clock.out", True),
+    ('"logs/x\'y"z.out', True),         # a `\'` inside a `"` region is literal
+    ('\'logs/x"y\'z.out', True),
+    ('"a"\'b\'"c"', True),
+    ('"logs/it\'s.out', False),         # region left open
+    ('\'logs/a"b.out', False),
+    ('"a\\"b', False),                   # ... including by an escaped closer
+    ("'a\\'b", False),
+    ("logs/ab\\", True),                 # a trailing backslash alone is fine
+]
+
+
+class TestUnmatchedQuoteInADirectiveValue:
+    """`_quote_sbatch_value` quoted only on whitespace, and Slurm's directive
+    parser does more than split on whitespace: it does quote processing, and an
+    **unmatched** ``'`` or ``"`` in a value is fatal for the whole script.
+
+    An apostrophe in a log path is ordinary (``--output-dir /scratch/o'brien``)
+    and holds no whitespace, so the directive went out bare. Measured on midway3
+    (Slurm 20.11.8) against the script slurmate itself generated -- generated
+    with ``--print --force``, then handed to ``sbatch --test-only`` (verify only,
+    nothing submitted)::
+
+        #SBATCH --output=logs/it's-%j.out
+        sbatch: fatal: script.sh: line 9: Unmatched `'` in [ --output=logs/it's-%j.out]
+        rc=1
+
+    slurmate exited 0 on it. Same shape as the padded-``--array`` bug
+    `_fold_directive` documents: what was validated was not what was written.
+    Wrapping the value verifies rc=0, which was measured for every ``EMITTED``
+    row below.
+    """
+
+    # output_dir="logs" is what the CLI defaults to, so the directive lines below
+    # are verbatim the ones handed to `sbatch --test-only`.
+    BASE = {"job_name": "jn", "partition": "p", "command": "x",
+            "output_dir": "logs"}
+
+    def _lines(self, prefix, **kw):
+        a = {**self.BASE, **kw}
+        return [ln for ln in build_from_answers(a).splitlines()
+                if ln.startswith(prefix)]
+
+    def _out(self, **kw):
+        return self._lines("#SBATCH --output=", **kw)
+
+    # (kwargs, the exact directive line sbatch --test-only verified rc=0)
+    EMITTED = [
+        # the filed shapes: a quote and no whitespace, previously emitted bare
+        ({"output_file": "it's-%j.out"},
+         '#SBATCH --output="logs/it\'s-%j.out"'),
+        ({"output_file": 'a"b-%j.out'},
+         '#SBATCH --output="logs/a\\"b-%j.out"'),
+        ({"output_dir": "/scratch/o'brien/logs"},
+         '#SBATCH --output="/scratch/o\'brien/logs/jn-%j.out"'),
+        # a *balanced* pair parses, but Slurm strips it, so `a"b"c` silently
+        # became `abc`; wrapping keeps the name that was asked for.
+        ({"output_file": 'a"b"c-%j.out'},
+         '#SBATCH --output="logs/a\\"b\\"c-%j.out"'),
+        # a quote *and* a trailing backslash: the backslash is doubled so it
+        # cannot escape the closing quote (measured rc=0; bare `\"` is fatal).
+        ({"output_file": "it's.out\\"},
+         '#SBATCH --output="logs/it\'s.out\\\\"'),
+    ]
+
+    @pytest.mark.parametrize("kw, line", EMITTED)
+    def test_the_value_is_wrapped(self, kw, line):
+        assert self._out(**kw) == [line]
+
+    @pytest.mark.parametrize("kw, line", EMITTED)
+    def test_no_directive_leaves_a_quote_region_open(self, kw, line):
+        # The property that actually matters, stated independently of the exact
+        # spelling the fix chose. Not "an even number of each mark" -- inside a
+        # `"` region a `'` is literal, so `"it's"` is fine with one apostrophe.
+        value = self._out(**kw)[0].split("=", 1)[1]
+        assert _slurm_directive_parses(value), value
+
+    @pytest.mark.parametrize("raw, parses", SLURM_QUOTE_RULE)
+    def test_the_rule_matches_the_controller(self, raw, parses):
+        # Calibration for the model above, so the property test cannot drift into
+        # asserting a rule Slurm does not have. Every row is a directive value
+        # that was written into a script and handed to `sbatch --test-only`:
+        # `parses` False means "sbatch: fatal: ... Unmatched", True means PASSED.
+        assert _slurm_directive_parses(raw) is parses, raw
+
+    def test_the_error_directive_is_wrapped_too(self):
+        # --error is emitted by the same helper and was equally fatal.
+        assert self._lines("#SBATCH --error=", output_file="it's-%j.out") == [
+            '#SBATCH --error="logs/it\'s-%j.err"']
+
+    # ---- controls: unchanged behaviour on values with no quote mark ----
+    def test_a_plain_path_stays_unquoted(self):
+        # Control. Quoting every path would be a readability regression and would
+        # hide the fix's real trigger; plain paths must read the same as before.
+        assert self._out(output_file="plain-%j.out") == [
+            "#SBATCH --output=logs/plain-%j.out"]
+
+    def test_whitespace_still_quotes_the_same_way(self):
+        # Control: the pre-existing whitespace trigger and its escaping are
+        # untouched, including a `"` inside a spaced value.
+        assert self._out(output_file="my log-%j.out") == [
+            '#SBATCH --output="logs/my log-%j.out"']
+
+    @pytest.mark.parametrize("name", [
+        "a$b-%j.out", "a`b`c-%j.out", "a#b-%j.out", "训练-%j.out", "ab.out\\",
+    ])
+    def test_shell_metacharacters_are_not_quoted(self, name):
+        # Control, and a deliberate non-mirror of the fix: `$`, a backtick, `#`,
+        # UTF-8 and a trailing backslash were each measured rc=0 *unquoted*
+        # (Slurm does no expansion in a directive), so the fix must not start
+        # wrapping them -- the trigger is the quote mark, not "anything unusual".
+        assert self._out(output_file=name)[0].startswith("#SBATCH --output=logs/")
+        assert '"' not in self._out(output_file=name)[0]
+
+    def test_the_control_is_not_vacuous(self):
+        # If the trigger ever widened to "always quote", the controls above would
+        # be the only thing catching it; pin the helper's two branches directly.
+        from slurmate.builder import _quote_sbatch_value
+        assert _quote_sbatch_value("/logs/a-%j.out") == "/logs/a-%j.out"
+        assert _quote_sbatch_value("") == ""
+        assert _quote_sbatch_value("/logs/it's.out") == '"/logs/it\'s.out"'

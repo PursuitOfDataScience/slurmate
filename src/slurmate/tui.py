@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
 import shlex
+import sys
 from collections.abc import Callable, Generator
 from typing import Any
 
@@ -34,7 +36,12 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import RadioList, TextArea
 
-from .builder import _join_flag_values, build_from_answers, job_summary_rows
+from .builder import (
+    _join_flag_values,
+    _quote_custom_flag,
+    build_from_answers,
+    job_summary_rows,
+)
 from .system_utils import (
     FALLBACK_MEMORY,
     config_source,
@@ -217,10 +224,18 @@ class LastTokenCommaCompleter(Completer):
         text = document.text_before_cursor
         idx = text.rfind(",")
         prefix = text[idx + 1:] if idx >= 0 else text
-        stripped = prefix.lstrip()
+        # Both ends, not just the left. `lstrip` let a trailing space through into
+        # the fuzzy pattern, and no module name contains one, so "gc " matched
+        # every word in the list instead of `gcc` -- tab after an accidental space
+        # offered the whole catalogue. The sibling completer above never had this
+        # because splitting on whitespace makes a trailing space an empty token.
+        stripped = prefix.strip()
         if not stripped:
             return
-        leading = len(prefix) - len(stripped)
+        # Measured from the LEFT only, deliberately: `start_position` below has to
+        # span the whole prefix including any trailing space, so that accepting a
+        # completion replaces that space rather than leaving "gc gcc".
+        leading = len(prefix) - len(prefix.lstrip())
         fuzzy = FuzzyWordCompleter(self._words, WORD=False)
         sub = Document(stripped, len(stripped))
         for comp in fuzzy.get_completions(sub, complete_event):
@@ -240,9 +255,21 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
     # capacity field is unknown (0/None), which is what keeps the limit checks
     # silent rather than warning against a limit of zero. nodes_up is None
     # (unknown), never 0, so it is not read as "all nodes are down".
+    #
+    # ``_unknown``/``_unknown_reason`` carry the same meaning as in
+    # :func:`~slurmate.main._get_partition`, and for the same reason: the zeros
+    # keep the limit checks quiet, so without the flag the wizard's live panel
+    # said *nothing* about a 999-CPU request on a mistyped partition — the less
+    # valid request producing the more reassuring screen. Only the CLI's copy of
+    # this record was flagged, so the wizard (the default interface, and the only
+    # one with a "Enter partition name manually..." row) was the surface that
+    # stayed silent, and its answers carry `_partition_obj` on into the CLI
+    # summary, where the same flag is what stops a nonexistent partition's empty
+    # `squeue` from being printed as a real "0 running / 0 pending" and an ETA.
     return {"name": name, "nodes": 0, "nodes_up": None, "cpus_per_node": 0,
             "mem_per_node_mb": 0, "gpu_types": [], "timelimit": None,
-            "is_public": True, "is_default": False}
+            "is_public": True, "is_default": False, "_unknown": True,
+            "_unknown_reason": "absent" if partitions else "unreadable"}
 
 
 def _fmt_partition(p: dict[str, Any]) -> str:
@@ -317,7 +344,9 @@ def _rank_partitions(
     return sorted(parts, key=key)
 
 
-def _parse_custom_flags(raw: str) -> list[str]:
+def _parse_custom_flags(
+    raw: str, reassembled: list[tuple[str, str]] | None = None
+) -> list[str]:
     """Parse custom #SBATCH flags from free-form input into one flag per entry.
 
     Options are separated by spaces or commas, so ``--exclusive --reservation=abc``
@@ -354,7 +383,7 @@ def _parse_custom_flags(raw: str) -> list[str]:
         parts.extend(p.strip().rstrip(",") for p in re.split(r",(?=\s*-)", tok))
     # Shared with the builder's list/API path, so every way of supplying custom
     # flags resolves a space-separated value identically.
-    return _join_flag_values(parts)
+    return _join_flag_values(parts, reassembled)
 
 
 MEMORY_CHOICES = ["4G", "8G", "16G", "32G", "64G", "128G", "256G", "512G", "64000M"]
@@ -471,6 +500,72 @@ STEPS: list[Step] = [
 
 
 # ── Wizard ───────────────────────────────────────────────────────────────
+
+#: Signals that end the process, and would otherwise end it with the terminal
+#: still in prompt_toolkit's raw, alternate-screen state.
+#:
+#: Measured by driving the wizard in a real pty:
+#:
+#:     typed ctrl-C  exit=0        termios restored   alt 1/1
+#:     SIGTERM       killed by 15  termios -echo/-icanon, alt 1/0
+#:     SIGHUP        killed by 1   termios -echo/-icanon, alt 1/0
+#:
+#: A terminal left that way has no echo and no line editing, so it does not crash
+#: anything -- it hands the user a shell that appears dead, with no echo to tell
+#: them that typing `reset` is working. `SIGHUP` is the one that matters most on a
+#: login node: it is what a dropped ssh connection sends. A typed ctrl-C is
+#: already clean, because prompt_toolkit turns 0x03 into `KeyboardInterrupt` and
+#: unwinds properly.
+#:
+#: The sibling packages arrived at the same list, one via its own raw-mode
+#: manager and one via Textual's signal handlers.
+_FATAL_SIGNALS = ("SIGTERM", "SIGHUP")
+
+
+@contextlib.contextmanager
+def restore_terminal_on_fatal_signal() -> Generator[None, None, None]:
+    """Put the terminal back if a fatal signal ends the process mid-prompt.
+
+    `finally` is not enough on its own, and that is the point: a default-handled
+    `SIGTERM` or `SIGHUP` ends the process without raising anything, so no
+    `finally` runs and prompt_toolkit never gets to restore what it changed.
+
+    Handled just long enough to put the terminal back, then **re-raised with the
+    default disposition** so the exit status stays honest -- a tool that swallows
+    `SIGTERM` is worse than one that leaves a messy terminal.
+    """
+    import signal as _signal
+    import termios
+
+    fd = sys.stdin.fileno() if getattr(sys.stdin, "isatty", lambda: False)() else None
+    saved = termios.tcgetattr(fd) if fd is not None else None
+    previous: dict[int, Any] = {}
+
+    def _restore_and_die(signum: int, _frame: Any) -> None:
+        if saved is not None and fd is not None:
+            with contextlib.suppress(Exception):
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        with contextlib.suppress(Exception):
+            # Leave the alternate screen and show the cursor again, in that order.
+            sys.stdout.write("\033[?1049l\033[?25h")
+            sys.stdout.flush()
+        with contextlib.suppress(Exception):
+            _signal.signal(signum, previous.get(signum, _signal.SIG_DFL))
+        os.kill(os.getpid(), signum)
+
+    for name in _FATAL_SIGNALS:
+        number = getattr(_signal, name, None)
+        if number is None:  # pragma: no cover - every POSIX platform has both
+            continue
+        with contextlib.suppress(ValueError, OSError):
+            previous[number] = _signal.signal(number, _restore_and_die)
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            with contextlib.suppress(ValueError, OSError):
+                _signal.signal(number, handler)
+
 
 class Wizard:
     """Full-screen TUI wizard for generating and submitting sbatch scripts."""
@@ -803,7 +898,12 @@ class Wizard:
                 # value that passes the step's validator, so a malformed entry
                 # (e.g. cpus="3.5") isn't fed to _coerce's int() and crash on Back.
                 # An invalid value is simply not saved — the prior answer stands.
-                if val and (s.validate is None or s.validate(val)):
+                # A *cleared* field is not an invalid value, though: where blank is
+                # an offered answer the emptied field is committed, exactly as Enter
+                # commits it, so which key the user presses next cannot decide
+                # whether the clearing took effect (see _blank_is_an_answer).
+                malformed = bool(val) and s.validate is not None and not s.validate(val)
+                if not malformed and (val or self._blank_is_an_answer(s)):
                     self.answers[s.key] = self._coerce(val, s)
             elif s.kind in ("select", "gpu_format"):
                 val = self._radio_value()
@@ -814,8 +914,8 @@ class Wizard:
                 # typed GPUs) was the one input the Back path didn't persist, so a
                 # typed model was silently lost — unlike every other kind of step.
                 val = self._text_val()
-                if val:
-                    self.answers["gpu_type"] = val
+                if val or self._blank_is_an_answer(s):
+                    self.answers["gpu_type"] = val or None
         # The live preview is cached; going backward changes which steps feed it,
         # so mark it dirty (forward navigation already does this in _advance).
         self.transient["preview_dirty"] = True
@@ -834,6 +934,43 @@ class Wizard:
         except (TypeError, ValueError):
             return literal
 
+    def _blank_is_an_answer(self, s: Step) -> bool:
+        """Whether *clearing* this step's field is itself a legitimate answer.
+
+        Read straight off ``_coerce``, so the two navigation gestures cannot
+        disagree about a field the user emptied: blank is an answer exactly where
+        ``_coerce`` turns ``""`` into ``None`` ("unset") — ``account``,
+        ``mem_per_cpu``, ``ntasks_per_node``, ``gpu_type``, ``constraint``,
+        ``array_spec``, the two output paths, ``custom_sbatch``, ``modules``,
+        ``env_name``. Every one of those steps says so twice more: it is absent
+        from ``main._REQUIRED_FIELDS`` (nothing flags it when left empty), and its
+        validator, where it has one, accepts an empty string.
+
+        False for the steps that substitute a *default* for a cleared field —
+        ``cpus``/``nodes``/``memory``/``time_limit``/``gpus``; see ``_coerce``'s
+        ``time_limit`` note, "Blank is not an offered answer here either" — and for
+        the required free-text ones (``job_name``, ``command``, and ``partition``
+        via its own handler), whose blank coerces to ``""``. There, "the prior
+        answer stands" is the answer, and Back keeps it.
+
+        ``env_name`` was the one field where this derived rule disagreed with the
+        builder, and the disagreement was ``_coerce``'s: see its note there. The
+        rule itself did not need an exception — the fix was to stop the field
+        falling through to the bare ``return val``.
+
+        Enter (``_confirm_and_next``) has always committed a cleared field. Back did
+        not, which made the *same* visible field state mean two different things
+        depending on which key came next: on ``ntasks_per_node`` the live panel even
+        confirmed the clear — its "exceeds partition limit" warning is computed from
+        the field's live value, so it went quiet as the field emptied — and Back then
+        put the deleted ``--ntasks-per-node`` back into the script. Slurm's verdict on
+        the resurrected directive: ``sbatch --test-only -p amd -N2
+        --ntasks-per-node=64 -c 4`` (what Back produced) → "Requested node
+        configuration is not available", against ``--ntasks-per-node=1 -c 4``
+        (what Enter produced) → accepted.
+        """
+        return self._coerce("", s) is None
+
     def _coerce(self, val: str, s: Step) -> Any:
         if s.key == "job_name":
             from .builder import sanitize_job_name
@@ -846,6 +983,19 @@ class Wizard:
             return int(val) if val else self._default_int("nodes", 1)
         if s.key == "ntasks_per_node":
             return int(val) if val else None
+        if s.key == "time_limit":
+            # A cleared field reverts to the config/literal default, the same
+            # P3-10 invariant cpus/nodes/memory follow. It used to fall through to
+            # the bare `return val`, i.e. "", and the builder omits `--time` for an
+            # empty value — so clearing the pre-filled `02:00:00` and pressing
+            # Enter produced a script with NO `#SBATCH --time` at all, a summary
+            # with no "Time limit" row at all, and an "Estimated CPU-hours" figure
+            # still computed from `estimate_su`'s implicit 120-minute assumption.
+            # Blank is not an offered answer here either: unlike mem_per_cpu /
+            # array_spec / constraint, this step's subtitle never says "optional",
+            # and there is no `--time none` in batch mode to omit it deliberately.
+            # An explicit empty config value still omits it, via _step_default.
+            return val or self._step_default(s)
         if s.key == "memory":
             if val:
                 return normalize_memory(val)
@@ -870,8 +1020,22 @@ class Wizard:
             # Normalize like batch mode does, so "2000" becomes "2000M" rather
             # than a bare number; blank means "use --mem instead".
             return normalize_memory(val) if val else None
+        # The fields whose blank simply means "unset". ``env_name`` belongs here
+        # and was only missing because it fell off the end of the chain into the
+        # bare ``return val`` below: the builder reads it as unset (``if
+        # env_name:`` — no activation line), its parameter is ``str | None =
+        # None``, and the wizard's OWN skip path already writes ``None``
+        # (``_setup_env_name``, when env_type is "None (skip)"). Every reader goes
+        # through truthiness or ``or ""`` — ``env_activation_emitted``,
+        # ``check_conda_env``, ``job_summary_rows``' ``add`` — so nothing wanted
+        # the ``""`` spelling; it just gave one user-visible state two encodings,
+        # and the ``""`` one made ``_blank_is_an_answer`` (which reads this
+        # function) say blank was not an answer for the one optional text step
+        # where it is. Unlike ``job_name``/``partition``/``command``, which keep
+        # ``""`` below, this field is not in ``main._REQUIRED_FIELDS``, nothing
+        # flags it when empty, and its subtitle offers no default.
         if s.key in ("account", "array_spec", "gpu_type", "gpu_format", "constraint",
-                     "output_dir", "output_file"):
+                     "output_dir", "output_file", "env_name"):
             return val or None
         return val
 
@@ -945,9 +1109,15 @@ class Wizard:
         rather than only warning about the step you happen to be on. Safe to
         call on every redraw: no subprocess calls, and the partition's GPU-type
         list is reused from the cache populated when the GPU-type step loaded.
+
+        Called with no partition too (before the partition step, and after
+        confirming an *empty* manual entry — a legitimate "use the site
+        default"). It used to return [] there, which turned one blank field into
+        a silent banner for the rest of the wizard: ``validate_job_config`` only
+        consults ``_partition_obj`` in *some* of its rules, and the ones that
+        never touch it were dropped along with the ones that had nothing to
+        compare against. It now decides that per rule.
         """
-        if not self.answers.get("_partition_obj"):
-            return []
         live = dict(self.answers)
         s = self.current_step
         if s.key in self._VALIDATED_KEYS:
@@ -1060,7 +1230,21 @@ class Wizard:
                 self._setup_env_name(direction)
             else:
                 if isinstance(prev, list):
-                    self.text_area.text = ", ".join(prev)
+                    # Re-quote before writing a parsed list back into the field.
+                    # _parse_custom_flags CONSUMES the user's quotes, so a value
+                    # holding whitespace comes back unquoted and the next confirm
+                    # re-splits it: --comment="my big run" was restored as
+                    # `--comment=my big run` and re-parsed into
+                    # ['--comment=my big', '--run'] — a fabricated `#SBATCH --run`
+                    # that sbatch refuses outright (rc 255, "unrecognized option"),
+                    # so pressing Back turned an accepted script into a rejected
+                    # one. The builder already applies this rule when it emits the
+                    # directive; the round trip needs the same one. A module list
+                    # (the other list-valued step) has no quoting to lose.
+                    parts = [str(p) for p in prev]
+                    if s.key == "custom_sbatch":
+                        parts = [_quote_custom_flag(p) for p in parts]
+                    self.text_area.text = ", ".join(parts)
                 else:
                     self.text_area.text = str(prev or self._step_default(s) or "")
                 self._setup_autocomplete(s)
@@ -1240,6 +1424,21 @@ class Wizard:
                 )
                 fmt_all = [_fmt_partition(p) for p in all_parts]
                 self.radio_list = RadioList([(c, c) for c in fmt_all])
+                # Restore the already-chosen partition as the highlighted row —
+                # the same thing _setup_partition does for the public list, and
+                # for the same reason. This list is one keypress away from that
+                # one, and without the restore its cursor sits on row 0: a user
+                # who came back to look at the private partitions and pressed
+                # Enter had the job silently moved to whatever partition sorts
+                # first, taking the memory default, GPU-type list and QoS list
+                # with it. Unlike the public list this cannot be a partial
+                # restore — every partition is in this list by construction.
+                prev_name = self.answers.get("partition")
+                if prev_name:
+                    for p in all_parts:
+                        if p.get("name") == prev_name:
+                            self._set_radio_default(_fmt_partition(p))
+                            break
                 self.step_cache["partition_sub"] = "all"
                 self._invalidate()
                 return
@@ -1447,10 +1646,10 @@ class Wizard:
         focused: Any = self.text_area
         if self._is_text_active():
             s = self.current_step
+            # No `else`: `focused` is already `self.text_area` from the
+            # initialiser above, so the branch was re-assigning the same object.
             if getattr(s, "multiline", False):
                 focused = self.multiline_text_area
-            else:
-                focused = self.text_area
         elif self._is_select_active():
             focused = self.radio_list
         elif self.current_step.kind == "review":

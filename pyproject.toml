@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slurmate"
-version = "0.7.0"
+version = "0.7.1"
 description = "Interactive TUI wizard for generating and submitting Slurm sbatch scripts"
 requires-python = ">=3.10"
 readme = "README.md"
@@ -65,7 +65,27 @@ target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP"]
+# Aligned with the sibling packages, which all select these. slurmate was the
+# least-linted of the five despite being the only one on `mypy --strict`: `B`
+# (bugbear), `C4` (comprehensions) and `SIM` (simplify) were absent, and turning
+# them on found 18 things -- a `zip()` with no `strict=`, two suppressible
+# exceptions, a nested `if` that read as two separate concerns, and an `else`
+# branch re-assigning the value it already held.
+#
+# `ARG`, `N` and `T20` are deliberately still absent: they flag 73, 9 and 59 sites
+# respectively, almost all of them test doubles with unused signature arguments
+# and a CLI whose job is to print. Those want per-file-ignores rather than fixes,
+# and adding config to silence a rule is not the same as enforcing it.
+select = ["E", "F", "I", "W", "UP", "B", "C4", "SIM"]
+# E501 is the one exemption, and it is a decision rather than an oversight -- the
+# four sibling packages all enforce it and all sit at zero violations, so leaving
+# this silent read as drift. Enforcing it here would flag 35 lines (28 in `src`,
+# 7 in `tests`; median 108 columns). Five of them are the demo partition records
+# in `system_utils.py`, 254-276 columns each, and they are one line per record on
+# purpose: as a table of mock partitions they are read by scanning down a column,
+# which wrapping destroys. The other 30 are 101-138 columns. `line-length = 100`
+# above still governs `ruff format`, so new code is written to 100 either way --
+# what is switched off is retroactively rewrapping those 35.
 ignore = ["E501"]
 
 [tool.mypy]

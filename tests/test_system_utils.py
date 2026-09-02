@@ -234,12 +234,20 @@ class TestHelpers:
 
     def test_validate_time_unpadded_fields(self):
         # Slurm accepts unpadded 1-digit minute/second fields; the wizard must
-        # not falsely reject them (the parser already reads them correctly),
-        # while genuinely out-of-range fields (60–99) stay rejected.
+        # not falsely reject them (the parser already reads them correctly).
+        #
+        # The four values on the second line were asserted *rejected* here, as
+        # "genuinely out-of-range fields (60-99)". Measured against a live
+        # controller, sbatch verifies every one of them and carries the value
+        # into the time limit, so refusing them was a false refusal; they are now
+        # in the accepted group. What sbatch rejects is a malformed *shape*, on
+        # the third line. Full measurement table:
+        # tests/test_cluster_portability.py TestTimeFormsSlurmAcceptsAreNotRefused
         from slurmate.system_utils import validate_time
-        for ok in ("5:3", "1:2:3", "5:0", "1-0:5", "1-0:5:9"):
+        for ok in ("5:3", "1:2:3", "5:0", "1-0:5", "1-0:5:9",
+                   "1:60", "1:60:60", "1-99:99:99", "1:5:99"):
             assert validate_time(ok) is True, ok
-        for bad in ("1:60", "1:60:60", "1-99:99:99", "1:5:99"):
+        for bad in ("1:0:0:0", "1:", ":5", "1-:2", "1:-2", "10m"):
             assert validate_time(bad) is False, bad
 
     def test_mock_queue_eta_label_matches_formatter(self):
