@@ -90,17 +90,55 @@ _PHASE_BUDGET: float = DEFAULT_TOTAL_TIMEOUT
 
 
 def total_timeout() -> float:
-    """The per-phase budget, from ``$SLURMATE_TIMEOUT`` or the default."""
+    """The per-phase budget, from ``$SLURMATE_TIMEOUT`` or the default.
+
+    **A value this cannot use is said out loud.** All three unusable forms used to
+    fall through to the default with nothing but a `logger.debug` -- so
+    ``SLURMATE_TIMEOUT=garbage``, ``=0`` and ``=-5`` were each indistinguishable
+    from leaving it unset. Measured before this change: all three returned 45.0
+    in silence.
+
+    The sibling packages settled this and named the principle. slurmpast's
+    `_timeout` says it outright -- *"it used to accept anything: ``garbage`` was
+    indistinguishable from leaving it unset, and ``0`` -- which a reader naturally
+    writes meaning* no timeout *-- silently became 300 seconds with nothing said. A
+    setting that does not do what it says and does not complain is worse than one
+    that is not offered."* slurmwatch rejects the same class by name. Zero is
+    called out separately here for exactly that reason: writing it is a request to
+    disable the budget, and quietly getting 45s instead is the opposite answer.
+
+    **Warns rather than raises, and that is deliberate** -- the difference from the
+    siblings is the caller, not the principle. slurmpast reads its variable on a
+    one-shot query whose `SacctError` its CLI already renders; this one is read by
+    `slurm_deadline` on the *interactive* wizard path, where an exception would
+    replace a working session with a traceback over a typo in an environment
+    variable. `logger.warning` reaches stderr through logging's last-resort handler
+    (measured), so the reader is told and the wizard still runs. A future round
+    that wants a refusal needs a clean error path on that side first.
+    """
     raw = os.environ.get(_TOTAL_TIMEOUT_ENV, "").strip()
-    if raw:
-        try:
-            asked = float(raw)
-        except ValueError:
-            logger.debug(f"ignoring non-numeric {_TOTAL_TIMEOUT_ENV}={raw!r}")
-        else:
-            if asked > 0:
-                return asked
-    return DEFAULT_TOTAL_TIMEOUT
+    if not raw:
+        return DEFAULT_TOTAL_TIMEOUT
+    try:
+        asked = float(raw)
+    except ValueError:
+        logger.warning(
+            f"{_TOTAL_TIMEOUT_ENV}={raw!r} is not a number, so it was ignored; "
+            f"using the default budget of {DEFAULT_TOTAL_TIMEOUT:g}s. "
+            f"Give it a count of seconds, for example {_TOTAL_TIMEOUT_ENV}=90."
+        )
+        return DEFAULT_TOTAL_TIMEOUT
+    if asked <= 0:
+        logger.warning(
+            f"{_TOTAL_TIMEOUT_ENV}={raw!r} is not a positive number of seconds, so "
+            f"it was ignored; using the default budget of "
+            f"{DEFAULT_TOTAL_TIMEOUT:g}s. There is no setting that removes the "
+            f"budget: an unbounded wait on a degraded controller is the hang this "
+            f"deadline exists to prevent. Raise it instead, for example "
+            f"{_TOTAL_TIMEOUT_ENV}=300."
+        )
+        return DEFAULT_TOTAL_TIMEOUT
+    return asked
 
 
 @contextlib.contextmanager
@@ -339,6 +377,23 @@ def _split_csv(raw: str | None) -> list[str]:
     if not raw:
         return []
     return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _acl_is_nobody(raw: str) -> bool:
+    """True for Slurm's ``none`` ACL sentinel — "nobody may use this".
+
+    A Slurm ACL field carries *two* sentinels, not one: ``ALL`` means "everybody"
+    and ``none`` means "nobody". Only ``ALL`` was ever recognised, so ``none``
+    read as a *name* — measured on this cluster's ``test`` partition
+    (``AllowAccounts=none AllowQos=none``), whose QoS ACL came back as a QoS
+    literally called "none". No such QoS exists in ``sacctmgr`` (98 names, not
+    one of them), and asking for it is refused as an invalid qos specification.
+
+    Matched against the whole field, never a member of a list: ``none`` is only
+    the sentinel when it is the entire value, which is the only way Slurm writes
+    it.
+    """
+    return _normalize_null(raw).lower() == "none"
 
 
 def _parse_mem_to_mb(raw: str) -> int:
@@ -2130,13 +2185,23 @@ def validate_job_config(
         str(answers.get(k) or "").strip() not in ("", "0")
         for k in ("cpus", "memory", "mem_per_cpu", "time_limit", "nodes", "gpus")
     ):
-        if part.get("_unknown_reason") == "unreadable":
+        reason = part.get("_unknown_reason")
+        if reason == "unreadable":
             detail = last_cluster_error()
             why = (
                 f"this cluster's partition list could not be read ({detail})"
                 if detail
                 else "this cluster's partition list could not be read (no Slurm, "
                      "or sinfo failed)"
+            )
+        elif reason == "undescribed":
+            # It exists — the same run validated the name against `sinfo -a` and
+            # accepted it. Only the plain `sinfo` this object was built from does
+            # not list it, so say that instead of denying the partition.
+            why = (
+                f"partition '{part.get('name')}' exists but this cluster's sinfo "
+                f"does not describe it (Slurm hides some partitions from a plain "
+                f"query)"
             )
         else:
             why = f"partition '{part.get('name')}' is not on this cluster"
@@ -2473,6 +2538,38 @@ def _fetch_all_partition_names_uncached() -> set[str]:
     return names
 
 
+def unknown_partition_reason(name: str, partitions: list[dict[str, Any]] | None) -> str:
+    """Why a partition could not be described: ``unreadable``/``undescribed``/``absent``.
+
+    The two ``sinfo`` queries slurmate makes are deliberately different widths —
+    :func:`fetch_partitions` runs a plain ``sinfo`` so the picker offers what the
+    user can see, while :func:`_fetch_all_partition_names_uncached` runs
+    ``sinfo -a`` so a user-supplied name is validated against the widest list the
+    controller will give. That asymmetry has a third outcome nobody had a word
+    for: a partition can be **in** the wide list and **absent** from the narrow
+    one, because ``Hidden=YES`` is filtered out of a plain query for an ordinary
+    user (``slurmctld``'s ``pack_all_part`` skips it unless ``SHOW_ALL`` is set or
+    the caller is an Operator). Existence validation then passes and the
+    partition object is the synthetic blank — so the run said *"partition 'test'
+    is not on this cluster"* about a partition it had just accepted as existing,
+    which is both self-contradictory and, of the two halves, the false one.
+
+    ``absent`` is therefore reserved for a name the *widest* list does not have,
+    and ``undescribed`` says the honest thing: it exists, this view does not
+    describe it, so nothing was checked against it. ``unreadable`` (an empty
+    partition list — no Slurm, ``sinfo`` failed) is tested first and keeps its
+    meaning: nothing is known about any partition there, and ``sinfo -a`` has
+    nothing to add.
+    """
+    if not partitions:
+        return "unreadable"
+    # Memoised, and every caller of this is on a path that has already asked for
+    # the wide list (existence validation), so this costs no extra query.
+    if name and name in fetch_all_partition_names():
+        return "undescribed"
+    return "absent"
+
+
 def fetch_public_partitions(all_parts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Return only publicly-usable partitions.
 
@@ -2519,6 +2616,113 @@ def fetch_public_partitions(all_parts: list[dict[str, Any]] | None = None) -> li
     return result
 
 
+def fetch_account_acl(partition: str) -> dict[str, Any]:
+    """A partition's *account* ACL, as ``{"allow", "deny", "nobody"}``.
+
+    The mirror of :func:`fetch_qos_acl` for the field that decides
+    **entitlement** rather than shape. Every other partition check asks whether
+    a partition *could* run this job — CPUs, memory, nodes, GPUs, time limit,
+    array size. None of them asks whether it will run it *for you*, and on a
+    multi-PI cluster that is what almost always says no: measured here, 61 of 88
+    partitions refuse this user outright, and 60 of those refusals are written
+    plainly in ``AllowAccounts``.
+
+    ``allow`` keeps Slurm's ``ALL`` sentinel verbatim (as ``fetch_qos_acl``
+    does). ``nobody`` is the opposite sentinel, ``AllowAccounts=none``, split out
+    into its own flag precisely because an empty ``allow`` is otherwise
+    ambiguous — it is also what an unreadable field returns, and "no account may
+    submit here" must not be inferred from "I could not ask".
+
+    ``-a`` for the same reason ``sinfo -a`` is used to validate a partition name
+    (see :func:`_fetch_all_partition_names_uncached`): ``partition`` is a name the
+    *user* supplied, and without ``SHOW_ALL`` the controller does not return a
+    ``Hidden=YES`` partition to an ordinary user — ``scontrol show partition test``
+    answers "Partition test not found", rc 1. That is indistinguishable here from
+    a broken ``scontrol``, so the ACL came back empty and the refusal went
+    unsaid: measured on midway3, ``test`` is ``AllowAccounts=none`` and the
+    controller refuses it with "Invalid account or account/partition combination
+    specified", while slurmate said nothing about it. Hidden is a display
+    setting, not an ACL, so the partition is submittable and its ACL is the one
+    fact that decides the job.
+    """
+    empty: dict[str, Any] = {"allow": [], "deny": [], "nobody": False}
+    if not is_tool_available("scontrol"):
+        return empty
+
+    stdout, _, rc = _run_command(["scontrol", "-a", "show", "partition", partition, "-o"])
+    if rc != 0:
+        return empty
+
+    allow_raw = _extract_token(stdout, "AllowAccounts")
+    return {
+        "allow": [] if _acl_is_nobody(allow_raw) else _split_csv(_normalize_null(allow_raw)),
+        "deny": _split_csv(_normalize_null(_extract_token(stdout, "DenyAccounts"))),
+        "nobody": _acl_is_nobody(allow_raw),
+    }
+
+
+def partition_account_refusal(
+    partition: str, account: str, acl: dict[str, Any] | None
+) -> str | None:
+    """Why this partition will refuse ``account``, or ``None`` to stay quiet.
+
+    The gap this closes is not a wrong message but a *missing* one. With
+    ``sbatch`` reachable, slurmate already relays the controller's own verdict,
+    so a partition the user has no account for is caught. With ``sbatch`` absent
+    — drafting on a login node that has none, or for another cluster — the live
+    verdict is gone and nothing replaced it: measured, ``--print -p kicp``
+    (``AllowAccounts=kicp``, an account this user does not hold) wrote the full
+    script with **zero bytes on stderr and rc=0**, while the controller refuses
+    that exact submission. ``scontrol show partition`` was being called all
+    along; only this field was never read.
+
+    Deliberately narrower than Slurm's own gate, because a false refusal is the
+    worse failure (SM-4):
+
+    - No ACL, an unreadable one, or ``AllowAccounts=ALL`` — silent.
+    - ``AllowAccounts=none`` — refused whatever the account is, since no value
+      can satisfy it. The one case that needs no ``--account`` to decide.
+    - An explicit allow list and an explicit account not on it — refused.
+    - **No** ``--account`` against an explicit allow list — silent. The site
+      default account is resolved by the controller, not visible here, and
+      guessing it is how a valid job gets rejected.
+
+    Verified against ``sbatch --test-only`` over all 88 partitions on this
+    cluster: 61 refusals predicted, 61 refused; 8 accepted, 8 predicted usable;
+    zero false refusals and zero missed ``AllowAccounts`` refusals.
+    """
+    if not acl:
+        return None
+    if acl.get("nobody"):
+        return (
+            f"partition '{partition}' has AllowAccounts=none — no account can "
+            f"submit to it, so Slurm refuses the job with 'Invalid account or "
+            f"account/partition combination specified'"
+        )
+    name = (account or "").strip()
+    if not name:
+        return None
+    denied = [a for a in acl.get("deny") or [] if a]
+    if name in denied:
+        return (
+            f"partition '{partition}' denies account '{name}' (DenyAccounts) — "
+            f"Slurm refuses the job with 'Invalid account or account/partition "
+            f"combination specified'"
+        )
+    allowed = [a for a in acl.get("allow") or [] if a]
+    if not allowed or any(a.upper() == "ALL" for a in allowed):
+        return None
+    if name in allowed:
+        return None
+    shown = sorted(allowed)[:6]
+    more = f", ... (+{len(allowed) - len(shown)} more)" if len(allowed) > len(shown) else ""
+    return (
+        f"account '{name}' cannot use partition '{partition}': it allows only "
+        f"{', '.join(shown)}{more} — Slurm refuses the job with 'Invalid account "
+        f"or account/partition combination specified'"
+    )
+
+
 def fetch_qos_acl(partition: str) -> dict[str, list[str]]:
     """A partition's QoS ACL as ``{"allow": [...], "deny": [...]}``.
 
@@ -2527,16 +2731,52 @@ def fetch_qos_acl(partition: str) -> dict[str, list[str]]:
     allow side means a deny-list site's ``ALL`` expands to every QoS on the
     cluster — including the ones the partition forbids — which is the same defect
     as offering partitions the user has no association for.
+
+    ``ALL`` is kept in the list verbatim, because the picker has to tell "every
+    QoS" apart from a one-element list. Slurm's opposite sentinel, ``none``, is
+    *not* a name and is dropped (see :func:`_acl_is_nobody`): kept, it became a
+    QoS row reading "none" sitting directly under the picker's own
+    "Default (none)" row — two indistinguishable choices, one of which no
+    controller will accept. It only survived to the screen when ``sacctmgr`` was
+    unavailable, since that is the path that deliberately trusts ``scontrol``'s
+    list rather than filtering it against a set it could not read.
+
+    ``-a`` for the same reason :func:`fetch_account_acl` needs it: ``partition``
+    is a name the *user* supplied, and without ``SHOW_ALL`` the controller does
+    not describe a ``Hidden=YES`` partition to an ordinary caller —
+    ``scontrol show partition climate`` answers "Partition climate not found"
+    at rc 1, which falls into the ``rc != 0`` branch below and returns the same
+    empty ACL as a missing ``scontrol``. Measured on midway3 by re-applying the
+    controller's non-privileged filter: ``climate`` and ``climate-build`` are
+    ``Hidden=YES`` with ``AllowQos=climate``, and the narrow query answered
+    ``{"allow": [], "deny": []}`` where the wide one answers ``{"allow":
+    ["climate"], "deny": []}``. The QoS step therefore collapsed to its bare
+    "Default (none)" row and the single QoS those partitions permit could not
+    be picked at all. Reachable without any privilege: the partition step's
+    "type a partition name" row accepts a hidden name, and ``-p`` prefills one.
+
+    **This is a display fix and must not become a gate.** The value feeds
+    exactly one thing — the wizard's QoS choice list (``tui``'s
+    ``_resolve_choices``, via :func:`fetch_qos_for_partition`) — and no code
+    path refuses a job over it. ``AllowQos`` as a *refusal* check has been
+    measured and withdrawn here twice (0 partitions excluded across 25 sampled
+    users) because this site's QoS refusals come from a submit plugin that
+    rewrites ``QOS=<partition>`` before any ACL is consulted: ``sbatch
+    --test-only -A rcc-staff -p climate --qos=normal`` reports ``QOS-Flag:
+    climate`` and ``Verification: ***PASSED***``, so a check reading
+    ``AllowQos=climate`` against ``--qos=normal`` would refuse a submission the
+    controller accepts. Widening the query does not license gating on it.
     """
     if not is_tool_available("scontrol"):
         return {"allow": [], "deny": []}
 
-    stdout, _, rc = _run_command(["scontrol", "show", "partition", partition, "-o"])
+    stdout, _, rc = _run_command(["scontrol", "-a", "show", "partition", partition, "-o"])
     if rc != 0:
         return {"allow": [], "deny": []}
 
+    allow_raw = _extract_token(stdout, "AllowQos")
     return {
-        "allow": _split_csv(_normalize_null(_extract_token(stdout, "AllowQos"))),
+        "allow": [] if _acl_is_nobody(allow_raw) else _split_csv(_normalize_null(allow_raw)),
         "deny": _split_csv(_normalize_null(_extract_token(stdout, "DenyQos"))),
     }
 
@@ -2663,15 +2903,40 @@ def fetch_gpu_type_sources(partition: str) -> dict[str, list[str]]:
     # model?" is a question a typed-GRES node answers too — and answers "no" on a
     # cluster that publishes no features at all.
     feature_tokens: set[str] = set()
+    # Folded model key -> the spelling the GRES itself used. Every comparison
+    # below stays on the folded key (corroboration, `feature -= typed`, `_norm`),
+    # because the two sources really do disagree on separators. But `typed` is
+    # documented above as "requestable as a GRES type (--gres=gpu:MODEL:N)", and
+    # Slurm matches a GRES type name LITERALLY -- so reporting the folded key
+    # there hands the picker a type the cluster does not have. Measured: a site
+    # whose GRES is `gpu:rtx_6000:2` and whose nodes publish no features at all
+    # reported `typed: ["rtx-6000"]`, and `--gres=gpu:rtx-6000:2` is refused with
+    # "Requested node configuration is not available" -- which is the very
+    # rejection this docstring attributes to the *feature*-only category. The
+    # separator fold was slurmate's own doing, so nothing warned about it, while
+    # `validate_job_config` already treats a **case**-only difference as "a real,
+    # and otherwise invisible, way for a validated job to be rejected at submit".
+    #
+    # `constraint` deliberately keeps the folded key: that surface names a node
+    # *feature*, and the fold is what lets an `rtx_6000` GRES match an
+    # `rtx-6000` feature. `fetch_partitions`' own `gpu_types` keeps it too --
+    # that list is a matching key for `validate_job_config` and `main.py`, not a
+    # request string.
+    gres_spelling: dict[str, str] = {}
     for features, gres in lines_data:
         if features and features != "(null)":
             feature_tokens.update(t.strip() for t in features.split(",") if t.strip())
         text = f"{features},{gres}"
-        typed_here = [
-            m.group(1).replace("_", "-")
-            for m in re.finditer(r"gpu:([a-z0-9._-]+):\d+", text, re.IGNORECASE)
-            if m.group(1).lower() not in {"gpu", "mps", "shard"}
-        ]
+        typed_here = []
+        for match in re.finditer(r"gpu:([a-z0-9._-]+):\d+", text, re.IGNORECASE):
+            raw = match.group(1)
+            if raw.lower() in {"gpu", "mps", "shard"}:
+                continue
+            folded = raw.replace("_", "-")
+            # First spelling seen wins, so the answer does not depend on node
+            # order when two nodes spell the same card differently.
+            gres_spelling.setdefault(folded, raw)
+            typed_here.append(folded)
         if typed_here:
             typed.update(typed_here)
             continue
@@ -2693,7 +2958,7 @@ def fetch_gpu_type_sources(partition: str) -> dict[str, list[str]]:
     advertised = {_norm(t) for t in feature_tokens}
     constraint = sorted(m for m in (typed | feature) if _norm(m) in advertised)
     return {
-        "typed": sorted(typed),
+        "typed": sorted(gres_spelling.get(m, m) for m in typed),
         "feature": sorted(feature),
         "constraint": constraint,
     }
@@ -4221,7 +4486,24 @@ CONFIG_KEYS: frozenset[str] = frozenset(
 # CLI flag spellings that differ from the config key by more than a dash.
 # Dashes are normalised to underscores before this is consulted, so
 # ``job-name``/``mem-per-cpu``/``ntasks-per-node`` and friends need no entry.
-CONFIG_ALIASES: dict[str, str] = {"time": "time_limit", "array": "array_spec"}
+#
+# **``env`` was missing, and the same fact was written out again in `main`.**
+# `main.CONFIG_ARG_DESTS` is this table inverted -- "config keys whose argparse
+# dest is spelled differently" -- and it listed all three pairs while this one
+# listed two, so `env = "myenv"` in a config file was reported as an unknown key
+# and DROPPED. That is the exact harm `_normalize_config_keys` documents for
+# `time`: the value silently does not reach the script, and here the script then
+# activates no environment at all, so the job fails on its first import.
+#
+# `main` now derives its table from this one, so a fourth pair cannot be added to
+# one and forgotten in the other. Membership rule, unchanged: every CLI flag
+# whose dest differs from its config key by more than a dash. Measured against
+# the parser -- `--env` was the only such flag missing.
+CONFIG_ALIASES: dict[str, str] = {
+    "time": "time_limit",
+    "array": "array_spec",
+    "env": "env_name",
+}
 
 # Tables whose contents are merged over the top-level keys, best last.
 CONFIG_SECTIONS: tuple[str, ...] = ("defaults", "slurmate")

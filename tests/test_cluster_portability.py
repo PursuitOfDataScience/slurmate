@@ -2601,6 +2601,221 @@ class TestQosDenyList:
         assert "debug" not in choices and "normal" in choices
 
 
+class TestAclNobodySentinel:
+    """A Slurm ACL field carries TWO sentinels, not one. `ALL` means "everybody"
+    and was handled; `none` means "nobody" and was read as a *name*. Measured on
+    Midway3's `test` partition (`AllowQos=none AllowAccounts=none`):
+    `fetch_qos_acl` returned a QoS literally called "none", which `sacctmgr`
+    knows nothing about (98 QoS names on that cluster, not one of them). It
+    reached the picker whenever `sacctmgr` was unavailable, because that is the
+    one path that deliberately trusts `scontrol`'s list rather than filtering it
+    against a set it could not read -- and it landed directly under the picker's
+    own "Default (none)" row, two indistinguishable choices of which one is
+    refused by every controller.
+    """
+
+    def _acl(self, mocker, line):
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=(line, "", 0))
+        return su.fetch_qos_acl("p")
+
+    def test_allow_qos_none_is_nobody_not_a_name(self, mocker):
+        # The exact line Midway3's controller prints for its `test` partition.
+        acl = self._acl(
+            mocker, "PartitionName=test AllowQos=none AllowAccounts=none Hidden=YES\n"
+        )
+        assert acl["allow"] == []
+
+    def test_the_legacy_accessor_does_not_leak_the_sentinel_either(self, mocker):
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(
+            su, "_run_command", return_value=("PartitionName=p AllowQos=none\n", "", 0)
+        )
+        assert su.fetch_qos_for_partition("p") == []
+
+    def test_the_picker_offers_nothing_when_the_partition_allows_no_qos(self, mocker):
+        # End to end, in the state that made it visible: sacctmgr unavailable, so
+        # `fetch_known_qos()` is the empty "unknown" list and cannot filter.
+        import slurmate.tui as t
+        from slurmate.tui import STEPS, Wizard
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(
+            su, "_run_command",
+            return_value=("PartitionName=test AllowQos=none AllowAccounts=none\n", "", 0),
+        )
+        mocker.patch.object(t, "fetch_qos_acl", side_effect=su.fetch_qos_acl)
+        mocker.patch.object(t, "fetch_known_qos", return_value=[])
+        wizard = Wizard()
+        wizard.answers["partition"] = "test"
+        step = next(s for s in STEPS if s.key == "qos")
+        assert wizard._resolve_choices(step) == []
+
+    # ── controls: neither sentinel handling may disturb a real list ──
+
+    def test_all_is_still_kept_as_a_sentinel(self, mocker):
+        # The picker has to tell "every QoS" from a one-element list, so `ALL`
+        # stays in the list where `none` is dropped.
+        acl = self._acl(mocker, "PartitionName=p AllowQos=ALL DenyQos=debug\n")
+        assert acl == {"allow": ["ALL"], "deny": ["debug"]}
+
+    def test_a_usable_partitions_qos_list_is_untouched(self, mocker):
+        # CONTROL, message for message: `amd`'s real line from Midway3.
+        acl = self._acl(
+            mocker,
+            "PartitionName=amd AllowGroups=ALL AllowAccounts=ALL "
+            "AllowQos=amd,debug,mgreenst-prio Hidden=NO State=UP\n",
+        )
+        assert acl == {"allow": ["amd", "debug", "mgreenst-prio"], "deny": []}
+
+    def test_none_inside_a_list_is_a_name_not_the_sentinel(self, mocker):
+        # Slurm writes the sentinel as the whole field. A member called "none"
+        # is a (perverse) name, and dropping it would be inventing an ACL.
+        acl = self._acl(mocker, "PartitionName=p AllowQos=none,normal\n")
+        assert acl["allow"] == ["none", "normal"]
+
+    def test_the_predicate_only_matches_the_whole_field(self):
+        assert su._acl_is_nobody("none") and su._acl_is_nobody("NONE")
+        assert not su._acl_is_nobody("none,normal")
+        assert not su._acl_is_nobody("ALL")
+        # "unreadable" is not "nobody" -- the distinction the flag exists for.
+        assert not su._acl_is_nobody("") and not su._acl_is_nobody("(null)")
+
+
+class TestPartitionAccountEntitlement:
+    """A partition can exist, advertise a shape that fits, and still refuse this
+    user. Every partition check written so far asks whether a partition *could*
+    run the job -- CPUs, memory, nodes, GPUs, time limit, MaxArraySize -- and
+    none asked whether it will run it *for you*.
+
+    Measured on Midway3 (Slurm 20.11.8, 88 partitions) against
+    `sbatch --test-only`: 61 partitions refuse this user, 60 of them written
+    plainly in `AllowAccounts` and the 61st as `AllowAccounts=none`. With
+    `sbatch` reachable slurmate relays the controller's own verdict, so the
+    refusal was seen. With `sbatch` absent -- drafting on a login node that has
+    none, or for another cluster -- there was no verdict to relay and nothing had
+    replaced it: `--print -p kicp` wrote the whole script with **zero bytes on
+    stderr and rc=0** for a partition whose `AllowAccounts=kicp` excludes every
+    account the user holds. `scontrol show partition` was already being called;
+    only this field was never read.
+    """
+
+    def _acl(self, mocker, line):
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=(line, "", 0))
+        return su.fetch_account_acl("p")
+
+    def test_an_excluded_account_is_refused(self, mocker):
+        # Midway3's `kicp`: exists, State=UP, 6 usable nodes, shape fits.
+        acl = self._acl(
+            mocker,
+            "PartitionName=kicp AllowGroups=ALL AllowAccounts=kicp AllowQos=kicp "
+            "Hidden=NO State=UP\n",
+        )
+        msg = su.partition_account_refusal("kicp", "rcc-staff", acl)
+        assert msg is not None
+        assert "rcc-staff" in msg and "kicp" in msg
+        # It names the controller's own wording, which is otherwise opaque.
+        assert "Invalid account or account/partition combination" in msg
+
+    def test_allow_accounts_none_refuses_whatever_the_account_is(self, mocker):
+        acl = self._acl(
+            mocker, "PartitionName=test AllowAccounts=none State=DOWN Hidden=YES\n"
+        )
+        assert acl["nobody"] is True
+        # No account needed: no value can satisfy `none`.
+        for account in ("", "rcc-staff", "anything"):
+            msg = su.partition_account_refusal("test", account, acl)
+            assert msg is not None and "AllowAccounts=none" in msg
+
+    def test_a_long_allow_list_is_truncated_not_dumped(self, mocker):
+        # Midway3's `beagle3` lists 28 accounts; a refusal that prints all of
+        # them is a wall, and the summary reporter only shows the first line.
+        many = ",".join(f"pi-{i:02d}" for i in range(28))
+        acl = self._acl(mocker, f"PartitionName=b AllowAccounts={many}\n")
+        msg = su.partition_account_refusal("b", "mine", acl)
+        assert msg is not None and "(+22 more)" in msg and "\n" not in msg
+
+    def test_a_denied_account_is_refused(self, mocker):
+        # The deny-list spelling. `fetch_qos_acl` already reads both sides of the
+        # QoS ACL for this reason; the account ACL read only the allow side, so
+        # `AllowAccounts=ALL DenyAccounts=<you>` looked like an open partition.
+        acl = self._acl(
+            mocker, "PartitionName=p AllowAccounts=ALL DenyAccounts=students\n"
+        )
+        assert su.partition_account_refusal("p", "students", acl) is not None
+        assert su.partition_account_refusal("p", "staff", acl) is None
+
+    def test_the_refusal_reaches_every_mode_through_the_shared_checks(self, mocker):
+        import slurmate.main as m
+        mocker.patch.object(m, "fetch_all_partition_names", return_value={"kicp"})
+        mocker.patch.object(m, "fetch_user_accounts", return_value=["rcc-staff"])
+        mocker.patch.object(
+            m, "fetch_account_acl",
+            return_value={"allow": ["kicp"], "deny": [], "nobody": False},
+        )
+        issues = m.site_check_issues({"partition": "kicp", "account": "rcc-staff"})
+        # The account exists and the partition exists; only entitlement fails.
+        assert [lvl for lvl, _ in issues] == ["error"]
+        assert "cannot use partition 'kicp'" in issues[0][1]
+
+    # ── controls: a partition the user CAN use stays silent, message for message ──
+
+    def test_a_usable_partition_is_silent(self, mocker):
+        # CONTROL. `amd`'s real line from Midway3 -- the partition every other
+        # probe in this campaign used, and the one that must not change.
+        acl = self._acl(
+            mocker,
+            "PartitionName=amd AllowGroups=ALL AllowAccounts=ALL "
+            "AllowQos=amd,debug,mgreenst-prio Hidden=NO State=UP\n",
+        )
+        assert acl == {"allow": ["ALL"], "deny": [], "nobody": False}
+        assert su.partition_account_refusal("amd", "rcc-staff", acl) is None
+
+    def test_a_usable_partition_adds_no_issue_to_the_shared_checks(self, mocker):
+        # CONTROL, message for message: the whole issue list stays empty.
+        import slurmate.main as m
+        mocker.patch.object(m, "fetch_all_partition_names", return_value={"amd"})
+        mocker.patch.object(m, "fetch_user_accounts", return_value=["rcc-staff"])
+        mocker.patch.object(
+            m, "fetch_account_acl",
+            return_value={"allow": ["ALL"], "deny": [], "nobody": False},
+        )
+        assert m.site_check_issues({"partition": "amd", "account": "rcc-staff"}) == []
+
+    def test_an_account_on_the_list_is_silent(self, mocker):
+        # `beagle3` lists 28 accounts and `rcc-staff` is one of them; the
+        # controller accepts it. A membership test, not a length test.
+        acl = self._acl(
+            mocker, "PartitionName=beagle3 AllowAccounts=pi-foster,rcc-staff,bcmb32600\n"
+        )
+        assert su.partition_account_refusal("beagle3", "rcc-staff", acl) is None
+
+    # ── restraint: never a refusal from an absence (SM-4) ──
+
+    def test_no_account_against_an_allow_list_is_silent(self, mocker):
+        # The site default account is resolved by the controller and is not
+        # visible here. Guessing it is how a valid job gets rejected.
+        acl = self._acl(mocker, "PartitionName=kicp AllowAccounts=kicp\n")
+        assert su.partition_account_refusal("kicp", "", acl) is None
+
+    def test_an_unreadable_acl_is_silent(self, mocker):
+        mocker.patch.object(su, "is_tool_available", return_value=True)
+        mocker.patch.object(su, "_run_command", return_value=("", "boom", 1))
+        acl = su.fetch_account_acl("p")
+        assert acl == {"allow": [], "deny": [], "nobody": False}
+        assert su.partition_account_refusal("p", "rcc-staff", acl) is None
+
+    def test_no_scontrol_is_silent(self, mocker):
+        mocker.patch.object(su, "is_tool_available", return_value=False)
+        assert su.fetch_account_acl("p") == {"allow": [], "deny": [], "nobody": False}
+        assert su.partition_account_refusal("p", "a", None) is None
+
+    def test_a_field_slurm_did_not_print_is_silent(self, mocker):
+        # An older/other controller that omits AllowAccounts entirely.
+        acl = self._acl(mocker, "PartitionName=p State=UP Hidden=NO\n")
+        assert su.partition_account_refusal("p", "rcc-staff", acl) is None
+
+
 class TestPartitionOwnState:
     """`sinfo %a` was parsed into the partition dict and never consulted. A
     partition's own state is a different fact from its nodes': it can be UP with
@@ -4560,7 +4775,13 @@ class TestNoSurfaceClaimsAbsentWhenUnreadable:
         # and _enrich_partition_maxima (SM-27), which reads the flag only to
         # *skip* work: an unknown partition has no real name to query per-node, so
         # it makes no claim and cannot make a false one.
-        assert len(sites) == 4, f"new consumer of _unknown: {sites}"
+        #
+        # The fifth is the wizard's queue strip (`_render_queue_text`), reviewed
+        # and cleared: it reads the flag to withhold a *reading* it never took,
+        # printing "unknown" where it used to print `0 running / 0 pending`. It
+        # names no reason, so it cannot name a wrong one -- the summary is the
+        # surface that says which of absent / undescribed / unreadable applies.
+        assert len(sites) == 5, f"new consumer of _unknown: {sites}"
 
 
 class TestConfigIntTypesAreNotSilentlyReinterpreted:

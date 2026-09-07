@@ -698,6 +698,24 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     add("Nodes", nodes)
     if answers.get("ntasks_per_node"):
         add("Tasks per node", answers.get("ntasks_per_node"))
+    else:
+        # The same rule one row up, applied to the builder's *fallback*: a
+        # multi-node job that asked for no task count still gets
+        # `#SBATCH --ntasks-per-node=1` from build_sbatch_script, and that
+        # directive had no summary row at all -- the exact shape the Nodes
+        # comment above describes. Unlike `--nodes=1` this one IS an
+        # imposition: one task per node over 4 nodes is 4 tasks, where Slurm's
+        # own default is one task for the whole job. So the row names slurmate
+        # as the author of the value instead of showing a bare 1 the user
+        # never typed. Mirrors the builder's own int coercion, and its
+        # exception -- `--custom-sbatch=--ntasks=N` suppresses the fallback, so
+        # there is no directive to account for and no row.
+        try:
+            node_count = int(nodes)
+        except (TypeError, ValueError):
+            node_count = 1
+        if node_count > 1 and custom_ntasks(answers.get("custom_sbatch")) is None:
+            add("Tasks per node", "1 (automatic for a multi-node job)")
     if _gpus_int(answers) > 0:
         # Same rule as memory above: report the request the SCRIPT makes. A custom
         # flag on the option the chosen format would emit overrides it, so showing

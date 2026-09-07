@@ -227,9 +227,9 @@ Every one of them is also a wizard step, so a config file prefills the
 interactive flow and batch mode identically.
 
 **CLI spellings work too.** `time` is accepted for `time_limit`, `array` for
-`array_spec`, and any dashed form (`job-name`, `mem-per-cpu`,
-`ntasks-per-node`, …) for its underscored key — so a key copied from `--help`
-does what it looks like it does.
+`array_spec`, `env` for `env_name`, and any dashed form (`job-name`,
+`mem-per-cpu`, `ntasks-per-node`, …) for its underscored key — so a key copied
+from `--help` does what it looks like it does.
 
 **Anything else is reported, not dropped.** A key outside the list above gets a
 named warning with the likely intent, instead of being silently discarded:

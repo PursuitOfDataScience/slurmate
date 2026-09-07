@@ -5,6 +5,147 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+Covers the working tree since 0.7.0. Note that `pyproject.toml` already reads
+**0.7.1**, which has no entry of its own — the fixes below are unreleased either way
+and want a version bump when they ship.
+
+### Fixed
+
+- **Indented status lines were padded out to the terminal with spaces.** Every
+  message printed through `_print_indented` — twelve call sites then, sixteen
+  after the entry below, including the
+  `Slurm refuses this job:` line — rendered as a full-width block, so the text was
+  followed by however many spaces were left in the row, outside the style reset.
+  Measured at 90 columns: 79 cells of text and 11 trailing spaces, filling the row
+  exactly. Nothing was misdrawn, which is why it lasted; the cost is a line that
+  copies with junk on the end and a cursor left at the right margin. The
+  indent-on-every-wrapped-line behaviour the helper exists for is unchanged.
+
+  **A wrapping paragraph was padded a second way, and now is not.** `expand=False`
+  sizes the block; it does not stop `Padding` rendering its child at the full
+  available width, so every line of a paragraph long enough to wrap was still
+  filled to the wrap column. That was recorded here as a measured limit on the
+  grounds that no line the tool emits through the helper is that long — which the
+  entry below makes untrue. The helper now asks `rich` where to wrap and prints
+  each resulting line as the single line it is, so the block is measured to that
+  line's own length. `rich` still chooses the wrap points, the line count and the
+  wrapped text are unchanged, and every line is rstripped.
+
+- **Two site-check lines lost their indent when they wrapped, and kept the space
+  they wrapped on.** The continuation lines of a multi-line site-check issue and
+  the `--force` hint carried their indent as **literal spaces inside the string**,
+  which is the arrangement `_print_indented` exists to replace: `rich` applies a
+  literal prefix to the first line only, so the remainder came back at column 0.
+  The unknown-partition message is the one here that always wraps, because it
+  interpolates the cluster's whole partition list. Measured on a real `--dry-run`
+  against an unknown partition on an 85-partition cluster, at 60 columns: **3** of
+  the 6 lines at column 0 and **3** with a trailing space, e.g. `This cluster's
+  partitions: caslake, aaz, aettinger-gpu, ` followed by `ai4s-hackathon, amd,
+  amd-hm, andrewferguson, ` starting at column 0. Both sites go through the helper
+  now, at `indent=4` and `indent=2`: **0 and 0** at 60, 70, 80, 90 and 120 columns.
+  `_FORCE_HINT` held its own two-space prefix and is printed from three places, so
+  the prefix moved out of the constant and all three hand it to the helper. This
+  was **L11** in `issues.md`; routing the two sites through the helper alone would
+  have traded the lost indent for *more* trailing whitespace (5 padded lines at 60
+  columns instead of 3), which is why the wrap-column padding above went with it.
+
+- **The remaining sixteen literal-indent lines lost their indent too — the last
+  round's reason for leaving them was measured and is false.** Three groups in
+  `main.py` were recorded as deliberately unchanged because "none of them
+  interpolates an unbounded list, so none has been observed to wrap". Each was
+  then driven through its own code path at six real terminal widths (60, 70, 80,
+  90, 100, 120) and **all three wrap**:
+
+  - the **batch-mode validation rejections** (`--cpus`/`--nodes`/`--gpus`/
+    `--ntasks-per-node`, `--mem`, `--mem-per-cpu`, `--time`). The
+    `Give <forms>.` line under a bad `--mem` is `MEMORY_FORMS`, **195 cells of
+    fixed text**, so it wraps at every one of the six widths — unconditionally,
+    with nothing user-supplied in it. At 60 columns a real
+    `--mem not-a-memory-value` printed **3 lines with a trailing space and 3
+    starting at column 0**; the `--time` forms line is 99 cells (wraps at
+    60/70/80/90) and `--ntasks-per-node` is 63 (wraps at 60). The value in
+    `Invalid memory value: …` is whatever the user typed, so a 200-character
+    `--mem` made four lines at 80 columns.
+  - the **inferred `--gpus` format hint**, 147 cells: there is no terminal width
+    at which it fits. Wrapped at all six, always leaving the remainder at
+    column 0.
+  - the **interactive submit menu's rejections** — `Slurm rejects the edited
+    script: <sbatch's own wording>` (all six widths with a real
+    `Invalid account or account/partition combination specified`), the
+    `Choose "Open in editor"` hint (80 cells, wraps at 60/70), the transient
+    `Slurm would not take this job right now` line, each `_hard_errors` message
+    (85 cells, wraps at 60/80) and the `This job has errors Slurm will reject.`
+    summary (90 cells, wraps at 60/70/80).
+
+  All sixteen now go through `_print_indented` — the seven `Error:` lines via
+  `_print_issue`, which composes the same sentence and hands it on — at the
+  two-space depth they carried as literal text. **0 lines with trailing
+  whitespace and 0 at column 0** at all six widths, on all three surfaces.
+
+  **The same measurement found a third defect and it is fixed with them: on a
+  colour terminal these lines printed their own escape sequence as visible
+  text.** Seven of the sixteen built their colour from a raw `c.RED`/`c.RESET`
+  ANSI escape and handed the string to `rich`, which does not read ANSI in a
+  `print` argument — `[38;2;255;0;0m` is not a markup tag, so it stayed text, the
+  repr highlighter coloured the digits inside it, and the sequence reached the
+  terminal broken. Interpreting the real output as a terminal would, at
+  `FORCE_COLOR=1` and 80 columns, the screen showed
+  `[38;2;255;0;0m✗ Error: Invalid memory value: …[0m` — **68 visible cells for a
+  51-cell message, and not red**. It is now 51 cells and carries `ESC[31m`.
+
+  Two smaller consequences, both intended: the interpolated value is escaped, so
+  `--mem '[red]x'` reports `[red]x` instead of silently injecting markup; and the
+  glyph comes from the theme, so **`--ascii` reaches these lines for the first
+  time** (`x Error:` instead of a hard-coded `✗`).
+
+  Not changed, and now recorded in `issues.md` rather than assumed absent: the
+  **other 18 literal-indent `console.print` calls** the same scan found in
+  `main.py`. Ten of them share the `c.*`-into-`rich` defect above.
+
+- **The review screen clipped the job it was asking you to confirm.** Both panels of
+  the last screen before submission — `Job Configuration` and `Final Script` — cut
+  their content mid-string with nothing on screen to say so. Measured on a
+  120-column terminal with an ordinary job: the summary read `Output directory
+  /home/youzhi/slu`, `Modules python/anaconda-` and `Command python train.py `,
+  while the script showed `#SBATCH --output=/home/youzhi/slurmwatch/logs/spec`. At 90
+  columns the summary column is 22 cells wide and five of twelve values were cut.
+  Both panels wrap now, and a summary value wraps *under its own column* so the
+  continuation still lines up with the value above it.
+- **The tail of the script could not be scrolled to.** The review panel's scroll
+  bound was `total_lines - visible_rows`, which assumed one row per line. Now that a
+  long `#SBATCH --output=` or `module load … || { … }` line takes two or three rows,
+  that arithmetic stopped short of the end and the last lines of the script were
+  unreachable — the same "you cannot see what you are submitting" fault by another
+  route. The bound counts wrapped rows.
+
+  *Known limit:* the summary card is a fixed height, so below 120 columns a
+  twelve-answer summary with a long command needs more rows than the card has and
+  the tail of the last value falls below its fold. The full command is on screen in
+  the `Final Script` panel beside it, which scrolls.
+
+- **A GPU model was reported under a spelling the cluster does not have.** The GPU
+  type collected from a typed GRES had `_` folded to `-` before being reported, so a
+  site whose configured type is `gpu:rtx_6000` was offered `rtx-6000` — and
+  `--gres=gpu:rtx-6000:N` names a type Slurm will refuse. Worse, validation then
+  *rejected* the real name: picking `rtx_6000` gave "GPU type 'rtx_6000' not in
+  partition list (rtx-6000)". The reported spelling is now the one the GRES uses;
+  the fold is kept only where models are compared, which is what it was for.
+- **The job summary omitted a directive the generated script emits.** A multi-node
+  job with no explicit `--ntasks-per-node` had the automatic value written into the
+  script but left out of the summary.
+
+### Changed
+
+- **An unusable `$SLURMATE_TIMEOUT` is now said out loud.** `garbage`, `0` and `-5`
+  all fell back to the 45-second default behind a debug log, so they were
+  indistinguishable from leaving the variable unset — the state a reader who set it
+  believes they are *not* in. Each now warns, naming the value, the budget that
+  applied and an example. `0` gets its own message, because writing it is a request
+  to remove the budget and quietly getting 45s is the opposite answer. No returned
+  budget changed.
+
 ## [0.7.0] — 2026-08-25
 
 Two portability rounds, over three more clusters, taking the cluster count to

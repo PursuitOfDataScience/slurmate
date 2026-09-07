@@ -31,6 +31,7 @@ from .builder import (
     unquoted_custom_values,
 )
 from .system_utils import (
+    CONFIG_ALIASES,
     GPU_COUNT_FLAG,
     GPU_SPELLING_FORMATS,
     MEMORY_FORMS,
@@ -46,6 +47,7 @@ from .system_utils import (
     default_memory_for,
     effective_log_path,
     expand_log_pattern,
+    fetch_account_acl,
     fetch_all_partition_names,
     fetch_gpu_type_sources,
     fetch_known_qos,
@@ -62,12 +64,14 @@ from .system_utils import (
     normalize_memory,
     parse_gpu_spelling,
     parse_submitted_job_id,
+    partition_account_refusal,
     refusal_is_permanent,
     refusal_is_transient,
     resolve_request_mem_mb,
     slurm_deadline,
     submit_sbatch,
     time_forms,
+    unknown_partition_reason,
     unsupported_gpu_format,
     validate_array_spec,
     validate_cluster_targets,
@@ -98,8 +102,16 @@ _GO_BACK = "\x00__go_back__"
 #: itself is valid", so the same condition was described two ways depending on
 #: which mode the reader was in. The more informative wording won, because
 #: "clears on its own" is the part that tells them what to do.
+#:
+#: The indent is NOT in here. It used to be two literal spaces at the front of
+#: the string, which is the arrangement `_print_indented` exists to replace: rich
+#: applies a literal prefix to the first line only, so at 60 columns the hint
+#: printed "Pass --force to generate the script anyway (e.g. for " and then
+#: "another cluster)." back at column 0. It is printed from three sites, so the
+#: prefix had to come out of the constant rather than be indented twice -- all
+#: three now hand it to the helper, which pads every wrapped line.
 _FORCE_HINT = (
-    "  [dim]Pass --force to generate the script anyway "
+    "[dim]Pass --force to generate the script anyway "
     "(e.g. for another cluster).[/]"
 )
 
@@ -112,8 +124,35 @@ def _print_indented(console: Console, markup: str, indent: int = 2) -> None:
     at column 0. Every caller here interpolates a string of unbounded length
     (a controller refusal, a site-check message), so wrapping is the normal
     case, not the edge one.
+
+    ``indent`` is a per-caller depth, not decoration: the site-check report
+    prints its head line at 2 and the continuation lines of a multi-line issue
+    at 4, and the second column only means anything if the wrap keeps it.
     """
-    console.print(Padding(Text.from_markup(markup), (0, 0, 0, indent)))
+    # `expand=False`: a `Padding` renders as a full-width block by default, so
+    # every one of these call sites padded its line out to the terminal with
+    # spaces the terminal never draws. Measured at 90 columns, the refusal line
+    # came out 79 cells of text plus 11 trailing spaces -- filling the row
+    # exactly, so the line copies with junk on the end and any `grep -nP ' $'`
+    # over a captured log flags it.
+    #
+    # ...but `expand=False` alone only sizes the BLOCK, and `Padding` renders its
+    # child with `pad=True`, so a paragraph long enough to wrap is measured at the
+    # full available width and every line of it is filled to the wrap column
+    # again. That was pinned as a residual limitation of the fix above, and it is
+    # what made routing the site-check continuation lines through here a trade
+    # rather than a win: they kept the indent and gained a longer run of trailing
+    # spaces than the literal prefix had left (three padded lines at 60 columns
+    # became five). So the wrap happens FIRST -- `rich` still decides where, this
+    # is not hand-wrapping -- and each resulting line is handed to the
+    # single-line path, where the block is measured to that line's own length and
+    # there is nothing left to fill. `Text.wrap` already crops whitespace that
+    # overruns the width; `rstrip` is what removes the separator space at a wrap
+    # point that lands inside it, which is the space the reported lines ended on.
+    text = Text.from_markup(markup)
+    for line in text.wrap(console, max(1, console.width - indent)):
+        line.rstrip()
+        console.print(Padding(line, (0, 0, 0, indent), expand=False))
 
 
 def _print_issue(console: Console, level: str, msg: str) -> None:
@@ -177,15 +216,17 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
     # less valid request produced the more reassuring screen. The flag lets the
     # validator say "I could not check" instead.
     #
-    # ``_unknown_reason`` distinguishes the two ways we get here, because the
+    # ``_unknown_reason`` distinguishes the three ways we get here, because the
     # honest message differs: with a readable partition list this name is genuinely
-    # absent, but with an *empty* list (no Slurm, sinfo down) nothing is known
+    # absent, with an *empty* list (no Slurm, sinfo down) nothing is known
     # about any partition — and saying "not on this cluster" there is the false
-    # rejection the SM-4 restraint exists to prevent.
+    # rejection the SM-4 restraint exists to prevent — and a name the wide
+    # ``sinfo -a`` list has but this narrow one does not exists and is merely
+    # undescribed. See :func:`~slurmate.system_utils.unknown_partition_reason`.
     return {"name": name, "nodes": 0, "nodes_up": None, "cpus_per_node": 0,
             "mem_per_node_mb": 0, "gpu_types": [], "timelimit": None,
             "is_public": True, "is_default": False, "_unknown": True,
-            "_unknown_reason": "absent" if partitions else "unreadable"}
+            "_unknown_reason": unknown_partition_reason(name, partitions)}
 
 
 def _enrich_partition_maxima(part: dict[str, Any]) -> dict[str, Any]:
@@ -280,10 +321,13 @@ def _coerce_str(value: Any, default: str | None, *, field: str,
 # Config keys whose argparse dest is spelled differently. Used to work out which
 # config values actually reached the script (a CLI flag overrides the file), so
 # the disclosure names only the ones the user did not type.
+#
+# Derived, not repeated: this is `CONFIG_ALIASES` read the other way round, and
+# written out by hand the two disagreed -- this table had `env_name`/`env` and
+# that one did not, so a config `env = "myenv"` was dropped as an unknown key.
+# One direction is the truth and the other is its inverse.
 CONFIG_ARG_DESTS: dict[str, str] = {
-    "time_limit": "time",
-    "array_spec": "array",
-    "env_name": "env",
+    config_key: cli_dest for cli_dest, config_key in CONFIG_ALIASES.items()
 }
 
 
@@ -348,10 +392,16 @@ def _check_cluster_targets(
             _print_issue(err_console, "warning", head)
         else:
             _print_issue(err_console, "error", head)
+        # Through the helper, at the deeper indent these continuation lines carry:
+        # the four spaces were literal, so rich indented the first line and wrapped
+        # the rest to column 0 -- and this is the one message here that always
+        # wraps, because it interpolates the cluster's whole partition list. On a
+        # real `--dry-run` against an unknown partition at 60 columns, three of the
+        # six lines came back at column 0 with a trailing space each.
         for line in rest:
-            err_console.print(f"    [dim]{escape(line)}[/]")
+            _print_indented(err_console, f"[dim]{escape(line)}[/]", indent=4)
     if not force:
-        err_console.print(_FORCE_HINT)
+        _print_indented(err_console, _FORCE_HINT)
         sys.exit(1)
 
 
@@ -461,24 +511,57 @@ def _run_batch(args: argparse.Namespace, console: Console,
     # Hard-validate numeric flags so batch mode rejects the same bad input the
     # wizard does (positive cpus/nodes, non-negative gpus/ntasks), instead of
     # emitting Slurm-invalid directives like --cpus-per-task=0 or --nodes=-2.
+    # Through `_print_issue` (so `_print_indented`), not a literal two-space
+    # prefix with a raw `c.RED` escape in it -- see the note on the memory
+    # rejection below for the three things that arrangement did to these lines.
+    # The longest of these four is 63 cells and wraps at 60 columns; all four
+    # interpolate a user-supplied number, so none has a bounded length.
     if cpus <= 0:
-        err_console.print(f"  {c.RED}\u2717 Error: --cpus must be a positive integer (got {cpus}){c.RESET}")
+        _print_issue(err_console, "error",
+                     f"--cpus must be a positive integer (got {cpus})")
         sys.exit(1)
     if nodes <= 0:
-        err_console.print(f"  {c.RED}\u2717 Error: --nodes must be a positive integer (got {nodes}){c.RESET}")
+        _print_issue(err_console, "error",
+                     f"--nodes must be a positive integer (got {nodes})")
         sys.exit(1)
     if gpus < 0:
-        err_console.print(f"  {c.RED}\u2717 Error: --gpus must be a non-negative integer (got {gpus}){c.RESET}")
+        _print_issue(err_console, "error",
+                     f"--gpus must be a non-negative integer (got {gpus})")
         sys.exit(1)
     if ntasks_per_node is not None and ntasks_per_node <= 0:
-        err_console.print(f"  {c.RED}\u2717 Error: --ntasks-per-node must be a positive integer (got {ntasks_per_node}){c.RESET}")
+        _print_issue(err_console, "error",
+                     "--ntasks-per-node must be a positive integer "
+                     f"(got {ntasks_per_node})")
         sys.exit(1)
 
     # Hard-validate memory (unless deliberately omitted for a whole-node site,
     # or not supplied at all \u2014 that case is sized from the partition below).
+    #
+    # These rejections carried their indent as two literal spaces and their
+    # colour as a raw `c.RED` escape handed to `rich`. Measured wrong three ways
+    # at every terminal width this tool is used at:
+    #
+    # * the `Give ...` line is `MEMORY_FORMS`, 195 cells of FIXED text, so it
+    #   wraps at 60, 70, 80, 90, 100 and 120 columns -- unconditionally, not as
+    #   an edge case. A literal prefix indents the first line only, so the
+    #   remainder came back at column 0 with the space it broke on left on the
+    #   end: at 60 columns, 3 lines with trailing whitespace and 3 at column 0.
+    # * `{memory_val}` is whatever the user typed, so the `Error:` line has no
+    #   bound either -- a 200-character `--mem` value wrapped it into four lines
+    #   at 80 columns.
+    # * and with colour on, `rich` reads `c.RED`'s own bytes as TEXT.
+    #   `[38;2;255;0;0m` is not a markup tag, so the repr highlighter styles the
+    #   digits inside it and the sequence reaches the terminal broken. Measured
+    #   at `FORCE_COLOR=1`, width 80, the screen showed
+    #   `[38;2;255;0;0m<glyph> Error: Invalid memory value: ...[0m` -- 68 visible
+    #   cells for a 51-cell message, and not red.
+    #
+    # `_print_issue` composes the same sentence as rich markup and hands it to
+    # `_print_indented`, which settles all three and escapes the interpolated
+    # value as a bonus (`--mem '[red]x'` used to inject markup).
     if memory_val is not None and not mem_omit and not validate_memory(str(memory_val)):
-        err_console.print(f"  {c.RED}\u2717 Error: Invalid memory value: {memory_val}{c.RESET}")
-        err_console.print(f"  [dim]Give {MEMORY_FORMS}.[/]")
+        _print_issue(err_console, "error", f"Invalid memory value: {memory_val}")
+        _print_indented(err_console, f"[dim]Give {MEMORY_FORMS}.[/]")
         sys.exit(1)
 
     # --mem-per-cpu (validated as a memory value); takes precedence over --mem.
@@ -488,10 +571,9 @@ def _run_batch(args: argparse.Namespace, console: Console,
         None, field="mem_per_cpu", err_console=err_console)
     if mem_per_cpu:
         if not validate_memory(str(mem_per_cpu)):
-            err_console.print(
-                f"  {c.RED}\u2717 Error: Invalid --mem-per-cpu value: {mem_per_cpu}{c.RESET}"
-            )
-            err_console.print(f"  [dim]Give {MEMORY_FORMS}.[/]")
+            _print_issue(err_console, "error",
+                         f"Invalid --mem-per-cpu value: {mem_per_cpu}")
+            _print_indented(err_console, f"[dim]Give {MEMORY_FORMS}.[/]")
             sys.exit(1)
         mem_per_cpu = normalize_memory(str(mem_per_cpu))
 
@@ -503,8 +585,9 @@ def _run_batch(args: argparse.Namespace, console: Console,
 
     # Hard-validate time limit
     if not validate_time(str(time_val)):
-        err_console.print(f"  {c.RED}\u2717 Error: Invalid time limit value: {time_val}{c.RESET}")
-        err_console.print(f"  [dim]Give {time_forms()}.[/]")
+        # `time_forms()` is 99 cells, so this `Give ...` wraps at 60/70/80/90.
+        _print_issue(err_console, "error", f"Invalid time limit value: {time_val}")
+        _print_indented(err_console, f"[dim]Give {time_forms()}.[/]")
         sys.exit(1)
 
     all_parts = fetch_partitions()
@@ -852,17 +935,23 @@ def _check_gpu_format(
     if not reason:
         return None
     if inferred:
-        err_console.print(
-            f"  [dim]--gpus '<type>:count' reads as gpu_format "
+        # 147 cells with the shortest format name this branch can carry, so it
+        # wraps at 60, 70, 80, 90, 100 AND 120 columns -- there is no terminal
+        # width at which this line fits. Through `_print_indented` at the depth
+        # its two neighbours below use (2), so the continuation keeps the indent
+        # instead of coming back at column 0 with a trailing space on the break.
+        _print_indented(
+            err_console,
+            f"[dim]--gpus '<type>:count' reads as gpu_format "
             f"'{escape(str(gpu_format))}', which this cluster cannot parse; "
-            f"using 'gres_type' instead (pass --gpu-format to choose).[/]"
+            f"using 'gres_type' instead (pass --gpu-format to choose).[/]",
         )
         return "gres_type"
     if force:
         _print_issue(err_console, "warning", reason)
         return None
     _print_issue(err_console, "error", reason)
-    err_console.print(_FORCE_HINT)
+    _print_indented(err_console, _FORCE_HINT)
     sys.exit(1)
 
 
@@ -889,7 +978,7 @@ def _check_modules_exist(
         else:
             _print_issue(err_console, "error", msg)
     if not force:
-        err_console.print(_FORCE_HINT)
+        _print_indented(err_console, _FORCE_HINT)
         sys.exit(1)
 
 
@@ -951,6 +1040,18 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
                 known_qos=fetch_known_qos() if qos else None,
                 known_features=fetch_node_features() if constraint else None,
             )
+        # Entitlement, which is a different question from existence: the checks
+        # above establish that the partition IS on this cluster and the account
+        # IS one the user holds, and every partition-limit check establishes that
+        # the shape fits. None of them asks whether this partition will run this
+        # account — the gate that actually says no on a multi-PI cluster. Only
+        # reached for a partition, since the ACL is the partition's.
+        if partition:
+            acl_refusal = partition_account_refusal(
+                partition, account, fetch_account_acl(partition)
+            )
+            if acl_refusal:
+                out.append(("error", acl_refusal))
         note = job_name_change_note(str(answers.get("_job_name_given") or ""))
         if note:
             out.append(("warning", note))
@@ -1445,16 +1546,17 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         # a flat constant. Say what it is instead of dressing a guess as a reading.
         part_obj = answers.get("_partition_obj") or {}
         part_unknown = bool(part_obj.get("_unknown"))
-        # Distinguish the two reasons, as the capacity message already does: with
+        # Distinguish the three reasons, as the capacity message already does: with
         # an unreadable partition list the partition may well exist, and saying it
         # is "not on this cluster" is the false rejection the SM-4 restraint
         # forbids. This renderer keyed off _unknown alone and so made that claim
         # in two more rows.
-        why_unknown = (
-            "the partition list could not be read"
-            if part_obj.get("_unknown_reason") == "unreadable"
-            else "partition not on this cluster"
-        )
+        why_unknown = {
+            "unreadable": "the partition list could not be read",
+            # Exists, but the plain `sinfo` this object came from does not list
+            # it, so squeue's answer is not a reading of the right thing either.
+            "undescribed": "partition not described by this cluster's sinfo",
+        }.get(str(part_obj.get("_unknown_reason")), "partition not on this cluster")
         if part_unknown:
             rows.append(("Queue:", f"unknown — {why_unknown}", "#ffaa00"))
         elif not queue_info.get("queue_known", True):
@@ -2384,11 +2486,16 @@ def _main(stack: contextlib.ExitStack) -> None:
                 # passing one that introduced it. Ask the controller about the
                 # actual bytes instead.
                 refusal = check_script_with_scheduler(script)
+                # The reports below go through `_print_indented`, not a literal
+                # prefix: `refusal` is sbatch's wording, so each wrapped at every
+                # width 60-120 and lost the indent. Terse on purpose -- the source
+                # guards in `TestEveryRefusalSiteClassifies` bound the distance
+                # between this call, the classifier and the bare `if refusal:`.
                 if refusal and refusal_is_permanent(refusal):
-                    console.print(f"  [red]{g.ERR} Slurm rejects the edited "
-                                  f"script: {escape(refusal)}[/]")
-                    console.print("  [dim]Choose \"Open in editor\" to fix it, "
-                                  "or \"Go back to edit answers\" to regenerate.[/]")
+                    _print_indented(console, f"[red]{g.ERR} Slurm rejects the "
+                                    f"edited script: {escape(refusal)}[/]")
+                    _print_indented(console, '[dim]Choose "Open in editor" to fix '
+                                    'it, or "Go back to edit answers" to regenerate.[/]')
                     continue
                 if refusal:
                     # Not permanent, so the edit is not demonstrably at fault:
@@ -2404,17 +2511,27 @@ def _main(stack: contextlib.ExitStack) -> None:
                         else "slurmate cannot tell whether this clears on its "
                              "own; submitting anyway"
                     )
-                    console.print(
-                        f"  [yellow]{g.WARN} Slurm would not take this job right "
-                        f"now: {escape(refusal)}[/] [dim]({detail})[/]"
+                    # Same shape, same reason: `refusal` plus `detail` wrapped
+                    # this at 60, 80 and 120 columns when measured.
+                    _print_indented(
+                        console,
+                        f"[yellow]{g.WARN} Slurm would not take this job right "
+                        f"now: {escape(refusal)}[/] [dim]({detail})[/]",
                     )
             else:
                 errs = _hard_errors(answers)
                 if errs:
                     for m in errs:
-                        console.print(f"  [red]{g.ERR} {escape(m)}[/]")
-                    console.print("  [red]This job has errors Slurm will reject.[/] "
-                                  "[dim]Choose \"Go back to edit answers\" to fix, or Quit.[/]")
+                        # A real `_hard_errors` message ("Time limit 3-00:00:00
+                        # exceeds the maximum for partition 'cpu-shared'
+                        # (1-00:00:00)", 85 cells) wraps at 60 and 80; the
+                        # summary line below it is 90 cells and wraps at 60/70/80.
+                        _print_indented(console, f"[red]{g.ERR} {escape(m)}[/]")
+                    _print_indented(
+                        console,
+                        "[red]This job has errors Slurm will reject.[/] "
+                        '[dim]Choose "Go back to edit answers" to fix, or Quit.[/]',
+                    )
                     continue
             _submit_and_report(script, answers, console, save_script=save_script)
             return

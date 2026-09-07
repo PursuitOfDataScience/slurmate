@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import sys
+import textwrap
 from collections.abc import Callable, Generator
 from typing import Any
 
@@ -60,6 +61,7 @@ from .system_utils import (
     fetch_user_partitions,
     load_config,
     normalize_memory,
+    unknown_partition_reason,
     validate_array_spec,
     validate_memory,
     validate_time,
@@ -69,8 +71,7 @@ from .system_utils import (
 logger = logging.getLogger(__name__)
 if os.environ.get("SLURMATE_DEBUG"):
     logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
 
@@ -87,47 +88,56 @@ _STAGE_BG = ""
 # selection); every other region gets its own color. All hues sit at a similar
 # mid brightness so they harmonize and stay legible over the terminal's own
 # (possibly translucent) background — the cards paint no fill of their own.
-_ACCENT = "#5c9dff"   # blue   — the active/focused input card + current selection
-_TEAL = "#3bc4c4"     # teal   — the header / brand bar and status labels
-_VIOLET = "#a889f5"   # violet — the Steps sidebar + current-step marker
-_PINK = "#ee85b5"     # pink   — the header progress counter
-_GREEN = "#54c99a"    # green  — done steps, the script-preview card, shell keywords
-_AMBER = "#e0b661"    # amber  — warnings, queue ETA, $variables, the review config card
-_RED = "#ef6f7e"      # red    — errors
-_TEXT = "#dfe3ec"     # primary text
-_DIM = "#7e8699"      # subtitles, pending steps, hints
-_BORDER = "#414a63"   # fallback border for an uncolored card
+_ACCENT = "#5c9dff"  # blue   — the active/focused input card + current selection
+_TEAL = "#3bc4c4"  # teal   — the header / brand bar and status labels
+_VIOLET = "#a889f5"  # violet — the Steps sidebar + current-step marker
+_PINK = "#ee85b5"  # pink   — the header progress counter
+_GREEN = "#54c99a"  # green  — done steps, the script-preview card, shell keywords
+_AMBER = "#e0b661"  # amber  — warnings, queue ETA, $variables, the review config card
+_RED = "#ef6f7e"  # red    — errors
+_TEXT = "#dfe3ec"  # primary text
+_DIM = "#7e8699"  # subtitles, pending steps, hints
+_BORDER = "#414a63"  # fallback border for an uncolored card
 
-_TUI_STYLE = PTStyle([
-    ("status-bar", f"fg:{_TEAL} bold"),        # header brand
-    ("status-meter", f"fg:{_PINK} bold"),      # header progress counter
-    ("sidebar-done", f"fg:{_GREEN}"),
-    ("sidebar-current", f"fg:{_VIOLET} bold"),
-    ("sidebar-pending", f"fg:{_DIM}"),
-    ("title", f"fg:{_ACCENT} bold"),
-    ("subtitle", f"fg:{_DIM}"),
-    ("text-area", f"fg:{_TEXT}"),
-    ("text-area focused", "fg:#ffffff bold"),
-    ("radio-list", f"fg:{_TEXT}"),
-    ("radio-list.selected", f"fg:{_GREEN} bold"),
-    ("radio-list.pointer", f"fg:{_ACCENT} bold"),
-    ("checkbox", f"fg:{_DIM}"),
-    ("checkbox.selected", f"fg:{_GREEN}"),
-    ("preview-header", f"fg:{_TEAL} bold"),    # queue-status labels
-    ("preview-text", f"fg:{_DIM}"),
-    ("error", f"fg:{_RED} bold"),
-    ("warning", f"fg:{_AMBER} bold"),
-    ("info", f"fg:{_DIM}"),
-    # The floating completion menu keeps an opaque backing (it overlays other text
-    # and would be unreadable transparent — macOS popovers are effectively opaque).
-    ("completion-menu", "bg:#1c2233 fg:#c8cdda"),
-    ("completion-menu.completion", "bg:#1c2233 fg:#c8cdda"),
-    ("completion-menu.completion.current", f"bg:{_ACCENT} fg:#0b0f1a bold"),
-])
+_TUI_STYLE = PTStyle(
+    [
+        ("status-bar", f"fg:{_TEAL} bold"),  # header brand
+        ("status-meter", f"fg:{_PINK} bold"),  # header progress counter
+        ("sidebar-done", f"fg:{_GREEN}"),
+        ("sidebar-current", f"fg:{_VIOLET} bold"),
+        ("sidebar-pending", f"fg:{_DIM}"),
+        ("title", f"fg:{_ACCENT} bold"),
+        ("subtitle", f"fg:{_DIM}"),
+        ("text-area", f"fg:{_TEXT}"),
+        ("text-area focused", "fg:#ffffff bold"),
+        ("radio-list", f"fg:{_TEXT}"),
+        ("radio-list.selected", f"fg:{_GREEN} bold"),
+        ("radio-list.pointer", f"fg:{_ACCENT} bold"),
+        ("checkbox", f"fg:{_DIM}"),
+        ("checkbox.selected", f"fg:{_GREEN}"),
+        ("preview-header", f"fg:{_TEAL} bold"),  # queue-status labels
+        ("preview-text", f"fg:{_DIM}"),
+        ("error", f"fg:{_RED} bold"),
+        ("warning", f"fg:{_AMBER} bold"),
+        ("info", f"fg:{_DIM}"),
+        # The floating completion menu keeps an opaque backing (it overlays other text
+        # and would be unreadable transparent — macOS popovers are effectively opaque).
+        ("completion-menu", "bg:#1c2233 fg:#c8cdda"),
+        ("completion-menu.completion", "bg:#1c2233 fg:#c8cdda"),
+        ("completion-menu.completion.current", f"bg:{_ACCENT} fg:#0b0f1a bold"),
+    ]
+)
 
 
-def _card(body: Any, title: str = "", *, color: str | None = None,
-          focused: bool = False, width: Any = None, height: Any = None) -> HSplit:
+def _card(
+    body: Any,
+    title: str = "",
+    *,
+    color: str | None = None,
+    focused: bool = False,
+    width: Any = None,
+    height: Any = None,
+) -> HSplit:
     """Wrap a container in a rounded, fill-less border 'card'.
 
     The interior stays transparent (the terminal shows through); only the rounded
@@ -143,29 +153,40 @@ def _card(body: Any, title: str = "", *, color: str | None = None,
     # keeps a quiet dim title so it recedes.
     t = f"fg:{hue} bold" if (focused or color) else f"fg:{_DIM}"
     if title:
-        top = VSplit([
-            Window(width=1, char="╭", style=b),
-            Window(width=1, char="─", style=b),
-            Window(FormattedTextControl([(t, f" {title} ")]), height=1, dont_extend_width=True),
-            Window(char="─", style=b),
-            Window(width=1, char="╮", style=b),
-        ], height=1)
+        top = VSplit(
+            [
+                Window(width=1, char="╭", style=b),
+                Window(width=1, char="─", style=b),
+                Window(FormattedTextControl([(t, f" {title} ")]), height=1, dont_extend_width=True),
+                Window(char="─", style=b),
+                Window(width=1, char="╮", style=b),
+            ],
+            height=1,
+        )
     else:
-        top = VSplit([
-            Window(width=1, char="╭", style=b),
+        top = VSplit(
+            [
+                Window(width=1, char="╭", style=b),
+                Window(char="─", style=b),
+                Window(width=1, char="╮", style=b),
+            ],
+            height=1,
+        )
+    middle = VSplit(
+        [
+            Window(width=1, char="│", style=b),
+            body,
+            Window(width=1, char="│", style=b),
+        ]
+    )
+    bottom = VSplit(
+        [
+            Window(width=1, char="╰", style=b),
             Window(char="─", style=b),
-            Window(width=1, char="╮", style=b),
-        ], height=1)
-    middle = VSplit([
-        Window(width=1, char="│", style=b),
-        body,
-        Window(width=1, char="│", style=b),
-    ])
-    bottom = VSplit([
-        Window(width=1, char="╰", style=b),
-        Window(char="─", style=b),
-        Window(width=1, char="╯", style=b),
-    ], height=1)
+            Window(width=1, char="╯", style=b),
+        ],
+        height=1,
+    )
     return HSplit([top, middle, bottom], width=width, height=height)
 
 
@@ -193,7 +214,9 @@ class LastTokenPathCompleter(Completer):
     def __init__(self) -> None:
         self._pc = PathCompleter(expanduser=True)
 
-    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Generator[Completion, None, None]:
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Generator[Completion, None, None]:
         text = document.text_before_cursor
         cut = max(text.rfind(" "), text.rfind("\t"), text.rfind("\n")) + 1
         token = text[cut:]
@@ -220,10 +243,12 @@ class LastTokenCommaCompleter(Completer):
     def __init__(self, words: list[str]) -> None:
         self._words = words
 
-    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Generator[Completion, None, None]:
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Generator[Completion, None, None]:
         text = document.text_before_cursor
         idx = text.rfind(",")
-        prefix = text[idx + 1:] if idx >= 0 else text
+        prefix = text[idx + 1 :] if idx >= 0 else text
         # Both ends, not just the left. `lstrip` let a trailing space through into
         # the fuzzy pattern, and no module name contains one, so "gc " matched
         # every word in the list instead of `gcc` -- tab after an accidental space
@@ -266,10 +291,19 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
     # stayed silent, and its answers carry `_partition_obj` on into the CLI
     # summary, where the same flag is what stops a nonexistent partition's empty
     # `squeue` from being printed as a real "0 running / 0 pending" and an ETA.
-    return {"name": name, "nodes": 0, "nodes_up": None, "cpus_per_node": 0,
-            "mem_per_node_mb": 0, "gpu_types": [], "timelimit": None,
-            "is_public": True, "is_default": False, "_unknown": True,
-            "_unknown_reason": "absent" if partitions else "unreadable"}
+    return {
+        "name": name,
+        "nodes": 0,
+        "nodes_up": None,
+        "cpus_per_node": 0,
+        "mem_per_node_mb": 0,
+        "gpu_types": [],
+        "timelimit": None,
+        "is_public": True,
+        "is_default": False,
+        "_unknown": True,
+        "_unknown_reason": unknown_partition_reason(name, partitions),
+    }
 
 
 def _fmt_partition(p: dict[str, Any]) -> str:
@@ -281,6 +315,19 @@ def _fmt_partition(p: dict[str, Any]) -> str:
     ``13 of 17 nodes`` when some are unusable and marks a fully-dead partition
     ``unavailable`` \u2014 visible, still selectable (a drained partition can be the
     right answer tomorrow), but not disguised as live capacity.
+
+    The GPU segment reports ``gpus_per_node`` as well as the model list, because
+    the count is the per-node figure this row already prints for CPUs and memory
+    and it was the only one missing. Two consequences, both measured on midway3:
+    a partition whose GRES is **count-only** (``Gres=gpu:4``, no model) populates
+    ``gpus_per_node`` but leaves ``gpu_types`` empty, so it got no GPU marker at
+    all and rendered byte-identically to a CPU-only partition of the same shape
+    \u2014 18 of this cluster's 88 partitions, ``gpu``/``beagle3``/``kicp-gpu`` among
+    them, in the one step where the partition is chosen and before any GPU step
+    runs. And on the typed side a 1-GPU and an 8-GPU ``a100`` partition both read
+    ``GPU:[a100]``. ``fetch_partitions`` parses the count with ``_parse_gpu_count``
+    and ``max()``-merges it across sinfo rows; only two capacity checks read it,
+    and neither is a surface the picker shows.
     """
     name = p["name"]
     nodes = p.get("nodes", "?")
@@ -295,11 +342,18 @@ def _fmt_partition(p: dict[str, Any]) -> str:
     cpus = p.get("cpus_per_node", "?")
     mem_gb = p.get("mem_per_node_mb", 0) // 1024
     gpus = p.get("gpu_types", [])
+    gpu_n = p.get("gpus_per_node") or 0
     label = f"{name:<12} {node_txt} \u00b7 {cpus} CPU \u00b7 {mem_gb}G"
     if p.get("is_default"):
         label += " \u00b7 default"
-    if gpus:
-        label += f" \u00b7 GPU:[{','.join(gpus)}]"
+    if gpus or gpu_n or p.get("has_gpu"):
+        # "?" for a partition known to have GPUs whose count and models are both
+        # unknown \u2014 the same admission this row already makes for an absent
+        # cpus_per_node, rather than a bare "GPU:" or silence.
+        shown = [str(gpu_n)] if gpu_n else []
+        if gpus:
+            shown.append(f"[{','.join(gpus)}]")
+        label += " \u00b7 GPU:" + (" ".join(shown) if shown else "?")
     return label
 
 
@@ -344,9 +398,7 @@ def _rank_partitions(
     return sorted(parts, key=key)
 
 
-def _parse_custom_flags(
-    raw: str, reassembled: list[tuple[str, str]] | None = None
-) -> list[str]:
+def _parse_custom_flags(raw: str, reassembled: list[tuple[str, str]] | None = None) -> list[str]:
     """Parse custom #SBATCH flags from free-form input into one flag per entry.
 
     Options are separated by spaces or commas, so ``--exclusive --reservation=abc``
@@ -377,7 +429,7 @@ def _parse_custom_flags(
     parts: list[str] = []
     for tok in tokens:
         if tok.startswith("#SBATCH"):
-            tok = tok[len("#SBATCH"):]
+            tok = tok[len("#SBATCH") :]
         # A comma that introduces the next flag (one followed by a dash)
         # separates options; a comma inside a value (a node list) survives.
         parts.extend(p.strip().rstrip(",") for p in re.split(r",(?=\s*-)", tok))
@@ -391,17 +443,36 @@ MEM_PER_CPU_CHOICES = ["1G", "2G", "4G", "8G", "2000M"]
 # Suggestions only — the field is free-text. "cpu"/"gpu" are the mandatory
 # node-type features on Perlmutter-style sites, which is why --constraint exists.
 CONSTRAINT_CHOICES = ["cpu", "gpu", "bigmem", "haswell", "knl"]
-TIME_CHOICES = ["01:00:00", "02:00:00", "04:00:00", "08:00:00", "12:00:00",
-                "24:00:00", "48:00:00", "7-00:00:00"]
+TIME_CHOICES = [
+    "01:00:00",
+    "02:00:00",
+    "04:00:00",
+    "08:00:00",
+    "12:00:00",
+    "24:00:00",
+    "48:00:00",
+    "7-00:00:00",
+]
 SBATCH_FLAGS = [
-    "--exclusive", "--exclude=", "--nodelist=", "--reservation=",
-    "--ntasks=", "--ntasks-per-node=", "--threads-per-core=",
-    "--mem-per-cpu=", "--constraint=", "--licenses=", "--gres=",
-    "--tmp=", "--hint=", "--signal=",
+    "--exclusive",
+    "--exclude=",
+    "--nodelist=",
+    "--reservation=",
+    "--ntasks=",
+    "--ntasks-per-node=",
+    "--threads-per-core=",
+    "--mem-per-cpu=",
+    "--constraint=",
+    "--licenses=",
+    "--gres=",
+    "--tmp=",
+    "--hint=",
+    "--signal=",
 ]
 
 
 # ── Step definitions ─────────────────────────────────────────────────────
+
 
 class Step:
     key: str
@@ -433,69 +504,160 @@ class Step:
 STEPS: list[Step] = [
     Step("job_name", "Job name", "text", subtitle="A name for your Slurm job", required=True),
     Step("partition", "Partition", "partition"),
-    Step("account", "Account", "autocomplete",
-         subtitle="Slurm account to charge",
-         fetch=fetch_user_accounts),
-    Step("qos", "QoS", "select", subtitle="Quality of Service",
-         choices=["Default (none)"], default="Default (none)",
-         fetch=lambda part: fetch_qos_for_partition(part)),
-    Step("cpus", "CPU cores", "text",
-         subtitle="Number of CPU cores per task", default="4",
-         validate=lambda v: v.strip().isdigit() and int(v) > 0),
-    Step("memory", "Memory", "autocomplete",
-         subtitle="Total memory per node (--mem) — e.g. 16G, 32G, 64000M",
-         validate=validate_memory, default="16G",
-         choices=MEMORY_CHOICES),
-    Step("mem_per_cpu", "Memory per CPU", "autocomplete",
-         subtitle="--mem-per-cpu, e.g. 2G — overrides Memory when set (optional, blank = use Memory)",
-         validate=validate_memory, default="",
-         choices=MEM_PER_CPU_CHOICES),
-    Step("time_limit", "Time limit", "autocomplete",
-         subtitle="e.g. 30 (minutes), 5:00 (mm:ss), hh:mm:ss, d-hh:mm:ss, d-hh",
-         validate=validate_time, default="02:00:00",
-         choices=TIME_CHOICES),
-    Step("nodes", "Nodes", "text", subtitle="Number of nodes", default="1",
-         validate=lambda v: v.strip().isdigit() and int(v) > 0),
-    Step("ntasks_per_node", "Tasks per node", "ntasks_per_node",
-         subtitle="Tasks per node (optional, for multi-node)", default="1",
-         validate=lambda v: not v.strip() or (v.strip().isdigit() and int(v) > 0)),
-    Step("gpus", "GPUs", "autocomplete",
-         subtitle="Number of GPUs — type any number (suggestions: 0, 1, 2, 4, 8)",
-         choices=["0", "1", "2", "4", "8"], default="0",
-         validate=lambda v: v.strip().isdigit()),
+    Step(
+        "account",
+        "Account",
+        "autocomplete",
+        subtitle="Slurm account to charge",
+        fetch=fetch_user_accounts,
+    ),
+    Step(
+        "qos",
+        "QoS",
+        "select",
+        subtitle="Quality of Service",
+        choices=["Default (none)"],
+        default="Default (none)",
+        fetch=lambda part: fetch_qos_for_partition(part),
+    ),
+    Step(
+        "cpus",
+        "CPU cores",
+        "text",
+        subtitle="Number of CPU cores per task",
+        default="4",
+        validate=lambda v: v.strip().isdigit() and int(v) > 0,
+    ),
+    Step(
+        "memory",
+        "Memory",
+        "autocomplete",
+        subtitle="Total memory per node (--mem) — e.g. 16G, 32G, 64000M",
+        validate=validate_memory,
+        default="16G",
+        choices=MEMORY_CHOICES,
+    ),
+    Step(
+        "mem_per_cpu",
+        "Memory per CPU",
+        "autocomplete",
+        subtitle="--mem-per-cpu, e.g. 2G — overrides Memory when set (optional, blank = use Memory)",
+        validate=validate_memory,
+        default="",
+        choices=MEM_PER_CPU_CHOICES,
+    ),
+    Step(
+        "time_limit",
+        "Time limit",
+        "autocomplete",
+        subtitle="e.g. 30 (minutes), 5:00 (mm:ss), hh:mm:ss, d-hh:mm:ss, d-hh",
+        validate=validate_time,
+        default="02:00:00",
+        choices=TIME_CHOICES,
+    ),
+    Step(
+        "nodes",
+        "Nodes",
+        "text",
+        subtitle="Number of nodes",
+        default="1",
+        validate=lambda v: v.strip().isdigit() and int(v) > 0,
+    ),
+    Step(
+        "ntasks_per_node",
+        "Tasks per node",
+        "ntasks_per_node",
+        subtitle="Tasks per node (optional, for multi-node)",
+        default="1",
+        validate=lambda v: not v.strip() or (v.strip().isdigit() and int(v) > 0),
+    ),
+    Step(
+        "gpus",
+        "GPUs",
+        "autocomplete",
+        subtitle="Number of GPUs — type any number (suggestions: 0, 1, 2, 4, 8)",
+        choices=["0", "1", "2", "4", "8"],
+        default="0",
+        validate=lambda v: v.strip().isdigit(),
+    ),
     Step("gpu_type", "GPU type", "gpu_type", subtitle="GPU hardware type"),
     Step("gpu_format", "GPU format", "gpu_format", subtitle="Format style for GPU requests"),
-    Step("constraint", "Node constraint", "autocomplete",
-         subtitle="Node feature / Slurm -C, e.g. cpu, gpu, bigmem ('&' = and, '|' = or) (optional)",
-         choices=CONSTRAINT_CHOICES),
-    Step("array_spec", "Array specification", "text",
-         subtitle="e.g. 1-10, 1,3,5-7%4 (optional)",
-         # Every other resource field validates as you type; this one was
-         # free-text, so a reversed range or a zero step was only caught later at
-         # the summary. Empty is valid — the field is optional.
-         validate=validate_array_spec),
-    Step("output_dir", "Output directory", "text",
-         subtitle="Directory for stdout/stderr logs (optional)", default="logs", path=True),
-    Step("output_file", "Output file", "text",
-         subtitle="Log name: %j = job ID, %A/%a = array job/task (optional; blank = auto). Bare name gets .out; .err derived", path=True),
-    Step("custom_sbatch", "Custom #SBATCH flags", "autocomplete",
-         subtitle='e.g. --exclusive --reservation=abc  (space/comma-separated; quote a value with spaces: --comment="my run")',
-         choices=SBATCH_FLAGS),
-    Step("modules", "Modules", "autocomplete",
-         subtitle="Enter a name, press Enter to add (comma auto-inserted); Tab to advance when done",
-         fetch=fetch_available_modules),
-    Step("env_type", "Environment type", "select",
-         subtitle="Environment activation strategy",
-         choices=["None (skip)", "Conda", "Mamba", "Virtualenv (venv)"],
-         default="None (skip)"),
-    Step("env_name", "Environment name/path", "autocomplete",
-         subtitle="Conda environment name or virtualenv path",
-         default=""),
-    Step("command", "Command to run", "text",
-         subtitle="e.g. python train.py  (Enter=next, Ctrl+J=newline, Tab=complete)",
-         required=True, multiline=True, path=True),
-    Step("review", "Review & Submit", "review",
-         subtitle="Review your job configuration before submitting"),
+    Step(
+        "constraint",
+        "Node constraint",
+        "autocomplete",
+        subtitle="Node feature / Slurm -C, e.g. cpu, gpu, bigmem ('&' = and, '|' = or) (optional)",
+        choices=CONSTRAINT_CHOICES,
+    ),
+    Step(
+        "array_spec",
+        "Array specification",
+        "text",
+        subtitle="e.g. 1-10, 1,3,5-7%4 (optional)",
+        # Every other resource field validates as you type; this one was
+        # free-text, so a reversed range or a zero step was only caught later at
+        # the summary. Empty is valid — the field is optional.
+        validate=validate_array_spec,
+    ),
+    Step(
+        "output_dir",
+        "Output directory",
+        "text",
+        subtitle="Directory for stdout/stderr logs (optional)",
+        default="logs",
+        path=True,
+    ),
+    Step(
+        "output_file",
+        "Output file",
+        "text",
+        subtitle="Log name: %j = job ID, %A/%a = array job/task (optional; blank = auto). Bare name gets .out; .err derived",
+        path=True,
+    ),
+    Step(
+        "custom_sbatch",
+        "Custom #SBATCH flags",
+        "autocomplete",
+        subtitle='e.g. --exclusive --reservation=abc -C bigmem  (space/comma-separated; quote a value with spaces: --comment="my run")',
+        choices=SBATCH_FLAGS,
+    ),
+    Step(
+        "modules",
+        "Modules",
+        "autocomplete",
+        subtitle="Enter a name, press Enter to add (comma auto-inserted); Tab to advance when done",
+        fetch=fetch_available_modules,
+    ),
+    Step(
+        "env_type",
+        "Environment type",
+        "select",
+        subtitle="Environment activation strategy",
+        choices=["None (skip)", "Conda", "Mamba", "Virtualenv (venv)"],
+        default="None (skip)",
+    ),
+    Step(
+        "env_name",
+        "Environment name/path",
+        "autocomplete",
+        subtitle="Conda environment name or virtualenv path",
+        default="",
+    ),
+    Step(
+        "command",
+        "Command to run",
+        "text",
+        subtitle="e.g. python train.py  (Enter=next, Ctrl+J=newline, Tab=complete)",
+        required=True,
+        multiline=True,
+        path=True,
+    ),
+    Step(
+        "review",
+        "Review & Submit",
+        "review",
+        subtitle="Review your job configuration before submitting",
+    ),
 ]
 
 
@@ -628,13 +790,25 @@ class Wizard:
         # the rendered height equal to the logical line count, so the review step
         # can size this card snugly to its content (see _content). The full,
         # untruncated value is always visible in the Final Script card alongside.
+        # Both review panels WRAP. They used to clip, silently and mid-string, on
+        # the one screen whose whole job is "check this before it is submitted".
+        # Measured on a 120-column terminal with an ordinary job: the summary read
+        # `Output directory /home/youzhi/slu`, `Modules python/anaconda-` and
+        # `Command python train.py ` while the script showed
+        # `#SBATCH --output=/home/youzhi/slurmwatch/logs/spec` -- three answers and
+        # two directives cut with nothing on screen to say so. At 90 columns the
+        # summary column is 22 cells and five of twelve values were cut.
+        self._review_line_widths: list[int] = []
         self._review_config_window = Window(
             FormattedTextControl(self._render_review_config),
-            wrap_lines=False, dont_extend_height=True, style=_STAGE_BG,
+            wrap_lines=True,
+            dont_extend_height=True,
+            style=_STAGE_BG,
         )
         self._review_script_window = Window(
             FormattedTextControl(self._render_review_script, focusable=True),
             style=_STAGE_BG,
+            wrap_lines=True,
         )
 
         self._build_app()
@@ -712,9 +886,12 @@ class Wizard:
             buf = self._focused_buffer()
             # On non-multiline steps, Enter first applies an active completion
             # rather than advancing; multiline accepts completions with Tab.
-            if not getattr(s, "multiline", False) and buf is not None \
-                    and buf.complete_state is not None \
-                    and buf.complete_state.current_completion is not None:
+            if (
+                not getattr(s, "multiline", False)
+                and buf is not None
+                and buf.complete_state is not None
+                and buf.complete_state.current_completion is not None
+            ):
                 buf.apply_completion(buf.complete_state.current_completion)
                 if s.key == "modules":
                     buf.insert_text(", ")
@@ -755,8 +932,11 @@ class Wizard:
         def _cc(event: Any) -> None:
             raise KeyboardInterrupt
 
-        @kb.add("c-j", eager=True,
-                filter=Condition(lambda: getattr(self.current_step, "multiline", False)))
+        @kb.add(
+            "c-j",
+            eager=True,
+            filter=Condition(lambda: getattr(self.current_step, "multiline", False)),
+        )
         def _newline(event: Any) -> None:
             # Ctrl+J inserts a literal newline on the multiline command step.
             # (Shift+Enter can't be distinguished from Enter by the terminal.)
@@ -974,6 +1154,7 @@ class Wizard:
     def _coerce(self, val: str, s: Step) -> Any:
         if s.key == "job_name":
             from .builder import sanitize_job_name
+
             return sanitize_job_name(val)
         if s.key == "cpus":
             return int(val) if val else self._default_int("cpus", 4)
@@ -1034,8 +1215,16 @@ class Wizard:
         # where it is. Unlike ``job_name``/``partition``/``command``, which keep
         # ``""`` below, this field is not in ``main._REQUIRED_FIELDS``, nothing
         # flags it when empty, and its subtitle offers no default.
-        if s.key in ("account", "array_spec", "gpu_type", "gpu_format", "constraint",
-                     "output_dir", "output_file", "env_name"):
+        if s.key in (
+            "account",
+            "array_spec",
+            "gpu_type",
+            "gpu_format",
+            "constraint",
+            "output_dir",
+            "output_file",
+            "env_name",
+        ):
             return val or None
         return val
 
@@ -1046,8 +1235,16 @@ class Wizard:
     # checked, so a problem introduced earlier (e.g. GPUs on a CPU-only
     # partition) keeps showing after you move past that step.
     _VALIDATED_KEYS = frozenset(
-        {"cpus", "memory", "time_limit", "nodes", "ntasks_per_node", "gpus",
-         "gpu_type", "gpu_format"}
+        {
+            "cpus",
+            "memory",
+            "time_limit",
+            "nodes",
+            "ntasks_per_node",
+            "gpus",
+            "gpu_type",
+            "gpu_format",
+        }
     )
 
     def _cached_max_array(self, array_spec: Any) -> int | None:
@@ -1065,7 +1262,7 @@ class Wizard:
         if "max_array_size" not in self.transient:
             try:
                 self.transient["max_array_size"] = fetch_max_array_size()
-            except Exception as e:      # a probe failure must not break a redraw
+            except Exception as e:  # a probe failure must not break a redraw
                 logger.debug(f"max array size lookup failed: {e}")
                 self.transient["max_array_size"] = None
         cached = self.transient.get("max_array_size")
@@ -1126,6 +1323,7 @@ class Wizard:
             elif self._is_select_active():
                 live[s.key] = self._radio_value()
         from .system_utils import validate_job_config
+
         return validate_job_config(
             live,
             extra_gpu_types=self._cached_gpu_types(),
@@ -1221,7 +1419,9 @@ class Wizard:
                 self._setup_ntasks_per_node(direction)
             elif getattr(s, "multiline", False):
                 self.multiline_text_area.text = str(prev or self._step_default(s) or "")
-                self._set_multiline_completer(self._path_completer if getattr(s, "path", False) else None)
+                self._set_multiline_completer(
+                    self._path_completer if getattr(s, "path", False) else None
+                )
             else:
                 self.text_area.text = str(prev or self._step_default(s) or "")
                 self._set_completer(self._path_completer if getattr(s, "path", False) else None)
@@ -1267,7 +1467,9 @@ class Wizard:
 
     def _set_multiline_completer(self, completer: Completer | None) -> None:
         self.multiline_text_area.buffer.completer = completer  # type: ignore[assignment]
-        self.multiline_text_area.buffer.complete_while_typing = Condition(lambda: completer is not None)
+        self.multiline_text_area.buffer.complete_while_typing = Condition(
+            lambda: completer is not None
+        )
 
     def _setup_autocomplete(self, s: Step) -> None:
         choices = self._resolve_choices(s)
@@ -1304,14 +1506,15 @@ class Wizard:
             key = f"choices_qos_{self.answers.get('partition', '')}"
         if key in self.step_cache:
             from typing import cast
+
             return cast(list[str], self.step_cache[key])
         if s.fetch:
             try:
                 if s.key == "qos":
                     part = self.answers.get("partition", "")
-                    acl = fetch_qos_acl(part)    # AllowQos + DenyQos
+                    acl = fetch_qos_acl(part)  # AllowQos + DenyQos
                     raw = acl["allow"]
-                    known = fetch_known_qos()    # all QoS names, or [] if unknown
+                    known = fetch_known_qos()  # all QoS names, or [] if unknown
                     if any(str(q).upper() == "ALL" for q in raw):
                         # AllowQos=ALL is a sentinel ("any QoS allowed"), not a QoS
                         # name — offer every known QoS rather than intersecting
@@ -1389,8 +1592,7 @@ class Wizard:
             choices.extend(_fmt_partition(p) for p in ranked)
         elif all_parts:
             choices.extend(
-                _fmt_partition(p)
-                for p in _rank_partitions(all_parts, user_parts, system_parts)
+                _fmt_partition(p) for p in _rank_partitions(all_parts, user_parts, system_parts)
             )
         # Keep the resolved list for _set_partition_from_select to match against.
         self.transient["public_parts"] = ranked or public
@@ -1631,12 +1833,32 @@ class Wizard:
         self._review_scroll = 0
 
     def _review_max_scroll(self) -> int:
-        """Largest scroll offset that still keeps the last script line on screen."""
+        """Largest scroll offset that still keeps the last script line on screen.
+
+        Counted in WRAPPED ROWS, not in lines. The panel wraps now, so a long
+        `#SBATCH --output=` or `module load ... || { echo ...; }` line takes two
+        or three rows of the panel and `total_lines - visible` stopped short of
+        the end -- the tail of the script became unreachable, which is the same
+        "you cannot see what you are submitting" fault as the clipping itself.
+        With nothing wrapped every line is one row and this returns exactly what
+        the old arithmetic did.
+        """
         info = self._review_script_window.render_info
         # The panel title now lives in the card border (not inside the window), so
         # the whole window height is body — no header row to subtract.
-        visible = info.window_height if info else 0
-        return max(0, self._review_total_lines - max(1, visible))
+        visible = max(1, info.window_height if info else 0)
+        width = info.window_width if info else 0
+        widths = self._review_line_widths
+        if not width or len(widths) != self._review_total_lines:
+            return max(0, self._review_total_lines - visible)
+        rows = 0
+        offset = self._review_total_lines
+        for i in range(self._review_total_lines - 1, -1, -1):
+            rows += max(1, -(-widths[i] // width))  # ceil, an empty line still a row
+            if rows > visible:
+                break
+            offset = i
+        return offset
 
     # ── Layout ──────────────────────────────────────────────────────
 
@@ -1657,13 +1879,15 @@ class Wizard:
 
         return Layout(
             FloatContainer(
-                HSplit([
-                    Window(height=1),   # top margin — keep the header off the top edge
-                    self._header(),
-                    Window(height=1),   # breathing room between the header and the cards
-                    VSplit([self._sidebar(), self._content()], padding=1),
-                    self._footer(),
-                ]),
+                HSplit(
+                    [
+                        Window(height=1),  # top margin — keep the header off the top edge
+                        self._header(),
+                        Window(height=1),  # breathing room between the header and the cards
+                        VSplit([self._sidebar(), self._content()], padding=1),
+                        self._footer(),
+                    ]
+                ),
                 floats=floats,
             ),
             focused_element=focused,
@@ -1673,16 +1897,22 @@ class Wizard:
         # The brand sits in the header's teal (status-bar); the progress counter
         # on the right gets its own pink (status-meter) so the two ends of the bar
         # echo the banner's pink→cyan gradient instead of a single flat color.
-        return VSplit([
-            Window(
-                FormattedTextControl(self._render_header_left),
-                height=1, style="class:status-bar", dont_extend_height=True,
-            ),
-            Window(
-                FormattedTextControl(self._render_header_right),
-                height=1, style="class:status-meter", align=WindowAlign.RIGHT,
-            ),
-        ])
+        return VSplit(
+            [
+                Window(
+                    FormattedTextControl(self._render_header_left),
+                    height=1,
+                    style="class:status-bar",
+                    dont_extend_height=True,
+                ),
+                Window(
+                    FormattedTextControl(self._render_header_right),
+                    height=1,
+                    style="class:status-meter",
+                    align=WindowAlign.RIGHT,
+                ),
+            ]
+        )
 
     def _render_header_left(self) -> StyleAndTextTuples:
         # Two-tone brand: the name in the header's teal, the tagline dimmed.
@@ -1733,10 +1963,14 @@ class Wizard:
 
         error_control: list[Window] = []
         if self.step_cache.get("error"):
-            error_control.append(Window(
-                FormattedTextControl([("class:error", f"  \u2717 {self.step_cache['error']}")]),
-                wrap_lines=True, dont_extend_height=True, style=content_bg,
-            ))
+            error_control.append(
+                Window(
+                    FormattedTextControl([("class:error", f"  \u2717 {self.step_cache['error']}")]),
+                    wrap_lines=True,
+                    dont_extend_height=True,
+                    style=content_bg,
+                )
+            )
         # Persistent whole-config validation: every issue in the work-in-progress
         # script stays visible on every step, not just the one that introduced it.
         # Errors (a config Slurm will reject \u2014 e.g. GPUs on a CPU-only partition)
@@ -1745,10 +1979,14 @@ class Wizard:
         for level, msg in self._config_warnings():
             cls = "class:error" if level == "error" else "class:warning"
             icon = "\u2717" if level == "error" else "\u26a0"
-            error_control.append(Window(
-                FormattedTextControl([(cls, f"  {icon} {msg}")]),
-                wrap_lines=True, dont_extend_height=True, style=content_bg,
-            ))
+            error_control.append(
+                Window(
+                    FormattedTextControl([(cls, f"  {icon} {msg}")]),
+                    wrap_lines=True,
+                    dont_extend_height=True,
+                    style=content_bg,
+                )
+            )
 
         # The Review step is itself two side-by-side cards (Job Config | Script).
         if s.kind == "review":
@@ -1763,23 +2001,40 @@ class Wizard:
             # summary is centered vertically inside its card (flex spacers above and
             # below) — balanced breathing room instead of a block crammed at the top.
             config_body = HSplit([Window(), self._review_config_window, Window()])
-            return HSplit([
-                Window(FormattedTextControl([("class:subtitle", f"  {s.subtitle}\n")]),
-                       height=1, dont_extend_height=True),
-                Window(height=1),  # gap between the subtitle and the cards
-                VSplit([
-                    _card(config_body, "Job Configuration", color=_AMBER, width=D(weight=2)),
-                    _card(self._review_script_window, "Final Script", focused=True, width=D(weight=3)),
-                ], padding=1, height=D(preferred=body_h, max=body_h)),
-                Window(),  # spacer — keeps the footer pinned to the bottom
-            ])
+            return HSplit(
+                [
+                    Window(
+                        FormattedTextControl([("class:subtitle", f"  {s.subtitle}\n")]),
+                        height=1,
+                        dont_extend_height=True,
+                    ),
+                    Window(height=1),  # gap between the subtitle and the cards
+                    VSplit(
+                        [
+                            _card(
+                                config_body, "Job Configuration", color=_AMBER, width=D(weight=2)
+                            ),
+                            _card(
+                                self._review_script_window,
+                                "Final Script",
+                                focused=True,
+                                width=D(weight=3),
+                            ),
+                        ],
+                        padding=1,
+                        height=D(preferred=body_h, max=body_h),
+                    ),
+                    Window(),  # spacer — keeps the footer pinned to the bottom
+                ]
+            )
 
         # The current step: subtitle + input widget in one focused card, titled
         # with the step name. The blue focus ring marks it as the live field —
         # the one region that stays blue, since blue now means "your keys act here".
         subtitle_win = Window(
             FormattedTextControl([("class:subtitle", f" {s.subtitle}\n")]),
-            height=1, dont_extend_height=True,
+            height=1,
+            dont_extend_height=True,
         )
         if getattr(s, "multiline", False):
             widget: Any = self.multiline_text_area
@@ -1815,9 +2070,7 @@ class Wizard:
         wait before modules load and the script runs — rather than during the
         hardware steps, where it would keep shifting as choices change.
         """
-        modules_idx = next(
-            (i for i, s in enumerate(STEPS) if s.key == "modules"), len(STEPS)
-        )
+        modules_idx = next((i for i, s in enumerate(STEPS) if s.key == "modules"), len(STEPS))
         return self.idx >= modules_idx
 
     def _queue_panel(self) -> Window:
@@ -1830,18 +2083,63 @@ class Wizard:
         )
 
     def _render_queue_text(self) -> StyleAndTextTuples:
+        """The two-row queue strip: a reading when there is one, else "unknown".
+
+        Nothing about a partition this run could not describe is a measurement,
+        and a request Slurm has already refused has no wait time. The CLI summary
+        settled both (see :func:`~slurmate.main._show_script_and_summary`); this
+        strip did not, and the wizard is the surface that can reach the synthetic
+        blank partition object — it owns the "Enter partition name manually..."
+        row. Measured: with the partition unresolved, ``squeue -p <name>`` returns
+        no rows (or fails outright), which arrived here as a confident
+        ``0 running / 0 pending``, and a refused request's ``eta_seconds=0``
+        selected the under-an-hour GREEN for the word "never" — a check that never
+        ran, and a verdict of refusal, both rendered as a pass.
+
+        Said in one word rather than the summary's fuller ``unknown — <reason>``:
+        this strip is a fixed two rows, and a wrapped reason would push the ETA
+        line off the bottom. The reason is already on screen — the
+        ``Capacity limits NOT checked: ...`` warning from
+        :func:`~slurmate.system_utils.validate_job_config` sits directly above it
+        — and the controller's own words are printed by ``_note_scheduler_refusal``
+        on the way to submit.
+        """
         qinfo = self.transient.get("queue_info")
         if not qinfo or not self._past_hardware_config():
             return []
         part = self.transient.get("queue_info_part", "")
-        eta_sec = qinfo.get("eta_seconds", 0)
-        eta_color = f"fg:{_GREEN} bold" if eta_sec < 3600 else f"fg:{_AMBER} bold"
+        # ``_unknown`` covers all three reasons (absent / undescribed /
+        # unreadable): they differ in what to *say*, but not in whether these two
+        # rows are readings, which is the only question here.
+        unresolved = bool((self.answers.get("_partition_obj") or {}).get("_unknown"))
+        if unresolved or not qinfo.get("queue_known", True):
+            # queue_known is False when squeue failed or timed out; 0/0 would
+            # present a failed query as an idle queue.
+            depth = "unknown"
+        else:
+            depth = f"{qinfo.get('running', 0)} running / {qinfo.get('pending', 0)} pending"
+        if qinfo.get("feasible", True) is False:
+            eta = str(qinfo.get("eta_label") or "never")
+            # Amber, not red, for a refusal that clears on its own (a submit-count
+            # cap): that is a statement about the moment, not about the request.
+            # Same split the summary's ETA row makes, and for the same reason.
+            eta_color = (
+                f"fg:{_RED} bold"
+                if qinfo.get("refusal_is_permanent", True)
+                else f"fg:{_AMBER} bold"
+            )
+        elif unresolved:
+            eta, eta_color = "unknown", f"fg:{_AMBER} bold"
+        else:
+            eta = str(qinfo.get("eta_label", "now"))
+            eta_sec = qinfo.get("eta_seconds", 0)
+            eta_color = f"fg:{_GREEN} bold" if eta_sec < 3600 else f"fg:{_AMBER} bold"
         return [
             ("", "\n  "),
             ("class:preview-header", f"Queue status ({part}): "),
-            ("class:info", f"{qinfo.get('running', 0)} running / {qinfo.get('pending', 0)} pending   "),
+            ("class:info", f"{depth}   "),
             ("class:preview-header", "ETA: "),
-            (eta_color, f"{qinfo.get('eta_label', 'now')}\n"),
+            (eta_color, f"{eta}\n"),
         ]
 
     def _preview_panel(self) -> Window:
@@ -1869,8 +2167,24 @@ class Wizard:
         # Continuation lines of a multi-line value (e.g. a multi-command script)
         # line up under the value column instead of starting at column 0.
         indent = " " + " " * label_w + " "
+        # Wrap the value to the column it actually has, so a wrapped line keeps
+        # the alignment this label width exists to give it. `wrap_lines` on the
+        # window is the safety net for the FIRST frame, where `render_info` does
+        # not exist yet -- it wraps to column 0, which loses no value but does
+        # lose the alignment, and one frame later this is doing it properly.
+        info = self._review_config_window.render_info
+        budget = (info.window_width - len(indent)) if info else 0
         for label, val in items:
             parts = str(val).split("\n")
+            if budget > 4:
+                parts = [
+                    piece
+                    for part in parts
+                    for piece in (
+                        textwrap.wrap(part, budget, break_long_words=True, break_on_hyphens=False)
+                        or [""]
+                    )
+                ]
             out.append(("", f" {label:<{label_w}} "))
             out.append(("class:preview-text", f"{parts[0]}\n"))
             for cont in parts[1:]:
@@ -1895,8 +2209,11 @@ class Wizard:
         """Right column \u2014 the final script, manually scrolled by ``_review_scroll``."""
         lines = self._build_script_lines()
         self._review_total_lines = len(lines)
+        # Kept for `_review_max_scroll`, which has to know how many ROWS each line
+        # occupies now that the panel wraps.
+        self._review_line_widths = [sum(len(text) for _style, text in frags) for frags in lines]
         out: StyleAndTextTuples = []
-        for frags in lines[self._review_scroll:]:
+        for frags in lines[self._review_scroll :]:
             out.extend(frags)
             out.append(("", "\n"))
         return out
@@ -1940,6 +2257,7 @@ class Wizard:
         cached = self.transient.get("preview_lines")
         if cached is not None:
             from typing import cast
+
             return cast(StyleAndTextTuples, cached)
         ans: dict[str, Any] = {}
         for i in range(self.idx):

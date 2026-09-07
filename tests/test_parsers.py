@@ -32,11 +32,15 @@ def mock_run_command(cmd: list[str], timeout: int = 30) -> tuple[str, str, int]:
         ), "", 0
     # Match scontrol partitions details (both list all and specific partition show)
     if "scontrol" in cmd and "show" in cmd and "partition" in cmd:
-        part = None
-        for arg in cmd[3:]:
-            if arg != "-o":
-                part = arg
-                break
+        # Locate the name by the position of the "partition" keyword, not by a
+        # fixed argv index: a caller may pass flags before it, and the ACL
+        # readers do — `scontrol -a show partition <name> -o` is the only form
+        # that describes a Hidden=YES partition to a non-privileged user. Read
+        # from cmd[3:], the `-a` shifted every argument and the router picked
+        # the literal "partition" as the name, so a real query answered
+        # "Partition not found".
+        after = cmd[cmd.index("partition") + 1:]
+        part = next((a for a in after if not a.startswith("-")), None)
         scontrol_out = read_fixture("scontrol_partitions.txt")
         if part:
             for line in scontrol_out.splitlines():
