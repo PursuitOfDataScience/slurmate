@@ -47,9 +47,17 @@ _NOT_JOB_FIELDS = frozenset({
     "error", "gres", "gpus_per_node", "gpus_per_task",
 })
 
-BASE = dict(job_name="j", partition="p", cpus=4, memory="8G",
-            time_limit="01:00:00", command="python train.py", nodes=1,
-            output_dir="logs", env_type="conda")
+BASE = {
+    "job_name": "j",
+    "partition": "p",
+    "cpus": 4,
+    "memory": "8G",
+    "time_limit": "01:00:00",
+    "command": "python train.py",
+    "nodes": 1,
+    "output_dir": "logs",
+    "env_type": "conda",
+}
 
 
 def _normalised(config):
@@ -83,7 +91,7 @@ class TestTheEnvKeyReachesTheScript:
 
 class TestTheTwoTablesCannotDisagreeAgain:
     def test_one_is_the_inverse_of_the_other(self):
-        assert CONFIG_ARG_DESTS == {v: k for k, v in CONFIG_ALIASES.items()}
+        assert {v: k for k, v in CONFIG_ALIASES.items()} == CONFIG_ARG_DESTS
 
     def test_the_inversion_is_lossless(self):
         """Guard on the derivation itself: two CLI spellings mapping to one config
@@ -176,7 +184,7 @@ class TestTheMembershipRuleHoldsAgainstTheRealParser:
         adding a name to it. Every excluded flag must NOT be a config key."""
         for name in _NOT_JOB_FIELDS:
             assert name not in CONFIG_KEYS, name
-        assert _NOT_JOB_FIELDS <= set(self._job_field_flags()), sorted(
+        assert set(self._job_field_flags()) >= _NOT_JOB_FIELDS, sorted(
             _NOT_JOB_FIELDS - set(self._job_field_flags())
         )
 

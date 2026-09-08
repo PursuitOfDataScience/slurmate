@@ -103,7 +103,10 @@ class TestTheColouredPathWalksEveryLine:
 
     def test_each_art_line_carries_its_own_gradient_code(self):
         out = _render(colour=True)
-        for code, line in zip(theme.BANNER_GRADIENT, theme.BANNER_LINES):
+        # `strict=True`, not ruff's `strict=False`: the gradient and the art must
+        # carry the same number of lines, and a silent truncation here would
+        # test only the shorter of the two.
+        for code, line in zip(theme.BANNER_GRADIENT, theme.BANNER_LINES, strict=True):
             assert f"{code}{theme.c.BOLD}\033[3m{line}" in out, (code, line)
 
     def test_the_gradient_codes_are_distinct_so_i_is_load_bearing(self):

@@ -145,24 +145,34 @@ class TestControls:
         `11072501.95` -- a `time.monotonic()` value. `_PHASE_BUDGET` is where the
         figure lands, which is also what the "budget exceeded" message quotes.
         """
-        with mock.patch.dict(os.environ, {su._TOTAL_TIMEOUT_ENV: "12"}):
-            with su.slurm_deadline():
-                assert su._PHASE_BUDGET == 12.0
+        with (
+            mock.patch.dict(os.environ, {su._TOTAL_TIMEOUT_ENV: "12"}),
+            su.slurm_deadline(),
+        ):
+            assert su._PHASE_BUDGET == 12.0
         # ...and an unusable value still opens the phase, on the default.
-        with mock.patch.dict(os.environ, {su._TOTAL_TIMEOUT_ENV: "garbage"}):
-            with su.slurm_deadline():
-                assert su._PHASE_BUDGET == su.DEFAULT_TOTAL_TIMEOUT
+        with (
+            mock.patch.dict(os.environ, {su._TOTAL_TIMEOUT_ENV: "garbage"}),
+            su.slurm_deadline(),
+        ):
+            assert su._PHASE_BUDGET == su.DEFAULT_TOTAL_TIMEOUT
 
     def test_an_explicit_argument_still_beats_the_environment(self) -> None:
-        with mock.patch.dict(os.environ, {su._TOTAL_TIMEOUT_ENV: "99"}):
-            with su.slurm_deadline(total=7.0):
-                assert su._PHASE_BUDGET == 7.0
+        with (
+            mock.patch.dict(os.environ, {su._TOTAL_TIMEOUT_ENV: "99"}),
+            su.slurm_deadline(total=7.0),
+        ):
+            assert su._PHASE_BUDGET == 7.0
 
     def test_a_nested_phase_still_keeps_the_outer_deadline(self) -> None:
         # The documented rule: "a phase cannot extend its own budget by opening
         # another one."
-        with mock.patch.dict(os.environ, {su._TOTAL_TIMEOUT_ENV: "20"}):
-            with su.slurm_deadline() as outer:
-                with su.slurm_deadline(total=999.0) as inner:
-                    assert inner == outer
-                assert su._PHASE_BUDGET == 20.0
+        with (
+            mock.patch.dict(os.environ, {su._TOTAL_TIMEOUT_ENV: "20"}),
+            su.slurm_deadline() as outer,
+        ):
+            # This inner `with` stays nested on purpose: nesting is what the
+            # test is about, so merging it away would delete the subject.
+            with su.slurm_deadline(total=999.0) as inner:
+                assert inner == outer
+            assert su._PHASE_BUDGET == 20.0

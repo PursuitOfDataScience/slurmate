@@ -2141,10 +2141,13 @@ class TestCustomMemPerGpuSuppressesTheAutoDirective:
     def _script(self, **kw):
         from slurmate.builder import build_sbatch_script
 
-        base = dict(
-            job_name="j", partition="p", cpus=1, time_limit="00:10:00",
-            command="true",
-        )
+        base = {
+            "job_name": "j",
+            "partition": "p",
+            "cpus": 1,
+            "time_limit": "00:10:00",
+            "command": "true",
+        }
         base.update(kw)
         return build_sbatch_script(**base)
 
@@ -8116,8 +8119,8 @@ class TestTheMemoryAdviceNamesOnlyFormsSbatchTakes:
         assert named, "the advice names no forms at all"
         bad = [f for f in named if f not in self.ACCEPTED]
         assert bad == [], (
-            "the memory advice recommends %s, which sbatch answers "
-            '"Invalid --mem specification" for' % bad
+            f"the memory advice recommends {bad}, which sbatch answers "
+            '"Invalid --mem specification" for'
         )
 
     def test_the_advice_no_longer_presents_the_suffix_as_slurm_grammar(self):

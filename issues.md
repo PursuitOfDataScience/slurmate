@@ -674,6 +674,41 @@ GPU partition carries typed GRES, which is why the picker's own tests passed.
 
 ## Low severity
 
+### T3 — the lint gate checked `src/` only, while four sibling repos check their tests
+
+**Where:** `.github/workflows/ci.yml:31` (`ruff check src/`).
+
+Measured across the family: `nodetop` runs `ruff check src tests`; `rapidu`, `slurmpast` and
+`slurmwatch` all run `ruff check .`, which covers `tests/`. This repo was the only one whose test
+suite no linter ever saw, and twelve violations had accumulated there — **four pre-existing**
+(`test_cluster_portability.py` ×2, `test_ntasks_per_node_conflict.py` ×2) and **eight in test files
+added by recent rounds** (B905 ×1, SIM300 ×2, SIM117 ×4, C408 ×1).
+
+> **Fix — the gate now covers `tests/`, and the twelve are fixed.** Notes on three of them, because
+> they were judgement rather than mechanics:
+>
+> * **B905** was fixed with `strict=True`, not ruff's `strict=False`: the site zips
+>   `theme.BANNER_GRADIENT` against `theme.BANNER_LINES`, and if those ever differ in length the
+>   test should fail rather than silently check only the shorter. This makes the test stronger.
+> * **SIM117** merged three `with mock.patch.dict(...): with su.slurm_deadline():` pairs. The fourth,
+>   in `test_a_nested_phase_still_keeps_the_outer_deadline`, kept its inner `with` nested on purpose:
+>   nesting is what that test is about, so merging it away would delete the subject.
+> * **UP031's own fix introduced UP032.** Ruff rewrote `"..." % x` to `"...".format(x)`, which then
+>   tripped the f-string rule — the error count went 4 → 6 mid-fix. Both were then fixed to
+>   f-strings. Worth knowing that a `--fix` pass can raise the count.
+>
+> **The TYPE gate is deliberately not widened.** Measured: `mypy src/ tests/` reports **2360 errors
+> in 25 files**, because this suite is largely unannotated. Three siblings do type-check their
+> tests, so the gap is real, but closing it is a project rather than a lint fix — and faking it with
+> a blanket ignore would make the gate lie.
+>
+> **Verified:** `ruff check src/ tests/` clean, `mypy src/` clean, **2266 passed + 2 skipped**
+> (2268 collected). **Tests:** `test_lint_gate_covers_the_tests.py` (5) pins both the scope and that
+> the tests actually pass at it. Teeth: narrowing the workflow back reddens the scope test;
+> reintroducing the B905 violation reddens the cleanliness test. Three controls green in both
+> states (src still linted, the type gate still `src`-only, `src/` still clean alone).
+
+
 ### L1 — Stale `transient["gpu_types"]` after a partition change suppresses the live "GPU type not in partition list" error
 
 **Where:** `tui.py:801` passed `extra_gpu_types=self.transient.get("gpu_types")`; the

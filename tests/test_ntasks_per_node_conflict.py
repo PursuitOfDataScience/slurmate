@@ -27,20 +27,20 @@ from slurmate.builder import build_sbatch_script
 
 
 def _script(**kwargs):
-    base = dict(
-        job_name="t",
-        partition="amd",
-        cpus=1,
-        memory="4G",
-        time_limit="1",
-        account="rcc-staff",
-    )
+    base = {
+        "job_name": "t",
+        "partition": "amd",
+        "cpus": 1,
+        "memory": "4G",
+        "time_limit": "1",
+        "account": "rcc-staff",
+    }
     base.update(kwargs)
     return build_sbatch_script(**base)
 
 
 def _directives(script, flag):
-    return [ln for ln in script.splitlines() if ln.startswith("#SBATCH %s" % flag)]
+    return [ln for ln in script.splitlines() if ln.startswith(f"#SBATCH {flag}")]
 
 
 def test_the_auto_directive_gives_way_to_a_custom_ntasks():
