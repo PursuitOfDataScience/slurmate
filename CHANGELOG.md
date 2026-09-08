@@ -135,6 +135,27 @@ and want a version bump when they ship.
 - **The job summary omitted a directive the generated script emits.** A multi-node
   job with no explicit `--ntasks-per-node` had the automatic value written into the
   script but left out of the summary.
+- **The lint gate did not cover the test suite — in either of the two workflows
+  that run it.** `ruff check src/` was the whole lint scope, so twelve violations
+  had accumulated in `tests/` where nothing would ever report them — four
+  long-standing, eight in files added by recent work — and any change that
+  reformatted a test could add more silently. All four sibling packages lint their
+  own tests (`nodetop` runs `ruff check src tests`; `rapidu`, `slurmpast` and
+  `slurmwatch` run `ruff check .`), so this was the one repo that did not. The
+  twelve are fixed and both workflows now run `ruff check src/ tests/`.
+
+  *Both* is the part worth spelling out. GitHub cannot express `needs:` across
+  workflow files, so `release.yml` carries its own copy of the lint/type/test gate
+  instead of depending on `ci.yml`. Widening `ci.yml` on its own therefore left the
+  stricter scope applying to every push **except** the one that ships — the tag
+  push that uploads to PyPI, where the version is burned whether or not the code
+  works. A pin test now reads both files, so narrowing either one fails the suite.
+
+  The type gate is deliberately still `mypy src/` in both workflows.
+  `mypy src/ tests/` reports **2360 errors in 25 files** on this suite, because
+  the tests are largely unannotated. Closing that is a project of its own rather
+  than part of a lint fix, and reaching the wider scope by way of a blanket ignore
+  would make the gate lie about what it checks.
 
 ### Changed
 
