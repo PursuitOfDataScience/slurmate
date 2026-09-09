@@ -3,8 +3,10 @@
 An audit of the whole codebase at **v0.5.1**, and a record of how each finding was
 fixed in **v0.5.2**.
 
-**Status:** every finding below is **resolved** except two that were investigated
-and deliberately left alone (see [Withdrawn / not changed](#withdrawn--not-changed)).
+**Status:** every finding recorded before the "Audit 2026-09-09" section at the
+end of this file is **resolved** except two that were investigated
+and deliberately left alone (see [Withdrawn / not changed](#withdrawn--not-changed)). The
+2026-09-09 section holds the currently open findings.
 **L11** was the last one still open and is now fixed; its entry records the
 before/after and the one change inside `_print_indented` that it needed.
 Each entry has a **Fix** block saying what
@@ -1139,9 +1141,122 @@ interactive case — the only one a human sees — that was broken.
 > in both states: "the line carries some SGR" was true before too, because the
 > mangling was itself rich's highlighter colouring the digits.
 >
-> **Not fixed:** the other ten `c.*`-into-`console.print` sites listed at the end of
-> L11 have the identical defect. Same severity, out of scope for a round that was
-> asked for three groups.
+> **Fixed later, in T4 below:** the other ten `c.*`-into-`console.print` sites
+> listed at the end of L11 had the identical defect. That entry records the sweep
+> and the `ast` scan that now keeps an eleventh site from being added quietly.
+
+### T4 — the ten remaining `c.*`-into-`console.print` sites, and a scan so there is no eleventh
+
+H4 closed seven `Error:` lines that built their colour from `theme.c.RED` -- a raw
+SGR escape -- and handed the string to `rich`. Rich does not read ANSI in a `print`
+argument, so the bracketed part arrived as *text*, its repr highlighter styled the
+digits inside it, and the terminal drew a lone `ESC` followed by the visible
+characters `[38;2;255;0;0m` while the sentence itself was never coloured. L11's
+closing note listed the remaining ten by line and H4's own **Not fixed** block said
+they carried the identical defect, out of scope for a round asked for three groups.
+This is that sweep.
+
+**Where:** ten `err_console.print` calls, confirmed by the `ast.walk` scan L11
+predicted would find them (*"the scan that finds them is three lines of
+`ast.walk`"*) -- `main.py:270`, `314`, `468`, `505`, `756`, `761`, `782`, `786`,
+`797`, `800`. A single-line `grep` for the same thing returns **zero**: every one of
+the ten is a multi-line call with `c.RED`/`c.GRAY`/`c.YELLOW` on a continuation
+line, which is why the count has to come from the AST and not from a regex.
+
+> **Fixed** in three shapes, all pre-existing helpers, with the visible text
+> unchanged:
+>
+> - the five `Error:` lines (`314`, `468`, `756`, `782`, `797`) now go through
+>   `_print_issue(err_console, "error", ...)`, the same helper H4 routed its seven
+>   through;
+> - the two `Warning:`-coloured lines (`270`, `505`) go through `_print_indented`
+>   with `[yellow]` rather than `_print_issue`, deliberately: `_print_issue` would
+>   insert the word `Warning:`, which these two do not currently print, and this
+>   round is the escape defect and not a re-wording;
+> - the three dim detail lines (`761`, `786`, `800`) go through `_print_indented`
+>   with `[dim]`, which is what `_FORCE_NOT_ENFORCED` and `_TRANSIENT_QUALIFIER`
+>   already use for exactly this kind of note.
+>
+> **Two things came free.** Four of the ten hardcoded `✗` where the other six use
+> `theme.g.ERR` -- precisely the defect `_print_issue`'s docstring records for the
+> sites that hardcoded `⚠`, since `g` is what `--ascii` acts on. And every
+> interpolated value now passes through `rich.markup.escape`, so a field name or a
+> `--custom-sbatch` value containing `[...]` is displayed rather than parsed as
+> markup.
+>
+> **Tests:** `tests/test_raw_ansi_never_reaches_rich.py`. The first is the scan
+> itself -- no `*.print` call in `main.py` may interpolate a raw `c.<ATTR>` -- which
+> makes all ten load-bearing at once and cannot be evaded by adding an eleventh.
+> Two behavioural tests drive the `--ntasks-per-node` rejection with `FORCE_COLOR=1`
+> and assert that no escape reaches the screen as text and that the sentence really
+> carries `ESC[31m`; the second matters because "the line carries some SGR" was true
+> before the fix too, which is the trap H4's test recorded.
+>
+> **Teeth:** each of the ten restored individually -- ten runs, each failing the
+> scan, and the `468` one additionally failing both behavioural tests because it is
+> the site those drive. The three controls (the plain text is unchanged, the scan is
+> not a blanket ban on `theme.c`, and H4's own seven still render clean) pass in all
+> ten neutered states.
+>
+> **Invisible to the rest of the suite by construction:** every other test runs
+> under `NO_COLOR=1` or a pipe, where `theme.C.__getattribute__` returns `""` and
+> the line is plain -- so the plain text is identical before and after, and the
+> 2269-test suite neither noticed the defect nor notices the fix.
+>
+> **The scan was widened 2026-09-09, after tabulating its own coverage.** It reads
+> each print call's source, so it sees `console.print(f"{c.RED}x")` and misses the
+> one refactor a developer actually performs on a line that has grown too long:
+>
+> ```python
+> msg = f"  {c.RED}Error: ...{c.RESET}"
+> err_console.print(msg)
+> ```
+>
+> Four forms escaped it -- a variable, a `%`-formatted variable, `print(*parts)`
+> where `parts` is a list holding `c.RED`, and `getattr(c, "RED")`. Measured
+> against crafted snippets rather than read off the code. **The source is clean
+> under the wider scan (no indirect route in `main.py` today)**, so this closes a
+> guard hole rather than fixing a live defect.
+>
+> `_raw_ansi_reaching_print_via_a_variable` does a **one-hop** taint check, scoped
+> per function. One hop deliberately: a chain (`a = c.RED; b = a; print(b)`) is not
+> followed, because that is dataflow analysis and the point is to catch the
+> ordinary refactor. The limit is stated in the docstring rather than implied.
+> Teeth: removing the `getattr` clause fails only the `[getattr]` case; removing
+> the taint check fails all four. Seven controls -- four cry-wolf negatives, the
+> per-function scoping, the real source, and the original direct scan -- pass in
+> both states.
+
+### T5 — `ruff` and `mypy` had no upper bound, the last of the five packages with neither
+
+`ruff check src/ tests/` and `mypy src/` are gates in both workflows, so those two
+tools decide whether a push is green, and `pyproject.toml` pinned `ruff>=0.3.0` /
+`mypy>=1.8`. rapidu and slurmpast have carried ceilings with the reason inline for
+several rounds -- slurmpast's records the incident, *"a minor ruff release changing
+its rule defaults is exactly what broke the first CI run here"* -- and slurmwatch and
+nodetop were bounded in the two preceding rounds. slurmate was the last one open.
+
+Two mechanisms make it sharper here than elsewhere. `[tool.ruff.lint] select` names
+whole rule **families** (E, F, I, W, UP, B, C4, SIM), so every rule ruff adds to any
+of them is opted into by a version bump alone. And this is the only one of the five
+on `mypy --strict`, so a minor release that tightens a single strict-mode check
+reddens the entire type gate.
+
+> **Fixed:** `ruff>=0.15,<0.17`, `mypy>=1.8,<3`, matching the siblings, with the
+> reasoning inline. **Measured at both ends rather than declared:** CI resolves ruff
+> **0.16.6** and mypy **2.3.1** on a green run, and locally 0.15.18 / 2.1.0 leave
+> `ruff check src/ tests/` and `mypy src/` clean.
+>
+> **Tests:** `tests/test_gated_tools_are_bounded.py`, the same shape the two sibling
+> repos use -- an implication that fires only while the hazard exists ("a tool a gate
+> runs has an upper bound"), plus controls that the gate really runs, that a floor is
+> still declared, that `select` still names families, and that `strict = true` is
+> still set. The last two pin the *premise* of the comment, so if either changes the
+> stated reason gets re-read instead of silently outliving itself. Teeth: dropping
+> `<0.17` fails the `[ruff]` id, dropping `<3` fails the `[mypy]` id, and the seven
+> controls pass in both states.
+>
+> CI/packaging only, so no CHANGELOG entry -- logged here, as T3's gate widening was.
 
 ---
 
@@ -1554,6 +1669,17 @@ measurement disproved — recorded here so they aren't "re-fixed" later.
   `1-99` parses as 1 day + 99 hours. `25:99:99` is likewise accepted by Slurm while
   slurmate *rejects* it — the validator is already **stricter** than Slurm, not looser.
   Tightening the days-hours field would have rejected input Slurm honours.
+- **`TestAFatalSignalPutsTheTerminalBack._drive` does not need slurmwatch's pty fix.**
+  Measured 2026-09-09. slurmwatch had a sibling defect — a pty master whose last slave fd has
+  closed raises EIO and discards unread bytes, so a terminal-restore sequence written
+  microseconds before `os._exit` is lost — and fixed it by having the parent hold a slave fd of
+  its own. This helper was the obvious candidate for the same remedy and does not need it:
+  driven directly five times at load 7.1 under six busy loops it returned `alt=(1, 1)` and
+  `echo_canon=(True, True)` every time. Structurally it is the non-susceptible shape, because its
+  post-signal loop reads in 0.2 s slices *while* polling `waitpid(WNOHANG)` — it is already
+  draining as the child dies, unlike the slurmwatch helper that only began reading after the
+  kill. Not applied where the defect is absent. (The `alt: (1, 0)` red seen once in a full-suite
+  run has never been reproduced, so its mechanism is still unattributed.)
 - **Case-duplicated GPU types in the picker are correct.** `fetch_gpu_types_for_partition("test")`
   returning `['A100','H100','H200','L40S','a100','a30','a40','rtx6000','v100']` looks
   like a de-duplication wart, and I had it filed as one until the M6 measurement:
@@ -1627,3 +1753,600 @@ Verification beyond the unit suite:
   partition sub-mode unwind), and the answers always still build a script.
 - The mamba activation, the H1/H2/M5/P4 directives, and the count-only-GRES failure
   and its fix were each executed against real Slurm / a real clean shell, not inferred.
+
+---
+
+## Audit 2026-09-09 — post-0.7.1 working-tree findings (open)
+
+Six parallel audits (builder / system_utils / main / tui / theme+packaging+CI /
+test-lint-type run) over the working tree at `4cc10f7` (dirty — see git note at
+the end), followed by a triple-check pass in which every High and every
+builder/system_utils Medium below was **re-executed** by a second party under
+the `AI` env (Python 3.11.14, `PYTHONPATH=src`, `SLURMATE_MOCK=1` where noted);
+main/tui/theme items were executed by the auditing subagents, with the ones
+marked [re-ran] re-executed in the triple-check too. Baseline at audit time:
+**2294 passed, 2 skipped, 0 failed**; `ruff check src/ tests/` clean (0.15.18);
+`mypy src/` clean (2.1.0). Line references are to this tree
+(`builder.py` 1364 lines, `main.py` 2569, `system_utils.py` 4846, `tui.py` 2341,
+`theme.py` 386).
+
+Nothing below is fixed yet. Severity reflects likelihood × impact, as before.
+
+### High severity
+
+#### HH1 — Whitespace-only `constraint` crashes the builder with `IndexError` [re-ran]
+
+**Where:** `builder.py:1023-1024,1103-1108`.
+
+`if constraint:` tests truthiness, not stripped content, so `"   "` is kept;
+`_clean_constraint("   ")` returns `""`; the merge then filters to an empty
+`merged` list and indexes `merged[0]`:
+
+```python
+build_sbatch_script(job_name='j', partition='p', cpus=1, memory='1G',
+                    time_limit='01:00:00', constraint='   ', command='x')
+# IndexError: list index out of range
+```
+
+`""` is safe (falsy), only whitespace crashes (`"   "`, `"\n"`, `"\t"` all
+reproduced). Reachable from the wizard (free-text field), the CLI, or a config
+value. The summary for the same input does not crash — it renders a
+`('Constraint', '   ')` row — so the two surfaces disagree as well as one of
+them dying.
+
+#### HH2 — Failed queue read reports `now` with `feasible: True` [re-ran]
+
+**Where:** `system_utils.py:4185-4186` (`fetch_queue_eta`, Tier 3).
+
+When `squeue` cannot be read (`queue_rc != 0`), the function returns
+`_result(0, "unknown")`, and `_format_eta(0)` is `"now"`. Reproduced end to end
+with `squeue` mocked to rc=1 (scheduler probe and node-fit both unavailable):
+
+```python
+{'source': 'unknown', 'eta_seconds': 0, 'eta_label': 'now',
+ 'feasible': True, 'queue_known': False, 'running': 0, 'pending': 0}
+```
+
+The comment three lines above says Tier 3 is "deliberately never 0, because
+without resource data there is no evidence anything is actually free" — this
+branch violates it, and additionally reports fabricated `0 running / 0 pending`
+counts (the function goes to some length elsewhere to mark unread counts as
+not-a-reading). The tools-absent path just above correctly returns
+`eta_label: "unknown"`. A degraded controller therefore reads as "your job
+starts immediately".
+
+#### HH3 — The Review screen hides the validation it exists to show [re-ran]
+
+**Where:** `tui.py:1992-2029` (`_content`) vs `1964-1989` (`error_control`).
+
+The review branch early-returns `HSplit[subtitle, VSplit[config|script],
+spacer]` and never includes the `error_control` list built just above it, nor
+`self._queue_panel()` — both of which every other step renders (confirmed by
+reading `_content` in full: the review `return` contains neither). And
+`_confirm_and_next` on review (`tui.py:1007-1009`) just calls `_advance()`
+with no gate. So the comment at `1020-1022` ("Required fields are flagged at
+the final review instead of blocking navigation here") describes a screen that
+cannot show flags: blank `job_name`/`command` build fine
+(`build_from_answers` omits, no raise — verified) and `run()` returns them
+unconditionally. Downstream `main.build_and_show` re-validates before anything
+submits, so this is a TUI-contract hole rather than a silent-submit hole — but
+it is on the one screen whose job is checking.
+
+#### HH4 — Batch flags + pipe + no mode flag dies in an `EOFError` traceback [re-ran]
+
+**Where:** `main.py:2223` (`_require_terminal_for_wizard` guards only non-batch).
+
+```console
+$ slurmate --partition cpu-shared --command 'echo hi' < /dev/null
+…whole summary renders…
+EOFError (prompt_toolkit vt100 _attached_input traceback)
+```
+
+The batch-falls-through-to-menu path has no TTY guard. Should be a clean
+"needs a terminal, or `--yes`/`--print`/`--dry-run`" error instead of a
+traceback after a full summary.
+
+#### HH5 — `custom_sbatch = 123` (int in config) → raw `TypeError` traceback
+
+**Where:** `main.py:758` → `builder._normalize_custom_flags` (`builder.py:336-338`).
+
+The raw config value bypasses `_coerce_str` and the normaliser iterates the
+int: `TypeError: 'int' object is not iterable` (reproduced both directly and
+via the config path). Every sibling string field exits 1 with a clean
+`Error …` line; this one dumps a traceback on the batch path.
+(`_normalize_custom_flags(["#SBATCH --exclusive"])` → `['--#SBATCH
+--exclusive']` and `_normalize_custom_flags(123)` crashing are the same
+unguarded-input family — see MH-batch below.)
+
+### Medium severity — builder emits a malformed or silently-wrong script
+
+All reproduced via `build_sbatch_script` / `build_from_answers` [all re-ran].
+
+#### MH6 — Custom flags with a quote but no whitespace are never quoted
+
+**Where:** `builder.py:193-207` (`_quote_custom_flag`) vs `127-171`
+(`_quote_sbatch_value`, used only for output/error paths).
+
+```python
+custom_sbatch=["--comment=a\"b"]  # -> #SBATCH --comment=a"b   (bare)
+custom_sbatch=["--comment=a'b"]   # -> #SBATCH --comment=a'b   (bare)
+```
+
+The project's own measured `SLURM_QUOTE_RULE` (unmatched quote = whole script
+refused, rc=1) was fixed for `--output`/`--error` only. An ordinary apostrophe
+(`o'brien`) reproduces the fatal shape through the custom-flag path.
+
+#### MH7 — Non-path directives are never quoted either
+
+**Where:** `builder.py:945-950,957-958,977-990,994,1081-1090,1109,1112`.
+
+```python
+partition="a'b"          # -> #SBATCH --partition=a'b
+partition="My Partition" # -> #SBATCH --partition=My Partition  (splits)
+qos="high priority"      # -> #SBATCH --qos=high priority
+memory="16'G"            # -> #SBATCH --mem=16'G
+gpus=2, gpu_type="a100 v100"  # -> #SBATCH --gres=gpu:a100 v100:2
+```
+
+Same fatal/split class as MH6. Space-containing partition names are invalid
+input anyway, but the quote case kills even valid-intent scripts.
+
+#### MH8 — Whitespace-only / empty-string numerics emit empty directives
+
+**Where:** `builder.py:945-950,957-958,979-994,1111-1112`.
+
+```python
+partition='   '  # -> #SBATCH --partition=
+account='   '    # -> #SBATCH --account=
+qos='   '        # -> #SBATCH --qos=
+array_spec='   ' # -> #SBATCH --array=  (+ wrongly triggers the %A_%a tag)
+cpus=""          # -> #SBATCH --cpus-per-task=
+ntasks_per_node=""  # -> #SBATCH --ntasks-per-node=  (is-not-None passes)
+memory="   "     # -> #SBATCH --mem=
+time_limit="   " # -> #SBATCH --time=
+```
+
+The guards test truthiness, not stripped content, against the comment's stated
+intent at `940-942` ("omit empty…"). Summaries omit the `CPUs`/`Memory` rows
+for the same inputs, so script and summary disagree too.
+
+#### MH9 — Auto `--ntasks-per-node=1` duplicates a custom `--ntasks-per-node` [re-ran]
+
+**Where:** `builder.py:993-995` + `job_summary_rows:713-718`.
+
+```python
+nodes=4, custom_sbatch=["--ntasks-per-node=2"]
+# script contains BOTH --ntasks-per-node=1 AND --ntasks-per-node=2
+# summary says '1 (automatic for a multi-node job)' (effective: 2, last-wins)
+```
+
+The fallback is suppressed only for custom `--ntasks`, not custom
+`--ntasks-per-node` — the combination the new M8 summary arm was written for,
+now misreported by it. The duplicate-sweep test matrix does not cover this
+combo.
+
+#### MH10 — A `#SBATCH` leader in `command` is emitted verbatim
+
+**Where:** `builder.py:1230-1232` (emit) vs `442-466` (`command_injects_directives`).
+
+```python
+command='#SBATCH --qos=INJECTED\necho hi'
+# -> blank line, then #SBATCH --qos=INJECTED, then echo hi  (detector fires, builder ignores)
+```
+
+Without modules/env lines the directive region continues, so the injected
+directive is obeyed (the detector's docstring cites a measured
+`Access/permission denied` for a bad QoS) — silently overriding the
+partition/QoS the summary shows and bypassing the `managed_custom_flags`
+check.
+
+#### MH11 — `gpu_type=' Any '` renders a typed request; unknown `gpu_format` drops the type [re-ran]
+
+**Where:** `builder.py:1043-1046,1054-1062` + `723-732`.
+
+```python
+gpus=2, gpu_type=' Any '  # -> #SBATCH --gres=gpu:Any:2  (should be gpu:2)
+gpus=2, gpu_type='a100', gpu_format='bogus'
+# script: #SBATCH --gres=gpu:2  (type silently dropped!)
+# summary: {'GPUs': '2 × a100', 'GPU format': 'bogus'}  (claims the dropped type)
+```
+
+The any-test runs before strip/fold, and an unknown format falls into the
+`else` auto branch instead of erroring — scheduling on the wrong GPU while the
+summary disagrees.
+
+#### MH12 — Empty custom flags suppress the auto directive, then emit a malformed one [re-ran]
+
+**Where:** `builder.py:562-563,968-969,1039,1127-1130,1161`.
+
+```python
+output_path='logs/j-%j.out', custom=['--output=']
+# -> only #SBATCH --output=  (good auto suppressed, malformed survivor)
+constraint='cpu', custom=['--constraint=']
+# -> #SBATCH --constraint=cpu AND #SBATCH --constraint=
+custom=['-o ']  # -> #SBATCH -o  (valueless; auto suppressed)
+```
+
+`_has_custom_flag` (output/error) checks the name only; `_custom_mem_override`
+ignores empties — inconsistent with each other, wrong in both directions.
+
+#### MH13 — `env_type`/`env_name` non-strings crash when both are set [re-ran]
+
+**Where:** `builder.py:1190-1191,1201,1223-1225`.
+
+```python
+env_type=123, env_name='myenv'  # -> AttributeError: 'int' has no 'lower'
+env_name=123, env_type='conda'  # -> TypeError (shlex.quote)
+env_name=123, env_type='venv'   # -> AttributeError ('rstrip')
+```
+
+Precision: a bare `env_type=123` with no `env_name` is correctly ignored (the
+`if env_name:` guard) — the crash needs both, i.e. exactly the stringy-config
+shape the neighbouring fields (`gpus`/`nodes`/`gpu_type`/`modules`) already
+coerce. (Checked against the earlier draft's broader claim.)
+
+#### MH14 — `estimate_su` crashes on stringy/None inputs its sibling tolerates [re-ran]
+
+**Where:** `builder.py:1300-1301,1348`.
+
+`estimate_su("4","01:00:00",1)`, `(4,"01:00:00","2")`, `(4,"01:00:00",None)`
+all → `TypeError`, while `estimate_gpu_hours` coerces (`int(gpus)`,
+`max(1, nodes or 1)`). Library callers handing the builder's own coerced
+fields crash on the cost path.
+
+#### MH15 — A boolean custom flag swallows the next value-token [re-ran]
+
+**Where:** `builder.py:266-273` (`_normalize_custom_flags`).
+
+```python
+["--exclusive", "/some/path"]  # -> ['--exclusive /some/path']
+["--exclusive", "4"]           # -> ['--exclusive 4']
+# emitted as #SBATCH --exclusive 4  (stray token; sbatch rejects)
+```
+
+Any non-option-like token attaches to *any* open `prev`, including booleans
+deliberately absent from `_VALUE_TAKING_FLAGS` — creating an invalid directive
+out of two valid inputs.
+
+#### MH16 — Padded `Default (none)` QoS breaks the directive and shows a row [re-ran]
+
+**Where:** `builder.py:949-950` + `649-651`.
+
+`qos=' Default (none) '` → `#SBATCH --qos=Default (none)` (space splits,
+unquoted) plus a `('QoS', ' Default (none) ')` summary row; the exact
+`'Default (none)'` is correctly omitted in both. Padding defeats the sentinel
+comparison.
+
+### Medium severity — system_utils parsing / validation / ETA
+
+All reproduced [all re-ran].
+
+#### MS1 — `_parse_gpu_count` / `_sum_node_gpus` count `mps`/`shard` slices as GPUs
+
+**Where:** `system_utils.py:722-744` and `3635,3642-3645`.
+
+```python
+_parse_gpu_count("gpu:mps:2") == 2            # docstring says slices ignored
+_parse_gpu_count("gpu:a100:2,gpu:mps:2") == 4 # expected 2
+_sum_node_gpus("gpu:mps:2") == 2
+```
+
+Inflates `gpus_per_node` → false "exceeds limit" warnings and false
+`capacity_refusal` positives on MPS/shard sites.
+
+#### MS2 — `mem_per_cpu × cores` diverges between validation and ETA
+
+**Where:** `system_utils.py:2047` vs `4022-4028`.
+
+Validate multiplies by `cpus × max(1, ntasks_per_node)`; `resolve_request_mem_mb`
+uses bare `cpus`. Same answers (`cpus=8, ntasks=4, mem_per_cpu=8G`):
+validation warns on `8G × 32 cores = 262144 MB`, ETA costs 65536 MB —
+underestimating by the `ntasks` factor on the figure the user checks before
+submitting something expensive.
+
+#### MS3 — Custom `--mem-per-gpu` is never checked and resolves to 0
+
+**Where:** `system_utils.py:2073-2082,4014-4031`.
+
+`validate_job_config({"memory":"16G",
+"custom_sbatch":["--mem-per-gpu=100G"], …}) == []` and
+`resolve_request_mem_mb(…)` returns 0 — a 100 GB/GPU request on a small node
+is silent in validation *and* in the ETA.
+
+#### MS4 — `validate_job_config` never validates the time shape; `-5` misclassified
+
+**Where:** `system_utils.py:2105-2139` (no `validate_time()` call).
+
+`time_limit="abc"` with a partition object → `[]` (silent);
+`time_limit="-5"` → `('warning', 'Time limit (-5) exceeds partition limit
+(02:00:00)')` instead of invalid. Root assist from `_safe_int` dropping the
+sign (`_safe_int("-5")==5`, so `_parse_slurm_time_to_minutes("-5")==300.0` —
+`system_utils.py:366-368,881-897`, reproduced).
+
+#### MS5 — Array limit compares top *index*, not task *count*
+
+**Where:** `system_utils.py:1078-1103,1940-1950`.
+
+`_max_array_index("1-1001")==1001`, `("0-1000")==1000`, `("1,3,5")==5` — so at
+`MaxArraySize=1001`, `1-1001` (1001 tasks) warns while `0-1000` (1001 tasks)
+is silent, and `1,3,5` (3 tasks) warns. Slurm limits task count.
+
+#### MS6 — `P`-unit triad is inconsistent; `validate_*` crash on `None`
+
+**Where:** `system_utils.py:416` vs `466`; `452,549`.
+
+`_parse_mem_to_mb("16P")==17179869184` but `validate_memory("16P")==False`
+while `normalize_memory("16P")=="16P"` (a value that fails validation but
+normalises into a doomed directive; `resolve_request_mem_mb` then returns 0).
+Separately, `validate_memory(None)` / `validate_time(None)` → `AttributeError`
+on `.strip()` (the neighbouring `time_request_is_unbounded` already handles
+`None` via `str(value or "")`).
+
+#### MS7 — `fetch_gpu_types` underscore→dash fold emits an unrequestable GRES
+
+**Where:** `system_utils.py:778,2448-2449`.
+
+`_detect_gpu_type("", "gpu:rtx_6000:2") == "rtx-6000"`, while the file itself
+documents at `2920-2924` that `--gres=gpu:rtx-6000:2` is refused on such a
+site. Related case-sensitivity asymmetry: the H2 feature-only check compares
+exact (`2306`) while the constraint mirror folds (`2336`), so
+`gpu_type="A100"` against `feature_only=["a100"]` misses the
+"use-constraint" error the lowercase spelling gets.
+
+#### MS8 — `_sbatch_log_path` misses glued `-oPATH`; keeps quotes+comment
+
+**Where:** `system_utils.py:4301,4326-4329`.
+
+`_sbatch_log_path("#SBATCH -o/logs/out") == ""` and `"#SBATCH -elogs/err" ==
+""` (sbatch accepts the glued short form) → `submit_sbatch` never `mkdir`s
+that dir and the job can fail on a missing directory;
+`_sbatch_log_path('#SBATCH --output="/a b/%j.out" # comment')` returns
+`'"/a b/%j.out" # comment'` (quotes + comment kept — no inline-comment
+strip). Companion: with `$HOME` unresolvable, `submit_sbatch` (`4218`) would
+`makedirs("./~/logs")` — `check_log_dirs` (`1578-1587`) has the
+`unexpanded_home` guard, the submit path does not (reproduced by reading both
+paths; the `expanduser`-no-op → relative-`~` sequence verified).
+
+#### MS9 — `submit_sbatch` bypasses the phase deadline and drops success-stderr
+
+**Where:** `system_utils.py:4228-4244,4253`.
+
+Direct `subprocess.run(..., timeout=30)` instead of `_run_command`/`_budget`
+(the interactive `slurm_deadline()` bounds every other query), a hardcoded 30
+vs the 20/`_ADVISORY_TIMEOUT` the probes use, and `return rc, stdout, ""` on
+success — discarding site-plugin warnings. No `shell=True` anywhere (checked —
+list argv only, `shlex.quote` on the fixed `bash -lc` fragments), so this is
+robustness, not injection.
+
+### Medium severity — main (CLI / config / gates)
+
+#### MM1 — `--print`/`--dry-run` print `✗ Error` but exit 0 [re-ran]
+
+**Where:** `main.py:2291-2297` (`fatal` only from `site_check_issues`, never
+`_partition_issues`); `--dry-run` never exits nonzero for post-script findings.
+
+`--print --partition cpu-shared --gpus 2` prints `✗ Error: Partition
+'cpu-shared' does not support GPUs`, emits the script, rc 0 (reproduced). Any
+CI gating on the exit code passes a script `--yes` refuses.
+
+#### MM2 — `--force` is downgraded on one of three render sites [re-ran]
+
+**Where:** `run_batch::_check_cluster_targets` downgrades, but
+`build_and_show` (`1279-1282`) and `--print` (`2293-2295`) re-render red.
+
+`--force --print --partition NOSUCH` shows `⚠ Warning: no partition …`
+immediately followed by `✗ no partition …` on the same screen (reproduced).
+
+#### MM3 — `--force --yes` still refuses unknown partition/account (rc 1) [re-ran]
+
+`_hard_errors` feeds the `--yes` gate (`2400`) with no force exemption,
+against the gate's own comment (`2389-2393`) describing cross-cluster submit
+under `--force`. Either the comment or the gate is wrong; today `--force`
+cannot do the documented thing. (Reproduced: `--force --yes --partition
+NOSUCH` → rc 1. Note the wizard banner then still renders — untidy but
+secondary.)
+
+#### MM4 — GPU-spelling conflicts silently first-win [re-ran]
+
+**Where:** `main.py:2156-2165` (errors only on count mismatch).
+
+`--gpus a100:2 --gres gpu:h100:2` → `gpus=2, gpu_type=a100,
+gpu_format=gpus`, rc 0 — the `h100` request silently dropped (reproduced).
+Format disagreements behave the same. Two spellings of one number with
+different types should refuse like differing counts do.
+
+#### MM5 — `gpu:2` parses inconsistently across flags [re-ran]
+
+`parse_gpu_spelling("--gres","gpu:2") == (2,'')` but
+`("--gpus-per-node","gpu:2") == (2,'gpu')` and `("--gpus","gpu:2") ==
+(2,'gpu')` (reproduced directly). The `gpu:` prefix is stripped for `--gres`
+and kept as a *type* elsewhere, producing `gpu:gpu:2`-shaped directives and a
+bogus model name downstream.
+
+#### MM6 — Config-path leniency that the CLI hard-refuses
+
+Each verified; grouped because the shape is one: the config path warns (or
+stays silent) where the CLI refuses, and batch mode keeps going.
+
+- `gpu_type`/`gpu_format`/`job_name` bypass `_coerce_str` (`478-484,734`):
+  `gpu_type=['a100']` emits `#SBATCH --gres=gpu:['a100']:1`, rc 0
+  (reproduced); `job_name=['x','y']` is mangled through `str()`.
+- `modules=123` / dict → `mods=None` via the `else` fallthrough (`648-658`),
+  silent; `custom_sbatch` dict iterates keys and passes vacuously, silent.
+- Config `env_type='docker'` flows through `_coerce_str` only: script
+  contains **no** activation line (just a `logger.warning`), rc 0
+  (reproduced) — a job that fails on first import where the CLI spelling is a
+  hard refusal.
+- Bad numerics warn-and-continue with the default (`_coerce_int`, `254-291`
+  — read in full; the "using {default}" fallback is explicit): config
+  `cpus='8cores'` proceeds with the default, so a `--yes` run can submit a
+  wrong-sized job off a warning nobody reads in batch mode.
+- Inferred `--gpus type:count` format beats an explicit config `gpu_format`
+  (verified end-to-end by the audit; structurally,
+  `_resolve_gpu_spellings` runs at `2207` before `load_config()` at `2217`,
+  so the derived spelling is already on `args` when the file value arrives).
+- CLI-only spellings rejected as config keys: `mem`, `output`,
+  `cpus-per-task` → "unknown key" + dropped. README claims "a key copied
+  from `--help` does what it looks like it does" — over-broad (only the three
+  documented aliases plus dashed forms hold); the `output`→`output_dir`
+  suggestion should be `output_file`, and `gpus-per-node` suggests
+  `ntasks_per_node`.
+
+#### MM7 — Five advisory sites keep the literal-indent wrap bug
+
+`_warn_missing_required` (`1176`), `_note_mock_mode` (`1391`),
+`_note_default_partition` (`1403`), `_note_config_source` (`1423`),
+`_note_defaulted_memory` (`1450/1456`) — verified at width 60 with
+continuation lines at column 0. Same defect class `_print_indented` was built
+for; these call sites never adopted it. (Rich-markup safety itself is solid —
+every user-controlled interpolation sampled in `_print_indented`,
+`_print_issue`, `_note_scheduler_refusal` and the summary rows is escaped.
+The stacked-panel `print()` at `1636` bypassing a redirected `Console`, and
+`_save_script` (`1684-1716`) overwriting without an existence check, are real
+but Low.)
+
+### Medium severity — tui
+
+#### MT1 — `--exclude=node1, node2` loses the comma [re-ran]
+
+`tui.py:435` + `builder._join_flag_values`: `shlex.split` yields
+`['--exclude=node1,', 'node2']`, the trailing comma is rstripped, and the
+second token folds with a space: `['--exclude=node1 node2']` (reproduced; the
+no-space spelling round-trips). Emits `#SBATCH --exclude=node1 node2`, not a
+valid Slurm list.
+
+#### MT2 — `_fmt_partition` crashes on `mem_per_node_mb=None` [re-ran]
+
+`tui.py:343`: `p.get("mem_per_node_mb",0)//1024` → `TypeError` on `None`
+(reproduced). Real rows are ints, but the `_get_partition` fallback uses `0`
+and any site returning `None` kills the fullscreen picker.
+`cpus_per_node=None` does not crash (prints `None CPU`) — inconsistent.
+
+#### MT3 — Failed queue refetch leaves the old partition's ETA on screen
+
+`tui.py:1398-1416` (`_on_enter_step`) vs `2107-2143` (`_render_queue_text`).
+On exception `queue_info`/`queue_info_part`/`queue_info_key` are left
+untouched, so the next render labels old-partition measurements with the new
+partition (reproduced by the audit by driving a fetch failure across a
+partition switch). Should clear or mark `queue_known=False`.
+
+#### MT4 — Preview lags warnings by one confirm; Back commits highlight
+
+`tui.py:2262-2269` vs `1318-1324`: `_config_warnings` overlays the
+current-field live text for `_VALIDATED_KEYS`, but `_render_preview_text`
+builds only committed `answers[i<idx]` — typing `2` on the `gpus` step warns
+`does not support GPUs` while the preview shows no `gres` (reproduced). And
+`_go_back` on selects (`1088-1091`) saves the moved highlight before stepping
+back — except `gpu_type`/select (`1092-1098`), which deliberately save nothing
+— so arrow-then-Esc silently changes QoS/account on some steps and no-ops on
+others (reproduced for `qos`).
+
+#### MT5 — Partition-fetch failure is a silent CUSTOM-only picker
+
+`tui.py:1562-1575,1589-1599`: `except: public,all_parts=[],…`, choices
+`[CUSTOM]`, only `logger.debug` (reproduced by forcing `fetch_partitions` to
+raise). Quiet is right for optional lookups (QoS/account/modules), wrong for
+"this cluster has 0 partitions". Companion staleness (Low): answered
+QoS/gpu_type survive a partition change until re-confirmed
+(`1496-1498,1726-1728`) — the partition-keyed caches keep this from
+suppressing errors, but the ETA key and mid-flow warnings read stale for a
+few steps.
+
+### Low severity + structural (kept short; code refs verified)
+
+- **Builder:** `~/logs` expanded in the script but raw in the summary
+  (`786-792` vs `749-755`, reproduced); whitespace `output_dir` summary says
+  "not used" while the script means current-directory (`418-423`, reproduced);
+  `env_name` newline not folded while modules are — spans physical lines
+  inside single quotes (`1179` vs `1201`, reproduced; direct RCE unlikely,
+  malformed script certain); `cpus=0`/`nodes=0` emitted verbatim while the
+  estimator treats 0 as 1; two custom `--gres` lines both emitted;
+  `job_name_change_note`'s `not safe` arm unreachable (fallback guarantees
+  non-empty). Suspected, needs a Slurm box: `\v\f\t` survive
+  `_fold_directive`; `%%a` in `output_file` false-positives the per-task
+  detection.
+- **system_utils:** heterogeneous GPU message always says "smallest" though
+  `gpus_per_node` is a max (`2149-2153` vs `2500`); multi-row merge keeps the
+  first `timelimit`/`state` while summing nodes (`2457-2500`); heterogeneity
+  missed when rows differ with no `+`; `fetch_public_partitions` drops rows
+  with no `AllowAccounts` field; `_sbatch_log_path` has no inline-comment
+  strip (see MS8); `check_log_dirs` vets superseded directives while
+  `effective_log_path` keeps last; `_CLUSTER_CACHE` never expires in a
+  long-lived wizard (accounts/QoS/features); two independent full `scontrol`
+  dumps per run (`fetch_public_partitions` + `fetch_system_partitions`);
+  `slurm_deadline(total=0)` bypasses the `total_timeout()` validation.
+  `has_gpu` regex misses bare `gpu` (`2453` — suspected; live `%G` is almost
+  always `gpu:N`).
+- **main:** abbreviated `--custom-sbatch` (`--custom …`) bypasses the `=`-form
+  hint (`1872` exact-match); `_check_custom_sbatch_form` over-refuses values
+  argparse accepts (`-1`, `--`); ambiguous prefixes (`--o`, `--gpus-p`, `--n`)
+  exit 2 under default `allow_abbrev`; empty `--gpus ""` silently falls back
+  to the config value (cannot clear from CLI); no `-n`/`--ntasks` flag
+  (deliberate — Slurm's `-n` is `--ntasks`, which has no option — but users
+  copying Slurm lines hit a wall); `_is_batch_mode` is wrong pre
+  `_resolve_gpu_spellings` (`--gres` not in `_BATCH_FLAGS`); `_edit_script_in_editor`
+  unguarded `unlink` + unvalidated empty edit.
+- **tui:** review layout pushes the footer off-screen when content exceeds
+  terminal height; `_review_scroll` unclamped on enlarge; picker
+  `f"{name:<12}"` breaks on long names (reproduced —
+  `very-long-partition-name-exceeding` runs into the counts); style is
+  hardcoded dark truecolor with no `NO_COLOR`/`TERM`/light-bg probe
+  (`91-129` vs `theme.py:169-179`); no non-TTY guard in `tui.run()` (guard
+  lives in `main`); synchronous Slurm probes on every step entry (no wizard
+  deadline — `main.py:2238-2240` deliberately opens none); `#SBATCH`
+  prefix-strip is case-sensitive (`#sbatch` fabricates a flag).
+- **theme/packaging/CI/docs:** `rich>=13.0` is unbounded while
+  `_should_use_color`'s `NO_COLOR`/`FORCE_COLOR`/`TERM` rules only textually
+  match one rich generation's — piped spot-checks on the installed rich
+  15.0.0 agreed in the cases executed, so this is recorded as a parity
+  *risk* (Low), not a confirmed split; `C` caches the colour decision per
+  instance while `print_banner` mixes a fresh decision with cached escapes
+  (`209-225` vs `307`); banner animation `sys.stdout.isatty()` unguarded
+  against `ValueError` (`314`); `--ascii` leaves the subtitle em-dash and
+  `Dry run —` (`theme.py:338,340`, `main.py:2361`); `_FORCE_ASCII` has no
+  conftest reset; 3.14 classifier claimed but CI tests 3.10–3.13; release
+  gate tests only 3.10+3.13 with older actions and no `SLURMATE_MOCK`
+  pin-test coverage beyond ruff/mypy lines; `conftest` does not clear
+  `SLURMATE_ASCII`/`NO_BANNER`/`BANNER_ANIMATE`/`TIMEOUT`/`HOME`/`TMPDIR`/`COLUMNS`
+  (the repo's own history is "green here, red in CI" from exactly this);
+  env truthiness is four different rules (`theme._env_flag` strips and
+  accepts `on`; mock/no-save do not; `tui` debug enables on `"0"`); `float()`
+  accepts `inf`/`nan` for `SLURMATE_TIMEOUT` with no warning — the text says
+  no setting removes the budget, `inf` is one; README still says
+  `ruff check src/` (gate is `src/ tests/`), env table omits
+  `SLURMATE_ASCII`/`SLURMATE_TIMEOUT`; README accuracy test is parse-only;
+  raw-ANSI scan pins only `main.py`; mock-forced suite structurally hides
+  the next real-cluster bug by construction (compensated by fixtures, which
+  is where the last two divergences bit).
+- **Corrections to the interim report (triple-check):** the `env_type`
+  non-string crash needs `env_name` set (bare `env_type=123` is correctly
+  ignored); the `A5` inconsistency was re-verified at the `parse_gpu_spelling`
+  level (`(2,'')` vs `(2,'gpu')`); the `C3` `--force --yes` refusal was
+  re-verified (rc 1) but the wizard banner rendering afterwards makes the
+  visible symptom noisier than "still refuses" alone.
+
+### Areas checked and found solid (triple-check additions)
+
+- No `shell=True` in `system_utils` (list argv only; fixed `bash -lc`
+  fragments use `shlex.quote`); locale handling deliberate (`utf-8/replace`
+  for reads, `surrogateescape` for the submit side); `0600`-on-create verified
+  for the saved script (overwrite preserves mode, documented); `../evil` job
+  names sanitise inside the target dir; federated `id;cluster` ids parse.
+- `_coerce_int`'s bool/fractional-float leniency is deliberate and warned
+  (read in full) — the finding above (MM6) is that warning-and-continuing is
+  the wrong default for `--yes` batch mode, not that the coercion is
+  accidental.
+- `sanitize_job_name` strips `/`, collapses whitespace, falls back to
+  `slurm` (`../../etc/passwd` → `etcpasswd`, verified by the audit).
+- `_VALUE_TAKING_FLAGS` covers the value-taking `SBATCH_FLAGS` set
+  (`--exclusive` correctly absent) — MH15 is about the *open-prev*
+  attachment, not set coverage.
+
+### Git note
+
+Working tree at audit time: `M CHANGELOG.md, issues.md, pyproject.toml,
+src/slurmate/main.py` plus untracked
+`tests/test_gated_tools_are_bounded.py`,
+`tests/test_raw_ansi_never_reaches_rich.py`, on `master @ 4cc10f7`. The
+`main.py` modification postdates the last commit, so MM-line references
+should be re-anchored after `git diff` review before fixing.

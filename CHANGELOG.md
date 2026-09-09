@@ -13,6 +13,33 @@ and want a version bump when they ship.
 
 ### Fixed
 
+- **Ten error, warning and detail lines printed their own colour code as visible
+  text on a colour terminal.** They built the colour from `theme.c.RED` and
+  friends — a raw ANSI escape — and handed the finished string to `rich`, which
+  does not read ANSI in a `print` argument. So `\x1b[38;2;255;0;0m` was not a
+  colour: rich treated the bracketed part as text, its highlighter styled the
+  digits inside it, and what reached the terminal was a stray `ESC` followed by
+  the characters `[38;2;255;0;0m` — while the sentence itself came out
+  uncoloured. Seven sites of the same defect were fixed earlier; these are the
+  remaining ten, found the way the earlier entry predicted they would have to be
+  (an AST scan — a line-based `grep` finds none of them, because every one is a
+  multi-line call with the escape on a continuation line).
+
+  Affected the `--ntasks-per-node`, `--custom-sbatch`, `--array` and config-key
+  rejections, the `gpu_format` warning, and three explanatory detail lines. All
+  ten now go through the same two helpers every other line in the file uses, so
+  what reaches rich is markup. The wording is unchanged.
+
+  Two smaller things went with it. Four of the ten hardcoded `✗` where the rest
+  take the glyph from the theme, so `--ascii` did not apply to them; it does now.
+  And every value interpolated into these messages is escaped, so a field name or
+  a `--custom-sbatch` value containing square brackets is shown rather than
+  swallowed as markup.
+
+  Only ever visible interactively: under `NO_COLOR`, or when output is piped, the
+  colour helper returns an empty string and these lines were always plain — which
+  is why a suite of 2269 tests never saw it.
+
 - **Indented status lines were padded out to the terminal with spaces.** Every
   message printed through `_print_indented` — twelve call sites then, sixteen
   after the entry below, including the

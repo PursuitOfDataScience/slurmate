@@ -267,9 +267,11 @@ def _coerce_int(value: Any, default: int, *, field: str | None = None,
 
     def _reject(reason: str) -> int:
         if field and err_console is not None:
-            err_console.print(
-                f"  {c.YELLOW}{g.WARN} {field} value {value!r} {reason}; "
-                f"using {default}{c.RESET}"
+            _print_indented(
+                err_console,
+                f"[yellow]{g.WARN} "
+                + escape(f"{field} value {value!r} {reason}; using {default}")
+                + "[/]",
             )
         return default
 
@@ -311,9 +313,10 @@ def _coerce_str(value: Any, default: str | None, *, field: str,
         return value
     if isinstance(value, (int, float)):  # bool is an int subclass — str() is fine
         return str(value)
-    err_console.print(
-        f"  {c.RED}{g.ERR} Error: {field} must be a string "
-        f"(got {type(value).__name__}){c.RESET}"
+    _print_issue(
+        err_console,
+        "error",
+        f"{field} must be a string (got {type(value).__name__})",
     )
     sys.exit(1)
 
@@ -465,9 +468,10 @@ def _run_batch(args: argparse.Namespace, console: Console,
             # error naming the original value — not _coerce_int's "using 0",
             # which would then trip the positive-int guard below with a
             # confusing "got 0" that never echoes what the user wrote.
-            err_console.print(
-                f"  {c.RED}{g.ERR} Error: --ntasks-per-node must be a positive integer "
-                f"(got {raw_ntasks!r}){c.RESET}"
+            _print_issue(
+                err_console,
+                "error",
+                f"--ntasks-per-node must be a positive integer (got {raw_ntasks!r})",
             )
             sys.exit(1)
 
@@ -502,9 +506,11 @@ def _run_batch(args: argparse.Namespace, console: Console,
     if gpu_format is not None:
         gpu_format = str(gpu_format).lower()
         if gpu_format not in _GPU_FORMATS:
-            err_console.print(
-                f"  {c.YELLOW}{g.WARN} Unknown gpu_format {gpu_format!r}; "
-                f"using 'gres_type'{c.RESET}"
+            _print_indented(
+                err_console,
+                f"[yellow]{g.WARN} "
+                + escape(f"Unknown gpu_format {gpu_format!r}; using 'gres_type'")
+                + "[/]",
             )
             gpu_format = "gres_type"
 
@@ -753,16 +759,23 @@ def _run_batch(args: argparse.Namespace, console: Console,
     if ambiguous:
         for name, value in ambiguous:
             head, _, tail = value.partition(" ")
-            err_console.print(
-                f"  {c.RED}\u2717 Error: --custom-sbatch {name}={head} is "
+            _print_issue(
+                err_console,
+                "error",
+                f"--custom-sbatch {name}={head} is "
                 f"followed by {tail!r}, which cannot be an sbatch option "
-                f"(no leading dash).{c.RESET}"
+                f"(no leading dash).",
             )
-            err_console.print(
-                f"  {c.GRAY}Two readings, and slurmate will not choose: "
-                f"--custom-sbatch='{name}=\"{value}\"' if it is part of the "
-                f"value, or --custom-sbatch='{name}={head} "
-                f"--{tail.split()[0]}' if it is another flag.{c.RESET}"
+            _print_indented(
+                err_console,
+                "[dim]"
+                + escape(
+                    f"Two readings, and slurmate will not choose: "
+                    f"--custom-sbatch='{name}=\"{value}\"' if it is part of the "
+                    f"value, or --custom-sbatch='{name}={head} "
+                    f"--{tail.split()[0]}' if it is another flag."
+                )
+                + "[/]",
             )
         sys.exit(1)
 
@@ -779,14 +792,16 @@ def _run_batch(args: argparse.Namespace, console: Console,
                 if owner == name
                 else f"Use {owner} instead."
             )
-            err_console.print(
-                f"  {c.RED}\u2717 Error: --custom-sbatch carries {name}, which "
-                f"slurmate manages. {advice}{c.RESET}"
+            _print_issue(
+                err_console,
+                "error",
+                f"--custom-sbatch carries {name}, which slurmate manages. {advice}",
             )
-        err_console.print(
-            f"  {c.GRAY}(A second #SBATCH line for the same directive would win "
-            f"over slurmate's, leaving the summary and the ETA describing a "
-            f"partition/account the job will not use.){c.RESET}"
+        _print_indented(
+            err_console,
+            "[dim](A second #SBATCH line for the same directive would win "
+            "over slurmate's, leaving the summary and the ETA describing a "
+            "partition/account the job will not use.)[/]",
         )
         sys.exit(1)
 
@@ -794,12 +809,11 @@ def _run_batch(args: argparse.Namespace, console: Console,
     # reversed range or a zero step is refused by the controller ("Invalid job
     # array specification") after a script that looked fine.
     if array_spec and not validate_array_spec(str(array_spec)):
-        err_console.print(
-            f"  {c.RED}\u2717 Error: {array_spec_reason(str(array_spec))}{c.RESET}"
-        )
-        err_console.print(
-            f"  {c.GRAY}Expected forms: 1-10, 0-9, 1,3,5, 1-10:2, 1-10%4 "
-            f"(a range must not run backwards and a step must be > 0).{c.RESET}"
+        _print_issue(err_console, "error", array_spec_reason(str(array_spec)))
+        _print_indented(
+            err_console,
+            "[dim]Expected forms: 1-10, 0-9, 1,3,5, 1-10:2, 1-10%4 "
+            "(a range must not run backwards and a step must be > 0).[/]",
         )
         sys.exit(1)
     command = _coerce_str(args_command if args_command is not None else config.get("command", ""),

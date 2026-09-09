@@ -45,8 +45,21 @@ dev = [
     "pytest>=7.0",
     "pytest-mock>=3.10",
     "pytest-cov>=4.0",
-    "ruff>=0.3.0",
-    "mypy>=1.8",
+    # Both bounded on purpose, and this was the last of the five packages with
+    # neither ceiling. `[tool.ruff.lint] select` names whole rule FAMILIES -- E,
+    # F, I, W, UP, B, C4, SIM -- not individual codes, so every rule ruff adds to
+    # any of them is opted into by a version bump alone, and `ruff check src/
+    # tests/` decides whether a push is green. slurmate is also the only one of
+    # the five on `mypy --strict` (see `[tool.mypy] strict = true`), which makes
+    # the type checker the sharper of the two risks here: a minor release that
+    # tightens one strict-mode check reddens a tree nobody touched. slurmpast's
+    # pin records the sibling incident -- "a minor ruff release changing its rule
+    # defaults is exactly what broke the first CI run here". Measured: CI resolves
+    # ruff 0.16.6 and mypy 2.3.1 on a green run, and locally 0.15.18 / 2.1.0 leave
+    # `ruff check src/ tests/` and `mypy src/` clean, so the range is verified at
+    # both of its ends rather than declared.
+    "ruff>=0.15,<0.17",
+    "mypy>=1.8,<3",
     "build>=1.0",
     "twine>=5.0",
 ]
