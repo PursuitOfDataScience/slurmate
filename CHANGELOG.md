@@ -5,11 +5,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.7.2] — 2026-09-09
 
-Covers the working tree since 0.7.0. Note that `pyproject.toml` already reads
-**0.7.1**, which has no entry of its own — the fixes below are unreleased either way
-and want a version bump when they ship.
+Covers the work since 0.7.0. **0.7.1 has no entry of its own** and this is not an
+omission that can be repaired here: it shipped (tag `v0.7.1`, and it is on PyPI),
+but its release commit never touched this file, so its three fixes — the
+`--ntasks-per-node`/`--custom-sbatch=--ntasks` conflict, `FORCE_COLOR=""`, and the
+release gate — are recorded only in that commit's message. The entries below are
+the work since, and they are why the number moves to 0.7.2 rather than reusing a
+version that is already public.
 
 ### Fixed
 

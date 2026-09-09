@@ -1679,7 +1679,14 @@ measurement disproved — recorded here so they aren't "re-fixed" later.
   post-signal loop reads in 0.2 s slices *while* polling `waitpid(WNOHANG)` — it is already
   draining as the child dies, unlike the slurmwatch helper that only began reading after the
   kill. Not applied where the defect is absent. (The `alt: (1, 0)` red seen once in a full-suite
-  run has never been reproduced, so its mechanism is still unattributed.)
+  run has never been reproduced, so its mechanism is still unattributed. **Seen a second time
+  during the 0.7.2 release round**, 2026-09-09: `[HUP]` was the single red in a whole-suite run
+  at load average 13.4 — the highest this test has been observed to fail at — and it then passed
+  alone immediately after and passed a second whole-suite run at the same load. So the
+  full-suite-only split T1 was meant to close is not fully closed, it is rarer than the
+  ~1-in-1 it once was, and it remains a synchronisation question rather than anything about
+  `restore_terminal_on_fatal_signal`. Deliberately not skipped or xfailed: the assertion it
+  makes is the one that catches a vacuous pass.)
 - **Case-duplicated GPU types in the picker are correct.** `fetch_gpu_types_for_partition("test")`
   returning `['A100','H100','H200','L40S','a100','a30','a40','rtx6000','v100']` looks
   like a de-duplication wart, and I had it filed as one until the M6 measurement:
