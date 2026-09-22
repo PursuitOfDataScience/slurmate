@@ -1,7 +1,7 @@
 """The README, checked against the real parser.
 
 slurmate was the only one of the five sibling packages with no test touching its
-README at all — and it shows seven invocations, using the short forms `-J`, `-p`,
+README at all, and it shows seven invocations, using the short forms `-J`, `-p`,
 `-c`, `-G`, `-t` and `--mem`. Any of those could be renamed, or an example could
 pick up a flag that never existed, and nothing would notice: the suite is large
 but it exercises the parser through argument lists written in the tests, never
@@ -26,9 +26,24 @@ import shlex
 
 import pytest
 
+from slurmate.agent import VERBS, verb_parser
 from slurmate.main import parse_args
 
 README = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+
+
+def _parse(argv: list[str]) -> None:
+    """Parse one documented invocation the way the real entry point would.
+
+    `slurmate brief --json` is a subcommand, and `parse_args` declares no
+    positionals, so sending it there would fail for the wrong reason: not
+    "the README invented a flag" but "this is not that parser". `main`
+    dispatches on the first token before argparse runs, and so does this.
+    """
+    if argv and argv[0] in VERBS:
+        verb_parser(argv[0]).parse_args(argv[1:])
+    else:
+        parse_args(argv)
 
 
 def _invocations() -> list[tuple[str, list[str]]]:
@@ -81,7 +96,7 @@ def test_every_shown_command_parses(shown, argv):
     err = io.StringIO()
     try:
         with contextlib.redirect_stderr(err):
-            parse_args(argv)
+            _parse(argv)
     except SystemExit:
         message = err.getvalue().strip().splitlines()
         pytest.fail(
@@ -100,6 +115,11 @@ def _parser_flags() -> set[str]:
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.suppress(SystemExit):
         parse_args(["--help"])
+    # Each verb owns its own flags (`--script`, `--all-partitions`,
+    # `--install`), and they are just as much a promise the README makes.
+    for verb in VERBS:
+        with contextlib.redirect_stdout(out), contextlib.suppress(SystemExit):
+            verb_parser(verb).parse_args(["--help"])
     return set(re.findall(r"(--[a-z][a-z0-9-]+)", out.getvalue()))
 
 

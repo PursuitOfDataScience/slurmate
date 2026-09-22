@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 from collections.abc import Iterable, Iterator
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # These rows carry every key ``fetch_partitions`` produces, because a key a real
 # cluster always supplies and the fixture omits makes a whole check unreachable in
-# mock mode — and so in ``--demo`` and in the test suite. Two were missing and
+# mock mode, and so in ``--demo`` and in the test suite. Two were missing and
 # each hid a check that works live: no ``is_default`` on any row made the "no
 # --partition given, use the site default" path (with its own limit, queue, ETA
 # and memory consequences) unreachable, and no ``gpus_per_node`` meant a 99-GPU
@@ -46,7 +47,7 @@ MOCK_ACCOUNTS = ["my_lab", "training", "default"]
 
 _RUN_TIMEOUT = 30
 
-# Advisory cluster facts — the ones used only to *validate* or *enrich*, where a
+# Advisory cluster facts; the ones used only to *validate* or *enrich*, where a
 # failed lookup is already designed to fall through silently. Waiting the full 30 s
 # for one of those buys nothing: the answer will be discarded either way, and six
 # of them in series meant a hung controller froze a --dry-run for ~170 s with no
@@ -211,7 +212,7 @@ def _run_command(
 
 
 def is_mock() -> bool:
-    """Whether demo data is in force — public alias of :func:`_force_mock`.
+    """Whether demo data is in force: public alias of :func:`_force_mock`.
 
     Callers need this to *label* what they render. Synthetic partitions, queue
     depth and ETA presented with no marker are measurement-shaped fiction, and
@@ -223,12 +224,24 @@ def is_mock() -> bool:
 
 # Cluster facts that cannot change during one invocation: the partition name
 # list, the caller's accounts and QoS, node features, the select plugin and
-# MaxArraySize. Each is queried by more than one code path — the batch path's
-# fatal checks and the shared site checks both ask — so an uncached lookup ran
+# MaxArraySize. Each is queried by more than one code path (the batch path's
+# fatal checks and the shared site checks both ask), so an uncached lookup ran
 # `sacctmgr show assoc` twice per run, and the report notes sacctmgr is slow
-# enough on a busy controller to be worth skipping. Memoised per process; a
-# single slurmate run is short enough that staleness is not a concern.
+# enough on a busy controller to be worth skipping.
+#
+# "Memoised per process; a single slurmate run is short enough that staleness
+# is not a concern" is what this used to say, and `slurmate mcp` made it
+# false: an MCP server is one process that lives for the length of an editor
+# session. The volatile facts were never in here (partition capacity, node
+# states and queue depth are re-queried on every call, measured), but the
+# caller's *accounts* are, and a user granted a new one mid-session would go
+# on being told they cannot use that partition for as long as the server
+# runs. Hence :func:`cluster_cache_age`, which lets a long-lived caller
+# expire this; nothing expires it on the one-shot CLI path, where the
+# original reasoning still holds exactly.
 _CLUSTER_CACHE: dict[str, Any] = {}
+#: When the first fact landed in the cache, or None when it is empty.
+_CLUSTER_CACHE_STAMP: float | None = None
 
 
 # The last error Slurm itself gave for a cluster query. The report's RD-2/SW-7
@@ -253,14 +266,33 @@ def _note_cluster_error(stderr: str) -> None:
 
 
 def reset_cluster_cache() -> None:
-    """Forget memoised cluster facts (for tests, which vary the mocked output)."""
-    global _LAST_CLUSTER_ERROR
+    """Forget memoised cluster facts.
+
+    Used by the tests, which vary the mocked output, and by a long-lived
+    caller that has decided the snapshot is old enough to re-take.
+    """
+    global _LAST_CLUSTER_ERROR, _CLUSTER_CACHE_STAMP
     _CLUSTER_CACHE.clear()
+    _CLUSTER_CACHE_STAMP = None
     _LAST_CLUSTER_ERROR = ""
 
 
+def cluster_cache_age() -> float | None:
+    """Seconds since the first memoised fact, or None when nothing is cached.
+
+    Exists for `slurmate mcp` and for nothing else. The one-shot CLI cannot
+    outlive its own cache, so it never asks.
+    """
+    if _CLUSTER_CACHE_STAMP is None:
+        return None
+    return time.monotonic() - _CLUSTER_CACHE_STAMP
+
+
 def _cached_cluster_fact(key: str, compute: Any) -> Any:
+    global _CLUSTER_CACHE_STAMP
     if key not in _CLUSTER_CACHE:
+        if _CLUSTER_CACHE_STAMP is None:
+            _CLUSTER_CACHE_STAMP = time.monotonic()
         _CLUSTER_CACHE[key] = compute()
     return _CLUSTER_CACHE[key]
 
@@ -301,7 +333,7 @@ def fetch_partition_node_maxima(partition: str) -> tuple[int | None, int | None]
     midway3, ``test`` reports ``32+|184320+`` while its nodes actually reach 256
     CPUs and 2321910 MB, and 20 of its 87 partitions emit the ``+`` at all.
 
-    One extra ``sinfo`` for the partition the user actually named — and only when
+    One extra ``sinfo`` for the partition the user actually named, and only when
     the aggregate row carried a ``+``, so a homogeneous site pays nothing.
 
     ``(None, None)`` for "could not tell", which callers must treat as unknown
@@ -353,6 +385,14 @@ def fetch_max_array_size() -> int | None:
     return value
 
 
+def fetch_cluster_identity() -> dict[str, Any]:
+    """Memoised; see :func:`_cached_cluster_fact`."""
+    value: dict[str, Any] = _cached_cluster_fact(
+        "fetch_cluster_identity", _fetch_cluster_identity_uncached
+    )
+    return value
+
+
 def _force_mock() -> bool:
     return os.environ.get("SLURMATE_MOCK", "").lower() in ("1", "true", "yes")
 
@@ -380,11 +420,11 @@ def _split_csv(raw: str | None) -> list[str]:
 
 
 def _acl_is_nobody(raw: str) -> bool:
-    """True for Slurm's ``none`` ACL sentinel — "nobody may use this".
+    """True for Slurm's ``none`` ACL sentinel: "nobody may use this".
 
     A Slurm ACL field carries *two* sentinels, not one: ``ALL`` means "everybody"
     and ``none`` means "nobody". Only ``ALL`` was ever recognised, so ``none``
-    read as a *name* — measured on this cluster's ``test`` partition
+    read as a *name*: measured on this cluster's ``test`` partition
     (``AllowAccounts=none AllowQos=none``), whose QoS ACL came back as a QoS
     literally called "none". No such QoS exists in ``sacctmgr`` (98 names, not
     one of them), and asking for it is refused as an invalid qos specification.
@@ -399,7 +439,7 @@ def _acl_is_nobody(raw: str) -> bool:
 def _parse_mem_to_mb(raw: str) -> int:
     # `sinfo %m` (without -e) reports the minimum node memory with a trailing
     # "+" when a partition's nodes differ (e.g. "515000+"). Strip it so the
-    # min value is used, mirroring how _safe_int already tolerates "+" for %c —
+    # min value is used, mirroring how _safe_int already tolerates "+" for %c:
     # otherwise the memory-over-limit warning is silently disabled for every
     # heterogeneous partition.
     value = raw.strip().upper().rstrip("+")
@@ -408,7 +448,7 @@ def _parse_mem_to_mb(raw: str) -> int:
     # The optional trailing "B" matches validate_memory, which accepts "16GB"
     # because sbatch does. Leaving it out here was worse than the refusal it
     # replaced: the value validated, normalised to a correct directive, and then
-    # read as **0 MB** in every comparison — so a 64 GB request on a 16 GB
+    # read as **0 MB** in every comparison, so a 64 GB request on a 16 GB
     # partition produced no warning at all. One grammar, three functions.
     match = re.match(r"^(\d+(?:\.\d+)?)([KMGTP])B?(?:[NC])?$", value)
     if match:
@@ -419,7 +459,7 @@ def _parse_mem_to_mb(raw: str) -> int:
         # "unknown"; clamp to 1 MB so it stays a real, if tiny, value.
         return mb if mb > 0 or num == 0 else 1
     # A bare integer is megabytes. Anything else is malformed ("16 G",
-    # "1.5.5G", "16GiB") — return 0 (unknown) rather than a misleading partial
+    # "1.5.5G", "16GiB"): return 0 (unknown) rather than a misleading partial
     # like "16", which would masquerade as a tiny valid value in limit checks.
     if value.isdigit():
         return int(value)
@@ -439,7 +479,7 @@ def validate_memory(value: str) -> bool:
       directive is written. Do not read this line as Slurm grammar.
 
     Zero is accepted, in every unit spelling. ``--mem=0`` is documented Slurm and
-    means *all the memory on the node* — the whole-node idiom — and it was
+    means *all the memory on the node* (the whole-node idiom), and it was
     measured accepted here as ``0``, ``0K``, ``0M``, ``0G`` and ``0T``. Rejecting
     it (which this function used to do, deliberately, as "not a valid size") left
     no way to express that request at all: ``--memory ''``/``none`` omits ``--mem``
@@ -507,7 +547,7 @@ _TIME_PATTERNS = (
 # The word spellings sbatch accepts for an unlimited --time, measured against a
 # live client rather than guessed: `UNLIMITED` and `INFINITE` parse (they reach
 # the controller and are judged on policy like any other value), while the
-# obvious-looking abbreviation `inf` does **not** — sbatch rejects it outright
+# obvious-looking abbreviation `inf` does **not**; sbatch rejects it outright
 # with "Invalid --time specification". So this set is deliberately not "words
 # that mean infinity"; it is the two Slurm actually takes. Case-insensitive.
 SLURM_UNLIMITED_TIME_WORDS = frozenset({"unlimited", "infinite"})
@@ -521,7 +561,7 @@ def time_request_is_unbounded(value: str) -> bool:
     covers ``0``, ``00:00:00`` and ``0-00:00:00``.
 
     Only a time-*shaped* string may parse to zero, or "not-a-time" would parse to
-    0 and be labelled unbounded — conflating unparseable with unlimited.
+    0 and be labelled unbounded: conflating unparseable with unlimited.
 
     An **absent** limit is deliberately not unbounded: the job takes the partition
     or site default.
@@ -541,7 +581,7 @@ def validate_time(val: str) -> bool:
 
     Includes the word forms. Rejecting ``--time=UNLIMITED`` was a *false*
     refusal: sbatch takes it, so slurmate was blocking a request the scheduler
-    would have accepted — the mirror image of the mistakes this module usually
+    would have accepted; the mirror image of the mistakes this module usually
     guards against, and worse in a way, because there is no cluster on which it
     was right. ``inf`` stays rejected because sbatch rejects it too; accepting
     that would trade this bug for its inverse.
@@ -608,26 +648,26 @@ def normalize_memory(value: str) -> str:
     v = value.strip().upper()
     if not v:
         return ""
-    # Every zero spelling ("0", "0G", "0M") is the same request — all the memory
-    # on the node — so emit the documented bare form rather than "0M", which
+    # Every zero spelling ("0", "0G", "0M") is the same request (all the memory
+    # on the node), so emit the documented bare form rather than "0M", which
     # reads like a request for nothing.
     if re.match(r"^0+(?:\.0+)?[KMGT]?B?[NC]?$", v):
         return "0"
     # Plain digits: append M
     if v.isdigit():
         return f"{v}M"
-    # Already has unit: return as-is, but drop any trailing Slurm N/C suffix —
+    # Already has unit: return as-is, but drop any trailing Slurm N/C suffix;
     # `sbatch --mem` accepts only a K/M/G/T unit, so "16GN" would be rejected.
     m = re.match(r"^(\d+(?:\.\d+)?)([KMGTP])B?(?:[NC])?$", v)
     if m:
         # `sbatch --mem` requires an INTEGER magnitude, so a fractional value like
-        # "1.5G" — which validate_memory accepts — would be rejected at submit.
+        # "1.5G" (which validate_memory accepts) would be rejected at submit.
         # Convert it to whole megabytes ("1.5G" -> "1536M") so a value that
         # validates always normalizes to a directive Slurm accepts.
         if "." in m.group(1):
             # Parse the *matched* number and unit, not the raw string: a trailing
             # "B" or Slurm "N"/"C" suffix is not something _parse_mem_to_mb reads,
-            # so "1.5GB" and "1.5GN" both came back as 0 — turning a 1.5 GiB
+            # so "1.5GB" and "1.5GN" both came back as 0: turning a 1.5 GiB
             # request into "--mem=0M", which Slurm reads as *all* the node's
             # memory. The magnitude and unit are already in hand; use them.
             return f"{_parse_mem_to_mb(m.group(1) + m.group(2))}M"
@@ -645,7 +685,7 @@ _KNOWN_GPU_MODELS = frozenset({
     "h800", "b100", "b200", "gb200", "gh200", "v100", "v100s", "p100", "p40",
     "p4", "k80", "k40", "k20", "l4", "l40", "l40s", "t4", "t10",
     # Fermi / Kepler / Maxwell. Long EOL, still in service on multi-year
-    # clusters' older partitions — and none of them satisfies the shape rule
+    # clusters' older partitions, and none of them satisfies the shape rule
     # below (two-digit or bare-"m" families), so without these the detector
     # falls through to guessing on exactly the nodes that have them.
     "m2050", "m2070", "m2075", "m2090", "k10", "k20c", "k20m", "k20x",
@@ -665,7 +705,7 @@ _KNOWN_GPU_MODELS = frozenset({
 # followed by at least THREE digits (a100, h200, v100, p100, b200, mi250, gh200,
 # gb200, rtx6000, …), so an unreleased future model is still detected. The digit
 # run must be 3+ because two-character labels are ambiguous with the rack /
-# chassis / blade tags clusters put in node features ("b12", "t2", "p2") — those
+# chassis / blade tags clusters put in node features ("b12", "t2", "p2"); those
 # used to win here purely by appearing earlier in the feature list than the real
 # model. Shorter real models are covered by _KNOWN_GPU_MODELS above.
 _GPU_MODEL_RE = re.compile(
@@ -697,7 +737,7 @@ _CPU_MODEL_RE = re.compile(
 # Infrastructure tokens that are not GPU models but pass a naive filter: network
 # fabric generations and adapters, rack/chassis/position labels, GPU *form
 # factors*, and cooling tags. The pre-existing blocklist already carried
-# "ib"/"opa"/"hdr" — these are the same convention's other spellings, which is
+# "ib"/"opa"/"hdr"; these are the same convention's other spellings, which is
 # how a partition whose features read "gold6248,avx512,hdr100,768g" came back
 # with a GPU type of "hdr100".
 _INFRA_TOKEN_RE = re.compile(
@@ -714,8 +754,8 @@ _INFRA_TOKEN_RE = re.compile(
 
 # CPU-generation tags that share a GPU-family letter prefix and would otherwise
 # be misread as a GPU model: Intel Xeon "vN" (E5/E7-…-v2…v6) and IBM POWER "pN"
-# (POWER8/9/10). No real GPU uses these exact tokens — V100/P100 etc. are
-# multi-digit — so excluding them is safe.
+# (POWER8/9/10). No real GPU uses these exact tokens: V100/P100 etc. are
+# multi-digit, so excluding them is safe.
 _CPU_GEN_TOKENS = frozenset({"v2", "v3", "v4", "v5", "v6", "p8", "p9", "p10"})
 
 
@@ -737,7 +777,7 @@ def _parse_gpu_count(gres_raw: str) -> int:
         if not entry.lower().startswith("gpu:"):
             continue
         parts = entry.split(":")
-        # gpu:N or gpu:TYPE:N — the count is the last numeric field, and a typed
+        # gpu:N or gpu:TYPE:N; the count is the last numeric field, and a typed
         # entry with no count at all ("gpu:a100") means one.
         counts = [int(x) for x in parts[1:] if x.isdigit()]
         total += counts[-1] if counts else 1
@@ -762,11 +802,11 @@ def _detect_gpu_type(features: str, gres: str, known_models: set[str] | None = N
           rack or form-factor tag. This keeps detecting GPU types
           that only ever appear in features and never in a typed GRES, without
           returning a site's node-class tag as a GPU model.
-    4. Returns ``"gpu"`` when the node has GPUs but nothing identifiable — the
+    4. Returns ``"gpu"`` when the node has GPUs but nothing identifiable; the
        caller then offers no type at all, which is the right answer: a wrong
        ``--gpu-type`` is worse than none, because nothing prompts the user to
        check it.
-    3. If GRES has no ``gpu:`` at all the node has no GPUs — return empty.
+    3. If GRES has no ``gpu:`` at all the node has no GPUs: return empty.
 
     The token's original case is always preserved: Slurm node features are
     case-sensitive (a node advertising ``a100`` is *not* matched by ``-C A100``),
@@ -901,7 +941,7 @@ def array_task_count(spec: str) -> int | None:
     """How many tasks an ``--array`` spec launches, or ``None`` when unknowable.
 
     The cost of an array job is per-task cost × task count, and reporting the
-    per-task figure for a 1000-task array understates it a thousandfold — in the
+    per-task figure for a 1000-task array understates it a thousandfold, in the
     direction that matters, since it tells the user an enormous job is cheap.
 
     The ``%N`` throttle is deliberately ignored: it caps how many run *at once*,
@@ -940,7 +980,7 @@ def _slurm_reads_as_index_number(text: str) -> bool:
     """Whether Slurm's array parser reads ``text`` as a number.
 
     ``strtol`` semantics, which is what the controller uses: whitespace *before*
-    the digits is skipped, whitespace *after* them is a parse error. Measured —
+    the digits is skipped, whitespace *after* them is a parse error. Measured:
     ``1- 5`` and ``1-10: 2`` verify, ``1 -5`` and ``1-10 :2`` do not.
     """
     return text.lstrip(" \t").isdigit()
@@ -1014,7 +1054,7 @@ def array_spec_reason(spec: str) -> str:
         return (
             f"array spec '{text}' ends with '%' and no number. Slurm accepts this "
             f"and runs the array with *no* throttle at all, which is unlikely to "
-            f"be what a '%' was typed for — write '%N' (e.g. '{body}%4') to cap "
+            f"be what a '%' was typed for: write '%N' (e.g. '{body}%4') to cap "
             f"concurrent tasks, or drop the '%'"
         )
     if _slurm_would_accept_array_spec(text):
@@ -1034,7 +1074,7 @@ def array_spec_reason(spec: str) -> str:
             f"array spec '{text}' has "
             f"{' and '.join(faults or ['a shape slurmate does not accept'])}. "
             f"Slurm accepts this rather than reporting it, so the typo would "
-            f"survive into a running array — write it as '{example}' if that is "
+            f"survive into a running array: write it as '{example}' if that is "
             f"what was meant"
         )
     return f"Invalid array specification: {text}"
@@ -1046,7 +1086,7 @@ def validate_array_spec(spec: str) -> bool:
     ``--time`` and ``--memory`` values were checked for shape and the array spec
     was not, so ``--array 10-1`` produced a script Slurm refuses with "Invalid
     job array specification". Calibrated against a live controller rather than
-    guessed — measured **accepted**: ``5``, ``1-10``, ``0-9``, ``1,3,5``,
+    guessed. Measured **accepted**: ``5``, ``1-10``, ``0-9``, ``1,3,5``,
     ``1-10:2``, ``1-10%4``, ``1-5,10`` and, unexpectedly, a bare ``%4``;
     measured **rejected**: ``10-1`` (reversed), ``1-10:0`` (zero step), ``1-``
     and ``-5``.
@@ -1112,6 +1152,19 @@ def _module_command() -> list[str] | None:
     through ``bash -lc 'module ...'`` instead works but costs ~10 s on a real
     login node, against ~30 ms for the direct call.
     """
+    # No MODULEPATH, no module system to ask. `modulecmd` exists on a Tcl site
+    # whether or not the profile that configures it has run, and without the
+    # search path it answers *every* query with "ERROR: No module path
+    # defined". Measured on Booth's Mercury over a non-login ssh: MODULEPATH
+    # and MODULESHOME are both unset, `shutil.which` still finds
+    # /usr/bin/modulecmd, and `-t avail <anything>` returns that error plus the
+    # shell fragment `test 0 = 1;`. `fetch_module_matches` then read those two
+    # lines as two module names, so every name looked present and
+    # `check_modules` passed a script naming a module that does not exist. A
+    # check that cannot run has to say so; silently approving is the one
+    # outcome worse than not checking.
+    if not os.environ.get("MODULEPATH", "").strip():
+        return None
     lmod = os.environ.get("LMOD_CMD")
     if lmod and os.path.exists(lmod):
         return [lmod, "bash"]
@@ -1133,13 +1186,18 @@ def _module_command() -> list[str] | None:
     return [found, "bash"] if found else None
 
 
+#: `modulecmd` prints its failures on the same stream as its listing and exits
+#: 0 either way, so the text is the only signal there is.
+_MODULE_ERROR = re.compile(r"^\s*(?:ERROR|FATAL)\b", re.MULTILINE)
+
+
 def fetch_module_matches(name: str) -> list[str] | None:
     """Module names matching ``name``, or None when no module system can be asked.
 
     Reads **stderr**, not stdout. ``modulecmd bash -t avail X`` writes its
     listing to stderr and leaves stdout empty, because stdout is reserved for the
-    shell code the caller is meant to ``eval``. A stdout-only read — the obvious
-    way to write this — reports every module on the system as missing, which is
+    shell code the caller is meant to ``eval``. A stdout-only read (the obvious
+    way to write this) reports every module on the system as missing, which is
     the same "the answer was on the channel nobody read" mistake that produced
     several findings in the portability report.
 
@@ -1150,8 +1208,18 @@ def fetch_module_matches(name: str) -> list[str] | None:
     if cmd is None or _force_mock():
         return None
     stdout, stderr, _rc = _run_command([*cmd, "-t", "avail", name])
+    combined = f"{stderr}\n{stdout}"
+    # Belt and braces behind the MODULEPATH guard above, because the guard
+    # only covers the one misconfiguration we measured. `modulecmd` reports
+    # every failure on the same stream as its listing and still exits 0, so an
+    # error line is indistinguishable from a hit unless it is named. Returning
+    # None (cannot ask) rather than [] (asked, nothing matched) is the whole
+    # point: [] makes the caller claim the module is missing, and a list
+    # containing the error text makes it claim the module is present.
+    if _MODULE_ERROR.search(combined):
+        return None
     matches: list[str] = []
-    for line in f"{stderr}\n{stdout}".splitlines():
+    for line in combined.splitlines():
         entry = line.strip()
         # Not module names: blank lines, path headers
         # ("/software/modulefiles:"), and Lmod's ruled section banners
@@ -1159,6 +1227,10 @@ def fetch_module_matches(name: str) -> list[str] | None:
         # first, or the banner reads as a module called "---- /opt ... ----".
         entry = entry.strip("-= \t")
         if not entry or entry.endswith(":") or entry.startswith("/"):
+            continue
+        # Shell code, not a listing. stdout carries what the caller is meant to
+        # `eval`, and a mixed read picks up fragments like `test 0 = 1;`.
+        if entry.endswith(";") or "=" in entry or " " in entry:
             continue
         entry = entry.split("(")[0].strip().rstrip("/")
         if entry:
@@ -1173,7 +1245,7 @@ def check_modules(modules: Iterable[str]) -> list[tuple[str, str]]:
     the partition, and they fail late: the job queues, starts, and *then* dies on
     ``module load``. A version that exists on one cluster and not the next is the
     common case, so when the base module is present its available versions are
-    listed — that is the answer the user needs.
+    listed: that is the answer the user needs.
 
     Warnings, never errors: hierarchical module trees only expose part of
     themselves at a time, so absence here is strong evidence but not proof.
@@ -1202,7 +1274,7 @@ def check_modules(modules: Iterable[str]) -> list[tuple[str, str]]:
         else:
             out.append((
                 "warning",
-                f"module '{name}' not found on this cluster — the job would queue, "
+                f"module '{name}' not found on this cluster; the job would queue, "
                 f"start, and then fail on 'module load'",
             ))
     return out
@@ -1215,17 +1287,17 @@ def check_conda_env(
 
     Exactly the shape SM-13 fixed for ``module load``, left in place for the env
     field: the job queues, starts, and then dies on ``conda activate``. The env
-    list was already being fetched — the wizard's picker offers it — but a name
+    list was already being fetched (the wizard's picker offers it), but a name
     typed on the command line was never checked against it, so ``--modules`` was
     validated and ``--env`` was not.
 
     Named conda/mamba envs only. A ``venv`` is a *path*, and a path unreadable
-    from the login node can be perfectly valid on the compute node — the same
-    reason :func:`check_log_dirs` warns rather than refuses — so checking one here
+    from the login node can be perfectly valid on the compute node (the same
+    reason :func:`check_log_dirs` warns rather than refuses), so checking one here
     would manufacture false refusals.
 
     A warning, never an error. An empty env list still must not read as "your
-    environment does not exist" — but it is not nothing either, which is what it
+    environment does not exist", but it is not nothing either, which is what it
     used to be treated as: see :func:`_conda_unavailable`.
     """
     name = str(env or "").strip()
@@ -1235,8 +1307,8 @@ def check_conda_env(
     if not known:
         # Could-not-ask, which is a fact about the *script* even though it says
         # nothing about the env: if conda cannot be reached here, the activation
-        # line cannot run. Measured on all three clusters tested — conda is on
-        # none of their default PATHs — so `--env x` with no conda-providing
+        # line cannot run. Measured on all three clusters tested (conda is on
+        # none of their default PATHs), so `--env x` with no conda-providing
         # module was the SM-13 failure exactly, in the field SM-13 did not cover.
         return _conda_unavailable(name, str(env_type), list(modules or []))
     if name in known:
@@ -1244,7 +1316,7 @@ def check_conda_env(
     # Suggest only *named* envs. fetch_conda_envs also returns full paths for
     # --prefix envs, which is right for activation but useless as a suggestion:
     # they are 100+ characters each, they crowd out the names, and anyone using
-    # one already knows its path. Sorting the raw list is worse still — paths
+    # one already knows its path. Sorting the raw list is worse still: paths
     # begin with "/" and so sort first, burying every name.
     named = sorted(e for e in known if "/" not in e)
     detail = ""
@@ -1254,13 +1326,13 @@ def check_conda_env(
         detail = f" Available: {shown}{more}"
     return [(
         "warning",
-        f"conda environment '{name}' not found here — the job would queue, start, "
+        f"conda environment '{name}' not found here; the job would queue, start, "
         f"and then fail on 'conda activate'.{detail}",
     )]
 
 
 # Module-name fragments that mean "this module provides conda/mamba". Matched as
-# substrings because sites name them every possible way — `conda/23.10` on
+# substrings because sites name them every possible way: `conda/23.10` on
 # Pythia, `python/anaconda-2025.12` on midway3, `Mambaforge` elsewhere.
 _CONDA_MODULE_HINTS = (
     "conda", "mamba", "miniforge", "micromamba",
@@ -1290,7 +1362,7 @@ def _conda_unavailable(env: str, env_type: str, modules: list[str]) -> list[tupl
 
     The script's first real line is ``source "$(conda info --base)/…"``, so a
     cluster where conda is not on ``PATH`` and no loaded module provides it
-    produces a job that starts and immediately dies — the late failure SM-13
+    produces a job that starts and immediately dies; the late failure SM-13
     exists to prevent, reached through ``--env`` rather than ``--modules``.
 
     A warning, and hedged, for the reason the env-name check is: a login node's
@@ -1301,13 +1373,13 @@ def _conda_unavailable(env: str, env_type: str, modules: list[str]) -> list[tupl
     """
     tool = "mamba" if env_type == "mamba" else "conda"
     if is_tool_available(tool):
-        # It is on PATH and the listing still failed — a broken conda, or one
+        # It is on PATH and the listing still failed; a broken conda, or one
         # that cannot read its own config. Claim nothing about the environment.
         return []
     # Substring-search the whole module list rather than asking
     # `module -t avail conda`: that matches a **name prefix**, not a substring, so
     # it finds Pythia's `conda/23.10` and misses midway3's
-    # `python/anaconda-2025.12` entirely — the cluster where the remedy is most
+    # `python/anaconda-2025.12` entirely; the cluster where the remedy is most
     # obviously available was the one it could not name.
     hints = (env_type, *_CONDA_MODULE_HINTS) if env_type == "mamba" else _CONDA_MODULE_HINTS
     available = fetch_available_modules()
@@ -1368,7 +1440,7 @@ GPU_SPELLING_FORMATS = {
 
 # ``--gpus`` is not in the table above because it is slurmate's own option rather
 # than an alias for it, and a bare ``--gpus 4`` must keep the default format. But
-# it takes Slurm's ``[type:]count`` too — slurmate itself *prints*
+# it takes Slurm's ``[type:]count`` too; slurmate itself *prints*
 # ``--gpus=a100:2`` under ``--gpu-format gpus``, and that was the one emitted
 # spelling argparse still met with "invalid int value", i.e. the SM-25 defect
 # surviving in the flag whose name matches the option. A type given this way does
@@ -1379,15 +1451,15 @@ GPU_COUNT_FLAG = "--gpus"
 def parse_gpu_spelling(flag: str, value: str) -> tuple[int, str]:
     """``(count, type)`` from a Slurm GPU flag's value; raises ``ValueError``.
 
-    SM-25's general rule — anything slurmate prints should be typeable back at
-    slurmate — applied to the GPU directives, which are also the ones most often
+    SM-25's general rule (anything slurmate prints should be typeable back at
+    slurmate) applied to the GPU directives, which are also the ones most often
     copied out of somebody else's script.
 
     ``--gres`` is deliberately strict about the leading ``gpu``. It can carry any
     resource (``lscratch:100``), slurmate manages only GPUs, and quietly treating
     a non-GPU gres as one would drop a request the user actually made.
 
-    Every other flag — ``--gpus``, ``--gpus-per-node``, ``--gpus-per-task`` —
+    Every other flag (``--gpus``, ``--gpus-per-node``, ``--gpus-per-task``)
     takes Slurm's ``count`` or ``<type>:count``.
     """
     text = str(value or "").strip()
@@ -1412,7 +1484,7 @@ def write_private_text(path: str, text: str) -> None:
     """Write ``text`` to ``path``, creating it mode 0600.
 
     ``open(path, "w")`` leaves the mode to the umask, which is 0002 on both
-    clusters measured — so a saved script came out ``-rw-rw-r--``. That is not a
+    clusters measured, so a saved script came out ``-rw-rw-r--``. That is not a
     disclosure everywhere, but it is here: ``/project/rcc`` and the user's
     directory under it are both ``o+x``, so a world-readable file at a known path
     is readable cluster-wide, and 79 of 81 project directories are listable.
@@ -1420,13 +1492,13 @@ def write_private_text(path: str, text: str) -> None:
     not do.
 
     The content is the submitted script, so by construction it contains whatever
-    was passed to ``--command`` — a token, an internal hostname, a credential in a
+    was passed to ``--command``; a token, an internal hostname, a credential in a
     one-liner. 0600 suits a file whose purpose is the submitter's own
     reproducibility; sharing it should be an explicit ``chmod``, not the umask's
     decision.
 
     The mode applies at *creation* only, so overwriting a file the user already
-    made deliberately shareable leaves their permissions alone — O_TRUNC does not
+    made deliberately shareable leaves their permissions alone: O_TRUNC does not
     re-apply the mode.
     """
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1441,7 +1513,7 @@ def unexpanded_home(path: str) -> bool:
     """Whether ``path`` still carries an unexpanded leading ``~``.
 
     ``os.path.expanduser`` does not raise when the home directory cannot be
-    determined — it returns the string unchanged. So in the same environment that
+    determined: it returns the string unchanged. So in the same environment that
     makes ``Path.home()`` raise (no ``$HOME``, no passwd entry), ``~/logs`` stays
     ``~/logs`` and Slurm, which does no tilde expansion of its own, writes the
     job's output to a *relative directory literally named* ``~``. Silent, and the
@@ -1461,7 +1533,7 @@ _NODE_LOCAL_FS_TYPES = frozenset({
 # Paths that are node-local by near-universal HPC convention, plus the ones that
 # say so in their own name. Deliberately not bare `/scratch`: a node-local
 # `/scratch` is common and so is a shared one, and warning about shared scratch
-# would fire on the correct configuration. `/scratch/local` earns its place —
+# would fire on the correct configuration. `/scratch/local` earns its place:
 # midway3's is the same `/dev/sda1` as its `/tmp`, and it is where `$TMPDIR`
 # points there, so a log written to it is as invisible as one in `/tmp`.
 # Combined with the type check above, a hit is about as certain as this can be
@@ -1515,8 +1587,8 @@ def node_local_log_dir(path: str) -> str:
 
     A job's ``--output`` on node-local storage is the worst kind of working
     script: Slurm opens the file on the *compute* node, so the log lands in that
-    node's private copy of the directory and the submitter — standing on the
-    login node — sees nothing, while the job reports ``COMPLETED 0:0``. Measured
+    node's private copy of the directory and the submitter (standing on the
+    login node) sees nothing, while the job reports ``COMPLETED 0:0``. Measured
     on Booth's Mercury, where ``/tmp`` is an LVM volume per node: an identical
     job wrote its log from an NFS home and produced no readable output at all
     from ``/tmp``, with the same exit status both times.
@@ -1527,7 +1599,7 @@ def node_local_log_dir(path: str) -> str:
     the one that matters.
     """
     if _force_mock():
-        # No cluster, so no compute node with its own /tmp — and --demo must not
+        # No cluster, so no compute node with its own /tmp, and --demo must not
         # lecture a demo user about their temp directory.
         return ""
     try:
@@ -1545,8 +1617,8 @@ def node_local_log_dir(path: str) -> str:
 def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, str]]:
     """Report ``--output``/``--error`` directories that cannot be created here.
 
-    The log path is the most cluster-specific value in a generated script — every
-    site mounts its scratch somewhere else — and Slurm kills a job outright when
+    The log path is the most cluster-specific value in a generated script (every
+    site mounts its scratch somewhere else), and Slurm kills a job outright when
     it cannot open the file. Until now the failure was invisible twice over: no
     check before submit, and the ``os.makedirs`` attempt at submit time logged
     its ``OSError`` at debug level and submitted anyway.
@@ -1564,7 +1636,7 @@ def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, 
     matters, and is reported; when slurmate is the one submitting
     (:func:`submit_sbatch` makes them first) it does not, or every default
     ``logs/`` would warn on every run. SM-24: on the ``--print`` path this cost a
-    whole job's output — Slurm accepts a path in a missing directory, discards
+    whole job's output; Slurm accepts a path in a missing directory, discards
     what the job writes, and reports ``COMPLETED 0:0``, which is the most
     confusing result a batch user can get.
     """
@@ -1580,7 +1652,7 @@ def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, 
             # not the one the user meant.
             out.append((
                 "warning",
-                f"log path '{val}' still begins with '~' — no home directory could "
+                f"log path '{val}' still begins with '~'; no home directory could "
                 f"be resolved, and Slurm does not expand it, so the log would land "
                 f"in a directory literally named '~'",
             ))
@@ -1604,7 +1676,7 @@ def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, 
                 "warning",
                 f"log directory '{shown}' is on node-local storage ({local_fs}); "
                 f"Slurm opens the log on the compute node, so it lands in that "
-                f"node's own copy and is not readable from here — the job still "
+                f"node's own copy and is not readable from here; the job still "
                 f"reports COMPLETED. Point --output-dir at shared storage (home, "
                 f"project or scratch)",
             ))
@@ -1617,7 +1689,7 @@ def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, 
                     f"Slurm fails a job it cannot open the output file for",
                 ))
             continue
-        # Not there yet — normal for "logs/". The question is whether it could be
+        # Not there yet: normal for "logs/". The question is whether it could be
         # created, which is decided by the nearest existing ancestor.
         ancestor = directory
         while ancestor and not os.path.exists(ancestor):
@@ -1625,7 +1697,7 @@ def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, 
             if parent == ancestor:
                 break
             ancestor = parent
-        # A *relative* directory walks up to "" — dirname("logs") is empty — and
+        # A *relative* directory walks up to "" (dirname("logs") is empty), and
         # reading that as "/" made the check claim that `logs` could not be
         # created whenever it did not exist yet. That is the default output
         # directory, so a first-time user in a perfectly writable directory got a
@@ -1646,7 +1718,7 @@ def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, 
                 f"job it cannot open the output file for",
             ))
         elif not will_create:
-            # Missing, but creatable — so "cannot be created" does not apply and
+            # Missing, but creatable, so "cannot be created" does not apply and
             # would be wrong. Reported only when nobody is going to create it:
             # this is the SM-24 case, where the script is handed to the user,
             # Slurm accepts an output path in a missing directory, discards what
@@ -1656,7 +1728,7 @@ def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, 
             out.append((
                 "warning",
                 f"log directory '{directory}' does not exist, and this script is "
-                f"yours to submit — slurmate only creates it when it submits for "
+                f"yours to submit; slurmate only creates it when it submits for "
                 f"you. Run 'mkdir -p {directory}' first, or Slurm will discard "
                 f"this job's output and still report it COMPLETED",
             ))
@@ -1664,7 +1736,7 @@ def check_log_dirs(script: str, *, will_create: bool = True) -> list[tuple[str, 
 
 
 # A constraint that is a single plain feature name, as opposed to a Slurm feature
-# *expression* — those support "&", "|", "!", "*N", "[a|b]" and counts, and a set
+# *expression*; those support "&", "|", "!", "*N", "[a|b]" and counts, and a set
 # membership test would reject perfectly valid ones.
 _PLAIN_FEATURE_RE = re.compile(r"^[A-Za-z0-9_.:+-]+$")
 
@@ -1679,8 +1751,8 @@ def _fetch_node_features_uncached() -> set[str] | None:
     refusals.
 
     ``None`` and an empty set are **different answers** and callers depend on the
-    difference. A cluster can legitimately advertise no features at all — every
-    node on Booth's Mercury reports ``(null)`` — and there a plain ``-C name``
+    difference. A cluster can legitimately advertise no features at all (every
+    node on Booth's Mercury reports ``(null)``), and there a plain ``-C name``
     matches nothing, which is worth saying. Collapsing that into the same empty
     set as "sinfo could not be asked" is what made the constraint check inert on
     exactly the clusters where it had a definite answer to give.
@@ -1705,9 +1777,85 @@ def _fetch_node_features_uncached() -> set[str] | None:
 # is not a partition or a node-config problem and no partition choice avoids it.
 _CONS_TRES_ONLY_GPU_FORMATS = frozenset({"gpus", "gpus_per_task"})
 
-# Select plugins that do understand them. Anything else — including an
-# unreadable value — is treated as unknown, and unknown must claim nothing.
+# Select plugins that do understand them. Anything else (including an
+# unreadable value) is treated as unknown, and unknown must claim nothing.
 _CONS_TRES_SELECT_TYPES = frozenset({"select/cons_tres"})
+
+
+#: The cluster name a brief reports when demo data is in force. Named so that
+#: nothing downstream can read it as a real site: it travels beside
+#: ``"mock": true`` and both have to be unmissable.
+MOCK_CLUSTER_NAME = "mock-cluster"
+
+
+def _scontrol_config() -> str:
+    """Raw ``scontrol show config``, memoised; "" when it cannot be read.
+
+    Three separate facts are parsed out of this one command (``SelectType``,
+    ``MaxArraySize`` and the cluster's own name) and each used to run it again,
+    so establishing them cost three round trips to the controller for one
+    answer. `slurmate brief` wants all three at once, which is exactly the
+    caller that makes the repetition visible, so the text is fetched once and
+    the parsers read the cache.
+
+    Failures are recorded through :func:`_note_cluster_error` rather than
+    swallowed: an unreadable ``scontrol`` is the reason three facts go
+    ``None`` together, and that is worth being able to say.
+    """
+    def compute() -> str:
+        if _force_mock() or not is_tool_available("scontrol"):
+            return ""
+        stdout, stderr, rc = _run_command(
+            ["scontrol", "show", "config"], timeout=_ADVISORY_TIMEOUT
+        )
+        if rc != 0:
+            _note_cluster_error(stderr)
+            return ""
+        return stdout
+
+    value: str = _cached_cluster_fact("scontrol_config", compute)
+    return value
+
+
+def _config_field(key: str) -> str:
+    """One ``Key = value`` field from ``scontrol show config``, or "".
+
+    ``scontrol`` pads its output into columns, so the separator is surrounded
+    by a run of spaces that varies with the longest key on the page. Matching
+    the separator as a whitespace run rather than a bare ``=`` is what keeps
+    this working on a site whose padding differs from ours.
+    """
+    match = re.search(rf"^{re.escape(key)}\s*=\s*(\S+)", _scontrol_config(), re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def _fetch_cluster_identity_uncached() -> dict[str, Any]:
+    """Which cluster this is, as far as it can be established.
+
+    Every other fetcher here answers "what may I ask for on this site". None of
+    them answered "which site", because the wizard never needed to: the user
+    knows what they logged into. A caller that studies a cluster and writes the
+    findings down does need it, both to label them and to notice, from another
+    login session, that it is now looking at somewhere else.
+
+    An unreadable field is ``None``, never a guess. A confident wrong cluster
+    name is worse than an absent one: it is the field everything else gets
+    filed under, so a wrong value mislabels a whole snapshot rather than
+    leaving one hole in it.
+    """
+    ident: dict[str, Any] = {
+        "name": MOCK_CLUSTER_NAME if _force_mock() else (_config_field("ClusterName") or None),
+        "slurm_version": _config_field("SLURM_VERSION") or None,
+        "select_type": fetch_select_type() or None,
+        "max_array_size": fetch_max_array_size(),
+        # Not a Slurm fact and deliberately separate from ``name``: on every
+        # cluster tested the login nodes are numbered (midway3-login4), so the
+        # hostname identifies the *node* and only hints at the site. It is here
+        # because "the answer came from this host" is what makes a stale
+        # snapshot recognisable.
+        "hostname": socket.gethostname() or None,
+    }
+    return ident
 
 
 def _fetch_select_type_uncached() -> str:
@@ -1715,17 +1863,11 @@ def _fetch_select_type_uncached() -> str:
 
     Decides which GPU request syntaxes exist at all: ``--gpus`` and
     ``--gpus-per-task`` are cons_tres-only, while ``--gres=gpu:…`` and
-    ``--gpus-per-node`` parse everywhere. Two real clusters differ on this —
-    one runs ``select/cons_tres``, the other ``select/cons_res`` — which is
+    ``--gpus-per-node`` parse everywhere. Two real clusters differ on this (
+    one runs ``select/cons_tres``, the other ``select/cons_res``, which is
     exactly why a ``gpu_format`` carried between them stops working.
     """
-    if _force_mock() or not is_tool_available("scontrol"):
-        return ""
-    stdout, _, rc = _run_command(["scontrol", "show", "config"], timeout=_ADVISORY_TIMEOUT)
-    if rc != 0:
-        return ""
-    match = re.search(r"^SelectType\s*=\s*(\S+)", stdout, re.MULTILINE)
-    return match.group(1).strip() if match else ""
+    return _config_field("SelectType")
 
 
 def unsupported_gpu_format(gpu_format: str, select_type: str) -> str:
@@ -1745,7 +1887,7 @@ def unsupported_gpu_format(gpu_format: str, select_type: str) -> str:
         return ""                    # not a value we understand; claim nothing
     return (
         f"gpu_format '{fmt}' needs select/cons_tres, but this cluster runs "
-        f"{select_type} — Slurm refuses the request at parse time, on every "
+        f"{select_type}; Slurm refuses the request at parse time, on every "
         f"partition. Use 'gres_type' (the default) or 'gpus_per_node'"
     )
 
@@ -1753,19 +1895,14 @@ def unsupported_gpu_format(gpu_format: str, select_type: str) -> str:
 def _fetch_max_array_size_uncached() -> int | None:
     """The site's ``MaxArraySize``, or None when it cannot be read.
 
-    A hard scheduler limit that differs wildly between sites — Slurm's own
-    default is 1001, this cluster is configured at 65533 — so an ``--array``
+    A hard scheduler limit that differs wildly between sites (Slurm's own
+    default is 1001, this cluster is configured at 65533), so an ``--array``
     carried from one site is exactly the kind of value that generates a script
     the local controller refuses. None means "unknown"; the caller must stay
     silent rather than guess a limit.
     """
-    if _force_mock() or not is_tool_available("scontrol"):
-        return None
-    stdout, _, rc = _run_command(["scontrol", "show", "config"], timeout=_ADVISORY_TIMEOUT)
-    if rc != 0:
-        return None
-    match = re.search(r"^MaxArraySize\s*=\s*(\d+)", stdout, re.MULTILINE)
-    return int(match.group(1)) if match else None
+    raw = _config_field("MaxArraySize")
+    return int(raw) if raw.isdigit() else None
 
 
 def _parse_partition_timelimit(raw: Any) -> float | None:
@@ -1800,7 +1937,7 @@ def capacity_refusal(
     the partition. The warnings already knew; this makes the ETA able to ask them.
 
     Only **exact** limits are reported. A ``heterogeneous`` partition's cpu/memory
-    figures are floors, not ceilings — ``sinfo`` printed its smallest node — so a
+    figures are floors, not ceilings (``sinfo`` printed its smallest node), so a
     bigger node in the same partition may well take the job, and claiming "never"
     there would trade one confident wrong answer for another. Node counts, array
     indices and the partition time limit are exact and so always count. The array
@@ -1857,7 +1994,7 @@ def capacity_refusal(
     # claimed "never" for a request a larger node takes. SM-27's per-node lookup
     # removes that limitation where it has run: an exact maximum *is* a ceiling,
     # so the refusal is sound even on a mixed partition. Without it the old
-    # silence is still right. Reading the enriched dict keeps this function pure —
+    # silence is still right. Reading the enriched dict keeps this function pure;
     # the ETA path consults it for free and must not gain a subprocess call.
     cpu_limit, cpu_exact = partition_capacity(part, "cpus")
     cores = _as_int(answers.get("cpus"))
@@ -1927,13 +2064,13 @@ def _array_size_issues(
 ) -> list[tuple[str, str]]:
     """Array indices vs the site's ``MaxArraySize``.
 
-    ``max_array_size`` is passed in, never fetched here — this runs on every TUI
+    ``max_array_size`` is passed in, never fetched here: this runs on every TUI
     redraw. ``None`` means unknown, and an unknown limit must not become a claim
     about one.
 
     Partition-independent: ``MaxArraySize`` is a controller-wide ``slurm.conf``
     value, so the refusal it predicts does not depend on which partition (or
-    none) was chosen — measured with ``sbatch --test-only ... --array=1-99999``
+    none) was chosen: measured with ``sbatch --test-only ... --array=1-99999``
     against this site's 65533, which is refused with "Invalid job array
     specification".
     """
@@ -1954,7 +2091,7 @@ def partition_capacity(part: dict[str, Any], key: str) -> tuple[int, bool]:
     """``(limit, exact)`` for ``"cpus"`` or ``"mem"`` on this partition.
 
     SM-27: on a heterogeneous partition the aggregate ``sinfo`` row is a *floor*,
-    so comparing against it warns about requests that fit a larger node — 20 of
+    so comparing against it warns about requests that fit a larger node: 20 of
     87 partitions on midway3 emit the ``+``, and its ``test`` partition reports
     ``32+`` where nodes reach 256 cores. When the per-node maxima have been
     resolved (see :func:`fetch_partition_node_maxima`) the largest node is used
@@ -1962,7 +2099,7 @@ def partition_capacity(part: dict[str, Any], key: str) -> tuple[int, bool]:
 
     Falls back to the aggregate figure when the per-node query could not be made,
     which keeps the honest "smallest node; nodes differ" wording rather than going
-    silent — an unknown must not turn a floor into a ceiling *or* disable the
+    silent; an unknown must not turn a floor into a ceiling *or* disable the
     check entirely.
     """
     if key == "cpus":
@@ -1991,9 +2128,9 @@ def validate_job_config(
 
     Returns a list of ``(level, message)`` tuples, where ``level`` is:
 
-    - ``"error"``   — a configuration Slurm will reject outright (e.g. GPUs on a
+    - ``"error"``: a configuration Slurm will reject outright (e.g. GPUs on a
       CPU-only partition, or a GPU model the partition doesn't have).
-    - ``"warning"`` — a request that exceeds a node's advertised capacity and may
+    - ``"warning"``: a request that exceeds a node's advertised capacity and may
       be rejected or left pending (CPU/memory/time over the per-node limit; the
       advertised value can undercount a heterogeneous partition, so it isn't a
       guaranteed failure).
@@ -2002,8 +2139,8 @@ def validate_job_config(
     (every redraw) and the final CLI summary share this single source of truth,
     so the two surfaces can't drift apart.
 
-    This function is pure and side-effect free — it makes **no** subprocess
-    calls — so the TUI can safely call it on every keystroke/redraw. Callers
+    This function is pure and side-effect free (it makes **no** subprocess
+    calls), so the TUI can safely call it on every keystroke/redraw. Callers
     that can afford a live ``sinfo`` lookup (e.g. the one-shot CLI summary) may
     pass ``extra_gpu_types`` to widen the set of GPU models considered valid
     beyond what ``_partition_obj`` statically lists, and
@@ -2011,7 +2148,7 @@ def validate_job_config(
     :func:`fetch_gpu_type_sources`) to have the GPU *request format* checked
     against how each model can actually be asked for, in either direction.
     ``constraint_gpu_types`` distinguishes "not looked up" (``None``) from "looked
-    up, and this partition advertises no GPU-model features" (``[]``) — the second
+    up, and this partition advertises no GPU-model features" (``[]``); the second
     is the whole point of the check, so the two cannot share a spelling.
     """
     part = answers.get("_partition_obj")
@@ -2024,12 +2161,12 @@ def validate_job_config(
         # ``_partition_obj`` None for the rest of the session.
         #
         # So the partition-DEPENDENT checks below have nothing to compare against
-        # and must stay silent — but returning [] silenced the whole function,
+        # and must stay silent, but returning [] silenced the whole function,
         # including the rules that never look at a partition at all. A duplicated
         # ``--job-name`` in --custom-sbatch then produced a second #SBATCH line
         # that Slurm accepts (measured: `sbatch --test-only ... -J first -J
         # second` is ***PASSED***) and silently honours over slurmate's, while
-        # the summary described the value that lost — the one failure mode this
+        # the summary described the value that lost; the one failure mode this
         # check exists to catch, dropped for a reason unrelated to it.
         out.extend(_managed_flag_issues(answers))
         out.extend(_array_size_issues(answers, max_array_size))
@@ -2056,7 +2193,7 @@ def validate_job_config(
     except (ValueError, TypeError):
         pass
 
-    # Memory vs the node's advertised memory — checked against what the SCRIPT will
+    # Memory vs the node's advertised memory: checked against what the SCRIPT will
     # actually request, mirroring the builder's precedence: a custom --mem /
     # --mem-per-cpu flag suppresses the auto directive, and --mem-per-cpu wins over
     # --mem. Checking the raw `memory` answer regardless meant warning about a value
@@ -2107,7 +2244,7 @@ def validate_job_config(
         try:
             req_mins = _parse_slurm_time_to_minutes(str(time_limit))
             # None = the partition told us nothing, so there is nothing to check.
-            # math.inf = the partition is unbounded, so the request is fine — a
+            # math.inf = the partition is unbounded, so the request is fine; a
             # comparison against inf affirms it instead of skipping the check.
             # SM-28 asked for the QoS MaxWall to be compared here. Measured and
             # NOT done, because it is not a cluster-invariant: whether exceeding a
@@ -2115,7 +2252,7 @@ def validate_job_config(
             # flag, which no QoS on midway3 sets. There, `--qos=build
             # --time=30-00:00:00` against `MaxWall=06:00:00` is reported
             # ***PASSED*** by sbatch, so a local comparison warns about a limit the
-            # scheduler does not enforce — the false warning this module exists to
+            # scheduler does not enforce; the false warning this module exists to
             # avoid. Slurm's own verdict is site-accurate and already consulted on
             # every path; a site that does enforce it answers
             # QOSMaxWallDurationPerJobLimit, which refusal_is_permanent() now
@@ -2171,7 +2308,7 @@ def validate_job_config(
     except (ValueError, TypeError):
         pass
 
-    # Array indices vs the site's MaxArraySize — see _array_size_issues, which
+    # Array indices vs the site's MaxArraySize: see _array_size_issues, which
     # the no-partition path above shares because the limit is a cluster
     # constant rather than a partition figure.
     out.extend(_array_size_issues(answers, max_array_size))
@@ -2195,7 +2332,7 @@ def validate_job_config(
                      "or sinfo failed)"
             )
         elif reason == "undescribed":
-            # It exists — the same run validated the name against `sinfo -a` and
+            # It exists; the same run validated the name against `sinfo -a` and
             # accepted it. Only the plain `sinfo` this object was built from does
             # not list it, so say that instead of denying the partition.
             why = (
@@ -2208,43 +2345,43 @@ def validate_job_config(
         out.append((
             "warning",
             f"Capacity limits NOT checked: {why}, so its CPU, memory, GPU and time "
-            f"limits are unknown — the request above has been validated for shape "
+            f"limits are unknown; the request above has been validated for shape "
             f"only",
         ))
 
     # The PARTITION's own state, which is a different fact from its nodes': a
     # partition can be UP with every node dead (caught below) or DOWN/INACT with
     # a hundred live nodes (caught here). Slurm accepts a job for a down
-    # partition and then never starts it — "queues forever with no indication
+    # partition and then never starts it: "queues forever with no indication
     # why", which is the most opaque way for a cross-cluster guess to fail.
     part_state = str(part.get("state") or "").strip().lower()
     if part_state and part_state not in _AVAILABLE_PARTITION_STATES:
         out.append((
             "warning",
             f"Partition '{part.get('name')}' is {part_state} (the partition itself, "
-            f"not its nodes) — Slurm accepts the job and never starts it",
+            f"not its nodes); Slurm accepts the job and never starts it",
         ))
 
     # A partition whose nodes are every one down/drained can never start the job.
     # A warning rather than an error: nodes come back, and queuing ahead of a
-    # repair window is legitimate — but "queues forever with no indication why"
+    # repair window is legitimate, but "queues forever with no indication why"
     # is the single most opaque way for a cross-cluster guess to fail.
     # ``nodes_up`` is None when the site's sinfo reported no state column at all,
-    # which is "unknown", not "none" — stay silent there.
+    # which is "unknown", not "none": stay silent there.
     nodes_up = part.get("nodes_up")
     total_nodes = part.get("nodes") or 0
     if nodes_up == 0 and total_nodes:
         out.append((
             "warning",
             f"Partition '{part.get('name')}' has no usable nodes right now "
-            f"(all {total_nodes} are down/drained/reserved) — the job would queue "
+            f"(all {total_nodes} are down/drained/reserved); the job would queue "
             f"indefinitely",
         ))
 
     # GPUs requested on a partition *known* to advertise none. Only assert this
     # when ``has_gpu`` is explicitly False: real partition objects (from
     # fetch_partitions / MOCK) always carry it as a bool, so ``is False`` means
-    # "we looked and there's no gpu GRES" — a config Slurm will reject. A
+    # "we looked and there's no gpu GRES": a config Slurm will reject. A
     # manually-typed or unrecognized partition falls back to a synthetic object
     # with no ``has_gpu`` key (capability unknown, like the 0/None cpu/mem/time
     # limits the checks above stay silent on), so we must not overclaim a hard
@@ -2274,9 +2411,9 @@ def validate_job_config(
             out.append(("error", f"GPU type '{gpu_type}' not in partition list ({', '.join(all_types)})"))
         elif known:
             # Matched only case-insensitively. Slurm node features ARE
-            # case-sensitive — a node advertising "A100" is not matched by
+            # case-sensitive; a node advertising "A100" is not matched by
             # "-C a100" ("Invalid feature specification" / "Requested node
-            # configuration is not available") — so a case-only difference is a
+            # configuration is not available"), so a case-only difference is a
             # real, and otherwise invisible, way for a validated job to be
             # rejected at submit.
             exact = {str(g) for g in all_types}
@@ -2293,7 +2430,7 @@ def validate_job_config(
         # Requestability: a model that only ever appears in a node's *feature*
         # list (because the node's GRES is count-only, "gpu:4") is not a GRES
         # type. Every format except "constraint" names the type inside the GRES
-        # request, which Slurm then rejects outright — measured on a count-only
+        # request, which Slurm then rejects outright: measured on a count-only
         # partition: `--gres=gpu:a100:1` → "Requested node configuration is not
         # available", while `--gres=gpu:1 --constraint=a100` schedules. This is
         # the default path (gres_type is the default format and the type comes
@@ -2310,12 +2447,12 @@ def validate_job_config(
                     f"GPU type '{gpu_type}' is a node feature on "
                     f"'{part.get('name')}', not a GRES type (the nodes advertise a "
                     f"count-only 'gpu:N'), so gpu_format '{fmt}' would emit a "
-                    f"request Slurm rejects — use gpu_format 'constraint'",
+                    f"request Slurm rejects: use gpu_format 'constraint'",
                 ))
         # The mirror image, and reachable by exactly the remedy the check above
         # recommends: `--constraint` names a node *feature*, so a model that is a
         # real GRES type but appears in no node's feature list cannot be requested
-        # that way. Slurm answers "Invalid feature specification" — measured on
+        # that way. Slurm answers "Invalid feature specification": measured on
         # both Booth clusters, whose nodes advertise typed GRES (`gpu:h100:8`) and
         # no features whatsoever, so on those *every* partition is in this state
         # and `gpu_format constraint` could never work. ``None`` means the lookup
@@ -2327,7 +2464,7 @@ def validate_job_config(
             and constraint_gpu_types is not None
             # Only for a model this partition really offers. Without it, a model
             # the partition does not have at all drew a second error asserting it
-            # "is a GRES type on <partition>" — a false statement stacked on top
+            # "is a GRES type on <partition>"; a false statement stacked on top
             # of the true "not in partition list" one, measured on midway3's `gpu`
             # partition. When the model is unknown, that first error is the whole
             # answer.
@@ -2345,7 +2482,7 @@ def validate_job_config(
                     f"GPU type '{gpu_type}' is a GRES type on '{part.get('name')}', "
                     f"not a node feature ({offer}), so gpu_format 'constraint' "
                     f"would emit '--constraint={gpu_type}' and Slurm rejects that "
-                    f"with 'Invalid feature specification' — use gpu_format "
+                    f"with 'Invalid feature specification': use gpu_format "
                     f"'gres_type'",
                 ))
 
@@ -2359,13 +2496,13 @@ _AVAILABLE_PARTITION_STATES = frozenset({"up"})
 
 # Node states (sinfo ``%T``, long form) that represent real capacity: a job can
 # land there now, or as soon as a job already running on the node finishes.
-# Everything else — down / drain* / fail* / maint / unknown / future / inval —
+# Everything else (down / drain* / fail* / maint / unknown / future / inval)
 # can never start a job, so summing it into a partition's node count is what
 # makes a fully-retired partition look like a live choice.
 _ALLOCATABLE_NODE_STATES = frozenset({
     "allocated", "alloc", "completing", "comp", "idle", "mixed", "mix",
     "planned", "plnd",
-    # Power-save states still accept work — Slurm resumes the node on demand.
+    # Power-save states still accept work: Slurm resumes the node on demand.
     "powereddown", "powerdown", "poweringup", "powerup",
 })
 
@@ -2380,7 +2517,7 @@ def _is_allocatable_state(raw: str) -> bool:
     """Whether an ``sinfo %T`` node state can ever start a job.
 
     Returns ``False`` for an empty state so callers can distinguish "no usable
-    nodes" from "state column absent" only by checking emptiness themselves —
+    nodes" from "state column absent" only by checking emptiness themselves:
     :func:`fetch_partitions` does exactly that and reports ``nodes_up=None``
     (unknown) rather than 0 when a site's sinfo gives it nothing to read.
     """
@@ -2420,7 +2557,7 @@ def fetch_partitions() -> list[dict[str, Any]]:
         if len(parts) < 5:
             continue
         raw_name = parts[0].strip()
-        # sinfo marks the site default partition with a trailing "*" — free
+        # sinfo marks the site default partition with a trailing "*": free
         # information the picker needs to rank it first (no extra scontrol call).
         is_default = raw_name.endswith("*")
         name = raw_name.rstrip("*")
@@ -2471,7 +2608,7 @@ def fetch_partitions() -> list[dict[str, Any]]:
                 "heterogeneous": heterogeneous,
                 "gpu_types": gpu_types,
                 "has_gpu": has_gpu,
-                # GPUs a single node advertises — the analogue of cpus_per_node,
+                # GPUs a single node advertises; the analogue of cpus_per_node,
                 # and until now the one advertised resource with no limit check.
                 "gpus_per_node": gpus_per_node,
                 # Keep "infinite" rather than nulling it: unbounded is a fact
@@ -2484,7 +2621,7 @@ def fetch_partitions() -> list[dict[str, Any]]:
             p["nodes_up"] += nodes_up
             p["_state_known"] = p["_state_known"] or state_known
             p["is_default"] = p["is_default"] or is_default
-            # cpus/mem are per-node capacities — keep the max across configs.
+            # cpus/mem are per-node capacities: keep the max across configs.
             p["cpus_per_node"] = max(p["cpus_per_node"], cpus)
             mem_mb = _parse_mem_to_mb(mem_raw) if mem_raw else 0
             p["mem_per_node_mb"] = max(p["mem_per_node_mb"], mem_mb)
@@ -2494,7 +2631,7 @@ def fetch_partitions() -> list[dict[str, Any]]:
             # hash randomisation made the order differ between runs. That order is
             # user-visible in the picker's "GPU:[a100,v100]" label and in the
             # "not in partition list (…)" error, so identical input produced
-            # different output — measured at four orderings across eight runs.
+            # different output: measured at four orderings across eight runs.
             p["gpu_types"] = sorted(set(p["gpu_types"] + gpu_types))
             p["has_gpu"] = p["has_gpu"] or has_gpu
             p["gpus_per_node"] = max(p["gpus_per_node"], gpus_per_node)
@@ -2518,7 +2655,7 @@ def _fetch_all_partition_names_uncached() -> set[str]:
     partition (Slurm's ``Hidden=YES`` is a display setting, not an ACL) gets
     reported as "no such partition on this cluster".
 
-    An empty set means "could not determine", never "this cluster has none" —
+    An empty set means "could not determine", never "this cluster has none":
     callers must skip validation rather than reject everything.
     """
     if not is_tool_available("sinfo"):
@@ -2541,7 +2678,7 @@ def _fetch_all_partition_names_uncached() -> set[str]:
 def unknown_partition_reason(name: str, partitions: list[dict[str, Any]] | None) -> str:
     """Why a partition could not be described: ``unreadable``/``undescribed``/``absent``.
 
-    The two ``sinfo`` queries slurmate makes are deliberately different widths —
+    The two ``sinfo`` queries slurmate makes are deliberately different widths:
     :func:`fetch_partitions` runs a plain ``sinfo`` so the picker offers what the
     user can see, while :func:`_fetch_all_partition_names_uncached` runs
     ``sinfo -a`` so a user-supplied name is validated against the widest list the
@@ -2550,14 +2687,14 @@ def unknown_partition_reason(name: str, partitions: list[dict[str, Any]] | None)
     one, because ``Hidden=YES`` is filtered out of a plain query for an ordinary
     user (``slurmctld``'s ``pack_all_part`` skips it unless ``SHOW_ALL`` is set or
     the caller is an Operator). Existence validation then passes and the
-    partition object is the synthetic blank — so the run said *"partition 'test'
+    partition object is the synthetic blank, so the run said *"partition 'test'
     is not on this cluster"* about a partition it had just accepted as existing,
     which is both self-contradictory and, of the two halves, the false one.
 
     ``absent`` is therefore reserved for a name the *widest* list does not have,
     and ``undescribed`` says the honest thing: it exists, this view does not
     describe it, so nothing was checked against it. ``unreadable`` (an empty
-    partition list — no Slurm, ``sinfo`` failed) is tested first and keeps its
+    partition list; no Slurm, ``sinfo`` failed) is tested first and keeps its
     meaning: nothing is known about any partition there, and ``sinfo -a`` has
     nothing to add.
     """
@@ -2574,7 +2711,7 @@ def fetch_public_partitions(all_parts: list[dict[str, Any]] | None = None) -> li
     """Return only publicly-usable partitions.
 
     Pass ``all_parts`` (a prior ``fetch_partitions()`` result) to avoid a
-    redundant ``sinfo`` call — the partition step fetches it once and shares it.
+    redundant ``sinfo`` call; the partition step fetches it once and shares it.
     """
     if not is_tool_available("sinfo") or not is_tool_available("scontrol"):
         return [p for p in MOCK_PARTITIONS if p.get("is_public")] if _force_mock() else []
@@ -2602,7 +2739,7 @@ def fetch_public_partitions(all_parts: list[dict[str, Any]] | None = None) -> li
         # "Public" = usable by anyone: open to all accounts, not hidden, and up.
         # (AllowGroups gating can't be evaluated here without the caller's groups;
         # such partitions still appear under the picker's "[Private]"/"[Custom]"
-        # paths, so nothing usable is truly hidden — only mis-ranked.)
+        # paths, so nothing usable is truly hidden, only mis-ranked.)
         is_public = (
             allow_accounts.upper() == "ALL"
             and hidden.upper() != "YES"
@@ -2616,12 +2753,387 @@ def fetch_public_partitions(all_parts: list[dict[str, Any]] | None = None) -> li
     return result
 
 
+#: Node features that describe the chassis or the fabric rather than anything a
+#: job can ask for, so grouping on them splits one hardware type into six. The
+#: memory tag (``192g``) is the worst offender: it duplicates ``RealMemory``,
+#: which is already part of the key.
+_NOISE_FEATURE = re.compile(r"^(?:\d+g|[bt]\d+|rack\d+|ib|opa|hdr|edr|fdr)$", re.I)
+
+
+def _node_shape_features(raw: str) -> list[str]:
+    """A node's features, minus the ones that only describe where it is racked."""
+    out = [f for f in _split_csv(_normalize_null(raw))
+           if f and not _NOISE_FEATURE.match(f)]
+    return sorted(set(out))
+
+
+#: How far apart two ``RealMemory`` figures can be and still be one hardware
+#: type. BIOS and firmware differences run to tens of megabytes out of
+#: hundreds of gigabytes (measured here: 515000 against 515072, 0.01%), while
+#: genuinely different machines differ by tens of percent, so there is a wide
+#: gap to put the line in.
+_MEMORY_TOLERANCE = 0.02
+
+
+def _memory_buckets(values: set[int]) -> dict[int, int]:
+    """Map each ``RealMemory`` figure onto a representative for its type.
+
+    Quantising to whole GB was the obvious fix for the BIOS difference and is
+    the wrong one, because a *grid* has boundaries and the pair that motivated
+    it straddles one: 515000 floors to 502 while 515072 floors to 503, and
+    rounding instead merely moves the boundary somewhere else (measured on
+    this cluster, 58 types by flooring against 62 by rounding, with neither
+    number right). Clustering has no boundaries: values are merged when they
+    are close to *each other*, which is the actual question.
+    """
+    out: dict[int, int] = {}
+    anchor = None
+    for value in sorted(values):
+        if anchor is None or value - anchor > max(anchor * _MEMORY_TOLERANCE, 1):
+            anchor = value
+        out[value] = anchor
+    return out
+
+
+def fetch_node_types() -> list[dict[str, Any]] | None:
+    """The cluster's distinct hardware configurations, with counts.
+
+    The question a first-time user actually has is "what machines are in here",
+    and neither existing surface answers it. `fetch_partitions` aggregates to
+    the partition, which hides that one partition spans two generations of
+    node; a raw node list answers it by burying it, because this cluster has
+    608 nodes and nobody reads 608 rows.
+
+    So nodes are grouped by what a job can ask for: cores, memory, GRES, and
+    the features that are not merely a rack tag. Measured here, that takes 608
+    nodes to a table small enough to read, and it is the table that makes
+    ``--constraint`` and ``--gres`` choosable rather than guessable.
+
+    ``avail`` counts only nodes in a state that can run a job, by the same
+    :func:`_is_allocatable_state` test the partition capacity uses, so a
+    hardware type that exists but is entirely drained reads as zero rather
+    than as an option. ``None`` when ``sinfo`` cannot be read.
+    """
+    if not is_tool_available("sinfo"):
+        return None
+    # %N first and `-N` for one row per node. The name is what makes the
+    # counting right: `sinfo -N` repeats a node once per partition it belongs
+    # to, so counting rows reports a node in six partitions as six machines.
+    # Measured here, row-counting inflated 608 nodes to 1,376.
+    stdout, stderr, rc = _run_command(
+        ["sinfo", "-h", "-N", "-o", "%N|%c|%m|%G|%f|%T|%P"], timeout=_ADVISORY_TIMEOUT
+    )
+    if rc != 0:
+        _note_cluster_error(stderr)
+        return None
+
+    parsed: list[tuple[str, int, int, str, tuple[str, ...], str, str]] = []
+    for line in stdout.splitlines():
+        parts = line.strip().split("|", 6)
+        if len(parts) < 6:
+            continue
+        parsed.append((
+            parts[0].strip(),                              # node name
+            _safe_int(parts[1].rstrip("+")),               # cores
+            _parse_mem_to_mb(parts[2].rstrip("+")),        # RealMemory
+            _normalize_null(parts[3].strip()),             # gres
+            tuple(_node_shape_features(parts[4])),         # features
+            parts[5].strip(),                              # state
+            parts[6].strip().rstrip("*") if len(parts) > 6 else "",
+        ))
+
+    memory_of = _memory_buckets({row[2] for row in parsed})
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for node, cpus, mem, gres, features, state, partition in parsed:
+        key = (cpus, memory_of[mem], gres, features)
+        row = groups.setdefault(key, {
+            "cpus": cpus,
+            "mem_mb": mem,
+            "gres": gres or None,
+            # Typed GRES first, then the node's own features. A count-only
+            # `gpu:4` carries no model at all, which is the common case here,
+            # and a table that renders it as "4x ?" has thrown away the answer
+            # that was sitting in AvailableFeatures.
+            "gpu_types": sorted({m.group(1).replace("_", "-") for m in
+                                 re.finditer(r"gpu:([a-zA-Z0-9._-]+):\d+", gres,
+                                             re.IGNORECASE)}),
+            "gpus_per_node": _parse_gpu_count(gres),
+            "features": list(features),
+            "count": 0,
+            "avail": 0,
+            "partitions": [],
+            "_nodes": {},
+        })
+        # The group's minimum, because that is the figure a `--mem` has to fit
+        # inside on every node of the type.
+        row["mem_mb"] = min(row["mem_mb"], mem)
+        if row["gpus_per_node"] and not row["gpu_types"]:
+            detected = _detect_gpu_type(",".join(features), gres)
+            if detected and detected != "gpu":
+                row["gpu_types"] = [detected]
+        # Last state wins for a node seen twice; every row for one node
+        # reports the same state, so which one is immaterial.
+        row["_nodes"][node] = state
+        if partition and partition not in row["partitions"]:
+            row["partitions"].append(partition)
+
+    out: list[dict[str, Any]] = []
+    for row in groups.values():
+        nodes = row.pop("_nodes")
+        row["count"] = len(nodes)
+        row["avail"] = sum(1 for s in nodes.values() if _is_allocatable_state(s))
+        row["partitions"] = sorted(row["partitions"])
+        out.append(row)
+    # GPU types first, then by how many there are: the two things that decide
+    # whether a reader keeps looking.
+    out.sort(key=lambda r: (not r["gpus_per_node"], -r["count"]))
+    return out
+
+
+#: Slurm's pending reasons, and what each one means the caller should do.
+#:
+#: ``squeue``'s ``%R`` is the most useful column on the screen and the least
+#: legible: ``Priority`` and ``Resources`` look interchangeable and are not
+#: (one is other people, one is hardware), while a ``QOSMax...`` code is not a
+#: wait at all, it is a cap that will not clear until something of yours
+#: finishes. A first-time user reads all of them as "be patient", and for
+#: three of the five that is the wrong answer.
+#:
+#: Matched on a prefix, because Slurm suffixes several of these with the limit
+#: that tripped, and unmatched codes are reported verbatim rather than guessed
+#: at.
+PENDING_REASONS: dict[str, str] = {
+    "Priority": "other jobs are ahead of yours in the queue; this clears on its "
+                "own, and a shorter --time usually moves it up",
+    "Resources": "the job is next in line but the hardware it asked for is busy; "
+                 "asking for less (fewer nodes, fewer GPUs, less memory) can start sooner",
+    "Dependency": "it is waiting on another job you named with --dependency",
+    "DependencyNeverSatisfied": "the job it depends on failed, so this will NEVER "
+                                "start; cancel it with scancel",
+    "JobHeldUser": "you held it; release it with 'scontrol release <jobid>'",
+    "JobHeldAdmin": "an administrator held it; this needs a support ticket",
+    "BeginTime": "you asked for a later start with --begin",
+    "ReqNodeNotAvail": "a node matching the request is down, drained or reserved; "
+                       "check the --constraint and --nodelist you asked for",
+    "PartitionTimeLimit": "the --time asked for is longer than the partition allows, "
+                          "so it will never start here; lower it or pick another partition",
+    "PartitionNodeLimit": "more nodes were asked for than the partition has",
+    "PartitionDown": "the partition is not accepting jobs right now",
+    "PartitionInactive": "the partition is configured but not active",
+    "AssocMaxJobsLimit": "your account is at its limit of running jobs; one has to "
+                         "finish before this starts",
+    "AssocGrpCPURunMinutes": "the account's CPU-minutes budget is exhausted for now; "
+                             "a shorter --time makes the job cheaper and can start it",
+    "QOSMaxJobsPerUserLimit": "you are at the QOS cap on running jobs; this is a cap, "
+                              "not a queue, so it clears when one of yours finishes",
+    "QOSMaxCpuPerUserLimit": "you are at the QOS cap on CPUs in use",
+    "QOSMaxGRESPerUser": "you are at the QOS cap on GPUs in use",
+    "QOSGrpCpuLimit": "the QOS as a whole is at its CPU cap, across every user on it",
+    "QOSMaxWallDurationPerJobLimit": "the --time asked for is longer than the QOS allows, "
+                                     "so it will never start; lower it",
+    "AccountNotAllowed": "this account may not submit to this partition",
+    "QOSNotAllowed": "this QOS may not be used on this partition",
+    "Licenses": "waiting on a software licence",
+    "NodeDown": "a node assigned to the job went down",
+    "ReqNodeNotAvailable": "a node matching the request is unavailable",
+}
+
+
+def explain_pending(reason: str) -> str:
+    """What a ``squeue`` pending reason means for the caller, or "".
+
+    Empty when the code is not one we have written down. Saying nothing is
+    correct there: Slurm has dozens of these, several are site plugins, and a
+    plausible-sounding guess about why a job is stuck is worse than the raw
+    code, which the reader can at least search for.
+    """
+    text = str(reason or "").strip()
+    if not text:
+        return ""
+    if text in PENDING_REASONS:
+        return PENDING_REASONS[text]
+    # Slurm suffixes several codes with the limit that tripped
+    # ("QOSMaxJobsPerUserLimit" vs "QOSMaxCpuPerUserLimit"), and a site plugin
+    # can append its own. Longest prefix first, so the specific code wins over
+    # a shorter one that happens to be its prefix.
+    for code in sorted(PENDING_REASONS, key=len, reverse=True):
+        if text.startswith(code):
+            return PENDING_REASONS[code]
+    return ""
+
+
+def fetch_my_jobs(user: str | None = None) -> list[dict[str, Any]] | None:
+    """The caller's jobs, with Slurm's own reason for each pending one.
+
+    "Why is my job still pending" is the question a first-time user asks
+    immediately after their first submit, and answering it takes reading a
+    column most people do not know exists: ``squeue``'s ``%R`` carries the
+    scheduler's own word (``Priority``, ``Resources``, ``QOSMaxJobsPerUser``,
+    ``ReqNodeNotAvail``), and those four mean four completely different things
+    to do next.
+
+    ``None`` when ``squeue`` cannot be read. An empty list is a real answer:
+    you have no jobs.
+    """
+    if not is_tool_available("squeue"):
+        return None
+    name = user or _current_username()
+    if not name:
+        return None
+    stdout, stderr, rc = _run_command(
+        ["squeue", "-u", name, "-h", "-o", "%i|%j|%T|%P|%M|%l|%D|%R"],
+        timeout=_ADVISORY_TIMEOUT,
+    )
+    # stderr as well as the exit status, because squeue does not use the exit
+    # status for this: `squeue -u nosuchuser` prints "error: Invalid user" and
+    # **exits 0** with an empty listing (measured). Reading only `rc` turned a
+    # name that does not exist into the confident answer "no jobs".
+    if rc != 0 or "error:" in (stderr or "").lower():
+        _note_cluster_error(stderr)
+        return None
+
+    jobs: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        parts = line.strip().split("|", 7)
+        if len(parts) < 8:
+            continue
+        state = parts[2].strip().upper()
+        tail = parts[7].strip()
+        jobs.append({
+            "job_id": parts[0].strip(),
+            "name": parts[1].strip(),
+            "state": state,
+            "partition": parts[3].strip(),
+            "elapsed": parts[4].strip(),
+            "time_limit": parts[5].strip(),
+            "nodes": _safe_int(parts[6]),
+            # One column, two meanings, and conflating them is how a node list
+            # gets read as a reason. Pending jobs carry the scheduler's reason
+            # in (parentheses); running ones carry the nodes they are on.
+            "reason": tail.strip("()") if state == "PENDING" else None,
+            "nodelist": None if state == "PENDING" else tail,
+        })
+    return jobs
+
+
+def fetch_queue_depth() -> dict[str, dict[str, int]] | None:
+    """Running and pending job counts per partition, in one ``squeue`` call.
+
+    A capacity table says what a partition *is*, never whether anything can
+    get on it today. Two partitions that read identically here differ by an
+    eight-hour wait, and that is usually the fact a choice actually turns on:
+    a caller picking between ``caslake`` and ``amd`` from node counts alone is
+    choosing on the one axis that does not vary.
+
+    :func:`fetch_queue_eta` already answers this and much more, but it is
+    per-partition and reaches for ``sbatch --test-only``; over the 21
+    partitions a brief lists that is 21 controller round trips for a number
+    this gets for all of them at once. So this is the cheap half, deliberately
+    without the ETA: a depth is a measurement, while a wait time for a job
+    nobody has described would be a guess wearing a number.
+
+    ``None`` when ``squeue`` cannot be read, which callers must not render as
+    an idle cluster. Partitions with no jobs are simply absent from the
+    mapping, so a reader defaults them to zero only when the call succeeded.
+    """
+    if not is_tool_available("squeue"):
+        return None
+    stdout, stderr, rc = _run_command(
+        ["squeue", "-a", "-h", "-o", "%P|%T"], timeout=_ADVISORY_TIMEOUT
+    )
+    if rc != 0:
+        _note_cluster_error(stderr)
+        return None
+
+    depth: dict[str, dict[str, int]] = {}
+    for line in stdout.splitlines():
+        name, _, state = line.strip().partition("|")
+        name = name.strip().rstrip("*")
+        if not name:
+            continue
+        row = depth.setdefault(name, {"running": 0, "pending": 0})
+        # Only the two states a chooser can act on. A COMPLETING or a
+        # CANCELLED job is leaving, and counting it as queue depth overstates
+        # the wait it implies.
+        key = state.strip().upper()
+        if key == "RUNNING":
+            row["running"] += 1
+        elif key == "PENDING":
+            row["pending"] += 1
+    return depth
+
+
+def fetch_reachable_partitions(accounts: list[str] | None = None) -> set[str] | None:
+    """Partitions at least one of the caller's accounts may submit to.
+
+    The question `fetch_public_partitions` does not answer. "Open to all
+    accounts" and "open to me" are different sets, and on a multi-PI cluster
+    the gap between them is most of the machine: measured here, the public set
+    is 6 of 88 while the caller holds 34 accounts, and ``beagle3`` (which they
+    hold ``beagle3-users`` for) is in neither the public set nor, before this,
+    anything a caller could ask for. A tool that filters on "public" and then
+    tells an agent never to name a partition it did not list has talked that
+    agent out of a partition the user pays for.
+
+    One ``scontrol show partition -o``, the same call
+    :func:`fetch_public_partitions` makes, so this costs nothing extra when
+    both run. The allow/deny rules are :func:`partition_account_refusal`'s,
+    applied per account instead of to one: that function was verified against
+    ``sbatch --test-only`` over all 88 partitions here (61 refusals predicted,
+    61 refused, zero false refusals), and reusing the rules rather than
+    restating them is what keeps this set honest.
+
+    Returns ``None`` when nothing can be established (no ``scontrol``, an
+    unreadable answer, or no accounts to test), which callers must read as "do
+    not filter" rather than as "you may use none". **Fails open per partition**
+    too: ``AllowGroups`` cannot be evaluated without the caller's group list,
+    so a partition gated only by a group is included. An over-wide set costs a
+    wasted `--test-only`; a too-narrow one costs a partition the user owns.
+    """
+    if not is_tool_available("scontrol"):
+        return None
+    names = accounts if accounts is not None else fetch_user_accounts()
+    if not names:
+        return None
+
+    # WIDE (`-a`), like the two ACL fetchers and unlike
+    # `fetch_public_partitions`, which reads the same command narrowly. The
+    # rule is the question, not the call: this one asks about *entitlement*,
+    # and ``Hidden=YES`` is a display setting rather than an ACL, so a hidden
+    # partition an account may submit to is a true answer that the
+    # non-privileged view simply does not return. See
+    # `_fetch_all_partition_names_uncached`, which states the rule, and
+    # `tests/test_partition_query_width.py`, which freezes it.
+    stdout, stderr, rc = _run_command(
+        ["scontrol", "-a", "show", "partition", "-o"], timeout=_ADVISORY_TIMEOUT
+    )
+    if rc != 0:
+        _note_cluster_error(stderr)
+        return None
+
+    reachable: set[str] = set()
+    seen_any = False
+    for line in stdout.splitlines():
+        partition = _extract_token(line, "PartitionName")
+        if not partition:
+            continue
+        seen_any = True
+        acl = {
+            "allow": _split_csv(_normalize_null(_extract_token(line, "AllowAccounts"))),
+            "deny": _split_csv(_normalize_null(_extract_token(line, "DenyAccounts"))),
+            "nobody": _acl_is_nobody(_extract_token(line, "AllowAccounts")),
+        }
+        if any(partition_account_refusal(partition, a, acl) is None for a in names):
+            reachable.add(partition)
+    return reachable if seen_any else None
+
+
 def fetch_account_acl(partition: str) -> dict[str, Any]:
     """A partition's *account* ACL, as ``{"allow", "deny", "nobody"}``.
 
     The mirror of :func:`fetch_qos_acl` for the field that decides
     **entitlement** rather than shape. Every other partition check asks whether
-    a partition *could* run this job — CPUs, memory, nodes, GPUs, time limit,
+    a partition *could* run this job: CPUs, memory, nodes, GPUs, time limit,
     array size. None of them asks whether it will run it *for you*, and on a
     multi-PI cluster that is what almost always says no: measured here, 61 of 88
     partitions refuse this user outright, and 60 of those refusals are written
@@ -2630,13 +3142,13 @@ def fetch_account_acl(partition: str) -> dict[str, Any]:
     ``allow`` keeps Slurm's ``ALL`` sentinel verbatim (as ``fetch_qos_acl``
     does). ``nobody`` is the opposite sentinel, ``AllowAccounts=none``, split out
     into its own flag precisely because an empty ``allow`` is otherwise
-    ambiguous — it is also what an unreadable field returns, and "no account may
+    ambiguous; it is also what an unreadable field returns, and "no account may
     submit here" must not be inferred from "I could not ask".
 
     ``-a`` for the same reason ``sinfo -a`` is used to validate a partition name
     (see :func:`_fetch_all_partition_names_uncached`): ``partition`` is a name the
     *user* supplied, and without ``SHOW_ALL`` the controller does not return a
-    ``Hidden=YES`` partition to an ordinary user — ``scontrol show partition test``
+    ``Hidden=YES`` partition to an ordinary user: ``scontrol show partition test``
     answers "Partition test not found", rc 1. That is indistinguishable here from
     a broken ``scontrol``, so the ACL came back empty and the refusal went
     unsaid: measured on midway3, ``test`` is ``AllowAccounts=none`` and the
@@ -2669,7 +3181,7 @@ def partition_account_refusal(
     The gap this closes is not a wrong message but a *missing* one. With
     ``sbatch`` reachable, slurmate already relays the controller's own verdict,
     so a partition the user has no account for is caught. With ``sbatch`` absent
-    — drafting on a login node that has none, or for another cluster — the live
+    (drafting on a login node that has none, or for another cluster) the live
     verdict is gone and nothing replaced it: measured, ``--print -p kicp``
     (``AllowAccounts=kicp``, an account this user does not hold) wrote the full
     script with **zero bytes on stderr and rc=0**, while the controller refuses
@@ -2679,11 +3191,11 @@ def partition_account_refusal(
     Deliberately narrower than Slurm's own gate, because a false refusal is the
     worse failure (SM-4):
 
-    - No ACL, an unreadable one, or ``AllowAccounts=ALL`` — silent.
-    - ``AllowAccounts=none`` — refused whatever the account is, since no value
+    - No ACL, an unreadable one, or ``AllowAccounts=ALL``: silent.
+    - ``AllowAccounts=none``: refused whatever the account is, since no value
       can satisfy it. The one case that needs no ``--account`` to decide.
-    - An explicit allow list and an explicit account not on it — refused.
-    - **No** ``--account`` against an explicit allow list — silent. The site
+    - An explicit allow list and an explicit account not on it: refused.
+    - **No** ``--account`` against an explicit allow list: silent. The site
       default account is resolved by the controller, not visible here, and
       guessing it is how a valid job gets rejected.
 
@@ -2695,7 +3207,7 @@ def partition_account_refusal(
         return None
     if acl.get("nobody"):
         return (
-            f"partition '{partition}' has AllowAccounts=none — no account can "
+            f"partition '{partition}' has AllowAccounts=none; no account can "
             f"submit to it, so Slurm refuses the job with 'Invalid account or "
             f"account/partition combination specified'"
         )
@@ -2705,7 +3217,7 @@ def partition_account_refusal(
     denied = [a for a in acl.get("deny") or [] if a]
     if name in denied:
         return (
-            f"partition '{partition}' denies account '{name}' (DenyAccounts) — "
+            f"partition '{partition}' denies account '{name}' (DenyAccounts): "
             f"Slurm refuses the job with 'Invalid account or account/partition "
             f"combination specified'"
         )
@@ -2718,7 +3230,7 @@ def partition_account_refusal(
     more = f", ... (+{len(allowed) - len(shown)} more)" if len(allowed) > len(shown) else ""
     return (
         f"account '{name}' cannot use partition '{partition}': it allows only "
-        f"{', '.join(shown)}{more} — Slurm refuses the job with 'Invalid account "
+        f"{', '.join(shown)}{more}; Slurm refuses the job with 'Invalid account "
         f"or account/partition combination specified'"
     )
 
@@ -2729,21 +3241,21 @@ def fetch_qos_acl(partition: str) -> dict[str, list[str]]:
     Slurm expresses this two ways and a site picks one: an explicit ``AllowQos``
     list, or ``AllowQos=ALL`` plus a ``DenyQos`` exclusion list. Reading only the
     allow side means a deny-list site's ``ALL`` expands to every QoS on the
-    cluster — including the ones the partition forbids — which is the same defect
+    cluster (including the ones the partition forbids), which is the same defect
     as offering partitions the user has no association for.
 
     ``ALL`` is kept in the list verbatim, because the picker has to tell "every
     QoS" apart from a one-element list. Slurm's opposite sentinel, ``none``, is
     *not* a name and is dropped (see :func:`_acl_is_nobody`): kept, it became a
     QoS row reading "none" sitting directly under the picker's own
-    "Default (none)" row — two indistinguishable choices, one of which no
+    "Default (none)" row, two indistinguishable choices, one of which no
     controller will accept. It only survived to the screen when ``sacctmgr`` was
     unavailable, since that is the path that deliberately trusts ``scontrol``'s
     list rather than filtering it against a set it could not read.
 
     ``-a`` for the same reason :func:`fetch_account_acl` needs it: ``partition``
     is a name the *user* supplied, and without ``SHOW_ALL`` the controller does
-    not describe a ``Hidden=YES`` partition to an ordinary caller —
+    not describe a ``Hidden=YES`` partition to an ordinary caller:
     ``scontrol show partition climate`` answers "Partition climate not found"
     at rc 1, which falls into the ``rc != 0`` branch below and returns the same
     empty ACL as a missing ``scontrol``. Measured on midway3 by re-applying the
@@ -2756,8 +3268,8 @@ def fetch_qos_acl(partition: str) -> dict[str, list[str]]:
     "type a partition name" row accepts a hidden name, and ``-p`` prefills one.
 
     **This is a display fix and must not become a gate.** The value feeds
-    exactly one thing — the wizard's QoS choice list (``tui``'s
-    ``_resolve_choices``, via :func:`fetch_qos_for_partition`) — and no code
+    exactly one thing, the wizard's QoS choice list (``tui``'s
+    ``_resolve_choices``, via :func:`fetch_qos_for_partition`), and no code
     path refuses a job over it. ``AllowQos`` as a *refusal* check has been
     measured and withdrawn here twice (0 partitions excluded across 25 sampled
     users) because this site's QoS refusals come from a submit plugin that
@@ -2793,8 +3305,8 @@ def _fetch_known_qos_uncached() -> list[str]:
     """Fetch all QoS names known to the system via sacctmgr.
 
     Returns the demo ``MOCK_QOS`` only in mock mode. When sacctmgr is genuinely
-    unavailable (or errors, or lists nothing), returns ``[]`` — an *unknown* set,
-    not the demo names — so the TUI can tell "QoS set unknown" apart from a real
+    unavailable (or errors, or lists nothing), returns ``[]`` (an *unknown* set,
+    not the demo names), so the TUI can tell "QoS set unknown" apart from a real
     list and skip filtering live ``AllowQos`` against a demo fallback (which
     would otherwise silently drop real, lab-specific QoS names).
     """
@@ -2829,19 +3341,19 @@ def fetch_gpu_type_sources(partition: str) -> dict[str, list[str]]:
 
     Returns ``{"typed": [...], "feature": [...], "constraint": [...]}``:
 
-    - ``typed``   — seen in a real ``gpu:MODEL:N`` GRES, so requestable as a GRES
+    - ``typed``: seen in a real ``gpu:MODEL:N`` GRES, so requestable as a GRES
       type (``--gres=gpu:MODEL:N``, ``--gpus=MODEL:N``, …).
-    - ``feature`` — only found in the node's *feature* list, because the node's
+    - ``feature``: only found in the node's *feature* list, because the node's
       GRES is count-only (``gpu:4``). Such a model is **not** a GRES type: asking
       for it with ``--gres=gpu:MODEL:N`` makes Slurm reject the job outright
       ("Requested node configuration is not available"). The only way to request
-      it is ``--gres=gpu:N`` plus ``--constraint=MODEL`` — i.e. ``gpu_format
+      it is ``--gres=gpu:N`` plus ``--constraint=MODEL``: i.e. ``gpu_format
       "constraint"``.
-    - ``constraint`` — models that some node in the partition advertises as a
+    - ``constraint``: models that some node in the partition advertises as a
       node *feature*, so ``--constraint=MODEL`` can name them. This is the
       mirror-image fact, and it is not the complement of ``typed``: a model can
       be both (midway3's ``a100`` is a feature *and* a GRES type on some nodes),
-      or neither-but-typed — a cluster whose nodes carry typed GRES and no
+      or neither-but-typed; a cluster whose nodes carry typed GRES and no
       features at all lists every model under ``typed`` and **none** here, which
       makes ``gpu_format "constraint"`` impossible there. An empty list is
       therefore a measured answer, not a missing one.
@@ -2893,14 +3405,14 @@ def fetch_gpu_type_sources(partition: str) -> dict[str, list[str]]:
                 typed_models.add(candidate)
 
     # Pass 2: collect every typed model on each node (a node can advertise more
-    # than one, e.g. "gpu:a100:2,gpu:v100:2" — a single re.search would drop the
+    # than one, e.g. "gpu:a100:2,gpu:v100:2"; a single re.search would drop the
     # second). Only when a node has no typed model do we fall back to feature
     # scanning, preferring corroboration against the typed models seen elsewhere.
     typed: set[str] = set()
     feature: set[str] = set()
     # Every feature token any node in the partition advertises. Collected for ALL
     # nodes, not only the count-only ones, because "can --constraint name this
-    # model?" is a question a typed-GRES node answers too — and answers "no" on a
+    # model?" is a question a typed-GRES node answers too, and answers "no" on a
     # cluster that publishes no features at all.
     feature_tokens: set[str] = set()
     # Folded model key -> the spelling the GRES itself used. Every comparison
@@ -2968,7 +3480,7 @@ def _extract_first_json(text: str) -> Any:
     """Return the first parseable JSON object in ``text``, or None.
 
     A login shell may print a banner before the JSON, and that banner can itself
-    contain braces — so a naive first-``{``/last-``}`` slice can capture garbage.
+    contain braces, so a naive first-``{``/last-``}`` slice can capture garbage.
     Walk each ``{`` and try to decode from there, tolerating trailing output.
     """
     decoder = json.JSONDecoder()
@@ -2989,7 +3501,7 @@ def fetch_conda_envs(modules: list[str] | None = None) -> list[str]:
 
     Conda is frequently provided by a module (e.g. ``module load anaconda``)
     rather than being on ``PATH`` directly, so when ``modules`` are given we load
-    them first — inside a login shell where ``module`` is defined — and then run
+    them first (inside a login shell where ``module`` is defined), and then run
     ``conda info --json``. Using ``info`` (not ``env list``) gives the authoritative
     ``root_prefix`` and ``envs_dirs``, so the base env is labelled ``base`` (not by
     its install-dir basename) and a ``--prefix`` env outside the envs dirs is kept
@@ -3031,10 +3543,10 @@ def fetch_conda_envs(modules: list[str] | None = None) -> list[str]:
         if root and p == root:
             env_names.append("base")
         elif os.path.dirname(p) in envs_dirs:
-            # A named env under an envs dir — activatable by its basename.
+            # A named env under an envs dir: activatable by its basename.
             env_names.append(os.path.basename(p))
         else:
-            # A --prefix env elsewhere — only the full path activates it.
+            # A --prefix env elsewhere, only the full path activates it.
             env_names.append(p)
     # De-dup while preserving order.
     return list(dict.fromkeys(env_names))
@@ -3067,12 +3579,12 @@ def fetch_available_modules() -> list[str]:
                 mod = mod[:-9].strip()
             # Lmod terse output can carry extras a Tcl-modules parser wouldn't: an
             # alias annotation "(@name)", a tag marker like "(D)"/"<F>", and a
-            # trailing "/" on a family short-name ("gcc/" — loadable as "gcc").
+            # trailing "/" on a family short-name ("gcc/": loadable as "gcc").
             if mod.startswith("(@") or (mod.startswith("<") and mod.endswith(">")) \
                     or (mod.startswith("(") and mod.endswith(")")):
                 continue
             mod = mod.rstrip("/")
-            # Drop the leading `command -v module` probe output — either the
+            # Drop the leading `command -v module` probe output, either the
             # bare "module" function name or its resolved path (/usr/bin/module).
             if not mod or mod == "module" or mod.endswith("/module"):
                 continue
@@ -3081,7 +3593,7 @@ def fetch_available_modules() -> list[str]:
 
 
 def current_username() -> str:
-    """The caller's username, or "" — public alias of :func:`_current_username`."""
+    """The caller's username, or "": public alias of :func:`_current_username`."""
     return _current_username()
 
 
@@ -3104,7 +3616,7 @@ def _fetch_user_accounts_uncached() -> list[str]:
     if not is_tool_available("sacctmgr"):
         # Demo accounts only under SLURMATE_MOCK. On a real cluster without
         # sacctmgr, return nothing rather than fake accounts the user can't
-        # charge to — the account field is free-text, so they type their own.
+        # charge to; the account field is free-text, so they type their own.
         return list(MOCK_ACCOUNTS) if _force_mock() else []
 
     user = _current_username()
@@ -3136,11 +3648,11 @@ def fetch_user_partitions() -> set[str] | None:
     The gate on most clusters is not the partition ACL. Private PI partitions
     routinely advertise ``AllowGroups=ALL AllowAccounts=ALL`` and still reject
     every submission with *"Invalid account or account/partition combination
-    specified"* — what actually decides is the association list in ``sacctmgr``.
+    specified"*; what actually decides is the association list in ``sacctmgr``.
     Filtering the picker on the partition ACL therefore cannot work; filtering on
     associations can.
 
-    Returns ``None`` — meaning "no filtering is justified" — when:
+    Returns ``None`` (meaning "no filtering is justified") when:
 
     - ``sacctmgr`` is missing, errors, or lists nothing, **or**
     - any association row has an *empty* Partition field. Blank means "every
@@ -3175,7 +3687,7 @@ def fetch_user_partitions() -> set[str] | None:
         saw_row = True
         part = fields[1].strip() if len(fields) > 1 else ""
         if not part:
-            return None  # wildcard row — the user is not partition-scoped
+            return None  # wildcard row; the user is not partition-scoped
         named.add(part)
     return named if (saw_row and named) else None
 
@@ -3196,7 +3708,7 @@ def _all_nodes_are_login(node_expr: str) -> bool:
     """Whether every node in a Slurm hostlist expression is a login node.
 
     A cron/service partition's nodes *are* the login nodes, which is a
-    structural signal available on any site — unlike the partition's name.
+    structural signal available on any site: unlike the partition's name.
     Bracketed ranges are collapsed first so ``dali-login[1-2],midway2-login[1-2]``
     splits into two host patterns rather than four comma-separated fragments.
     """
@@ -3211,7 +3723,7 @@ def fetch_system_partitions() -> set[str]:
     """Partition names that are for the scheduler, not for user jobs.
 
     Two cluster-agnostic signals: a small name deny-list, and a partition whose
-    nodes are all login nodes. Both are advisory — callers de-prioritise these
+    nodes are all login nodes. Both are advisory: callers de-prioritise these
     rather than hiding them, since a site can legitimately name a real partition
     anything at all.
     """
@@ -3325,7 +3837,7 @@ def validate_cluster_targets(
     # QoS is the third name Slurm resolves against its own database, and it fails
     # the same way: `--qos` from another site produced a complete script, rc=0,
     # and an "Invalid qos specification" from the controller later. Existence
-    # only — whether a QoS is *permitted on this partition* is set by
+    # only: whether a QoS is *permitted on this partition* is set by
     # AllowQos/DenyQos, and a site using DenyQos would make that check reject
     # valid combinations.
     # ``None`` means the feature list could not be read and nothing can be said.
@@ -3495,7 +4007,7 @@ def _probe_own_option(named: str) -> bool:
 # own text: Slurm puts its verdict on the unprefixed `allocation failure:` line,
 # and its scaffolding ("Batch job submission failed: …") belongs to a real
 # submit. So these lines are the job_submit plugin talking. Read only as a
-# fallback, and only when the plugin said exactly ONE thing — Booth's Pythia
+# fallback, and only when the plugin said exactly ONE thing: Booth's Pythia
 # rejects a batch job on its default partition with a single sentence and leaves
 # Slurm's half as the contentless "Unspecified error", whereas midway3's plugin
 # writes a six-line block whose reason line is already matched above. With
@@ -3511,7 +4023,7 @@ _SLURM_OWN_ERROR_PREFIXES = ("batch job submission failed",)
 # one of these as fatal would fail a CI run for having a job already queued.
 _TRANSIENT_REFUSAL_MARKERS = (
     "maxsubmitjob",      # QOSMaxSubmitJobPerUserLimit, AssocMaxSubmitJobLimit
-    "maxjobsper",        # QOSMaxJobsPerUserLimit — a running-count cap
+    "maxjobsper",        # QOSMaxJobsPerUserLimit; a running-count cap
     "not available now",  # Slurm's own "now" marks the transient variant
     "are down",
     "drained",
@@ -3519,7 +4031,7 @@ _TRANSIENT_REFUSAL_MARKERS = (
 
 # A refusal that describes the *request*: nothing about waiting will fix it, so
 # it is worth blocking a submit and failing --print over. Deliberately a
-# whitelist of measured wordings — anything unrecognised stays advisory, because
+# whitelist of measured wordings; anything unrecognised stays advisory, because
 # a new gate that guesses "permanent" blocks jobs that would have run.
 _PERMANENT_REFUSAL_MARKERS = (
     # An option sbatch cannot parse is not going to start parsing later.
@@ -3539,7 +4051,7 @@ _PERMANENT_REFUSAL_MARKERS = (
     # ones: asking for more nodes than the partition allows ("--nodes 2" where the
     # QoS caps it at 1) and a time limit past the partition's maximum. Neither
     # matched the list above, so both were reported as conditions that clear on
-    # their own — a confident false claim about a job that can never run.
+    # their own; a confident false claim about a job that can never run.
     "node count specification invalid",
     "requested time limit is invalid",
     # The same two mistakes as above, worded the way an older controller words
@@ -3577,8 +4089,8 @@ _PERMANENT_REFUSAL_MARKERS = (
 )
 
 # Slurm's own limit tokens split cleanly on one word. A "...PerJob" limit is a
-# statement about the *request* — no amount of waiting makes a 7-day job fit a
-# 6-hour MaxWall — while the "...PerUser"/"...PerAccount" count limits are about
+# statement about the *request* (no amount of waiting makes a 7-day job fit a
+# 6-hour MaxWall), while the "...PerUser"/"...PerAccount" count limits are about
 # the moment and clear when something finishes. Measured: sbatch answers
 # QOSMaxWallDurationPerJobLimit / QOSMaxCpuPerJobLimit for the former and
 # QOSMaxSubmitJobPerUserLimit for the latter. This is what lets slurmate treat a
@@ -3593,7 +4105,7 @@ def refusal_is_transient(reason: str) -> bool:
     The counterpart to :func:`refusal_is_permanent`, and deliberately not its
     negation: a refusal can be neither. Slurm has many wordings and this module
     has measured a handful, so "not recognised as permanent" must not become
-    "safe to tell the user their script is fine and this will clear" — that is
+    "safe to tell the user their script is fine and this will clear"; that is
     the same unfounded confidence as an ETA for a job the scheduler refused.
     Positive evidence, or the caller says it cannot tell.
     """
@@ -3611,7 +4123,7 @@ def refusal_is_permanent(reason: str) -> bool:
     now*". Measured on Booth's Mercury, whose ``clay`` QoS allows one submitted
     job per user: a perfectly valid script is refused with
     ``QOSMaxSubmitJobPerUserLimit`` whenever another job is already queued.
-    Blocking on that turns a wait into a failure — and in CI, into a red build
+    Blocking on that turns a wait into a failure, and in CI, into a red build
     caused by someone else's job.
 
     Unrecognised wordings are **not** permanent. The cost of guessing wrong in
@@ -3634,8 +4146,8 @@ _CPUS_STATE_RE = re.compile(r"^\s*(\d+)/(\d+)/(\d+)/(\d+)\s*$")
 # that GresUsed appends, and skipping mps/shard entries.
 _NODE_GPU_RE = re.compile(r"(?:^|,)\s*(?:gres/)?gpu(?::[a-zA-Z0-9._-]+)?[:=](\d+)", re.IGNORECASE)
 
-# (_UNSCHEDULABLE_FLAGS — the state flags marking nodes that will not take a
-# normal job — is defined next to _is_allocatable_state above; both the
+# (_UNSCHEDULABLE_FLAGS (the state flags marking nodes that will not take a
+# normal job) is defined next to _is_allocatable_state above; both the
 # partition-level node count and the node-level fit check read the same list.)
 
 
@@ -3663,13 +4175,13 @@ def _scheduler_verdict(
 
     Asks Slurm rather than modelling it. ``sbatch --test-only`` queues nothing but
     returns the backfill placement *and* runs the site's ``job_submit`` plugin,
-    whose rules are not published anywhere — so this is the only estimate that can
+    whose rules are not published anywhere, so this is the only estimate that can
     account for QOS caps, account limits and local policy.
 
     Exactly one of the two values is meaningful:
 
     - a start time means Slurm placed the job;
-    - a non-empty refusal means Slurm **rejected** it — the request cannot be
+    - a non-empty refusal means Slurm **rejected** it; the request cannot be
       scheduled as written, so any ETA computed for it would be fiction. This is
       the case the older code threw away by collapsing "rejected" into the same
       ``None`` as "couldn't ask", which is how a 35x over-request ended up with a
@@ -3729,7 +4241,7 @@ def _scheduler_verdict(
 
 
 def check_script_with_scheduler(script: str) -> str:
-    """Slurm's refusal for this exact script, or "" — submits nothing.
+    """Slurm's refusal for this exact script, or "": submits nothing.
 
     Needed when the script no longer corresponds to the answers: after a hand
     edit in ``$EDITOR`` the answers dict is stale, so validating *it* checks
@@ -3737,8 +4249,8 @@ def check_script_with_scheduler(script: str) -> str:
     bytes themselves cannot drift, and a refusal is authoritative in a way the
     answers-derived checks are not.
 
-    Empty on anything other than a positive refusal — no ``sbatch``, an
-    unreachable controller, an unparsable answer — for the same reason the ETA
+    Empty on anything other than a positive refusal (no ``sbatch``, an
+    unreachable controller, an unparsable answer) for the same reason the ETA
     does: "could not ask" must never render as "cannot run".
     """
     if not script.strip() or not is_tool_available("sbatch"):
@@ -3748,6 +4260,52 @@ def check_script_with_scheduler(script: str) -> str:
     )
     _start, refusal = _read_test_only_output(stdout, stderr, rc)
     return refusal
+
+
+def scheduler_verdict(script: str) -> tuple[str, str]:
+    """``(verdict, reason)``, where verdict distinguishes the three answers.
+
+    :func:`check_script_with_scheduler` returns ``""`` for both "the
+    controller accepted it" and "there was no controller to ask", which is
+    correct for its own caller: that one is looking for a refusal, and its
+    docstring says outright that "could not ask" must never render as "cannot
+    run". The inverse is just as wrong and is the one this exists for.
+    Measured with ``sbatch`` off ``PATH`` entirely, an agent-facing check
+    built on the two-state answer reported ``verdict: accepted`` with zero
+    findings, which is a confident pass on a cluster it had not read one byte
+    from.
+
+    ``unavailable`` is therefore its own word: no ``sbatch``, an empty script,
+    or a controller that could not be reached. A caller may treat a refusal as
+    bad news and an acceptance as good news, but it must not treat silence as
+    either.
+    """
+    if not script.strip():
+        return "unavailable", "there is no script to check"
+    if _force_mock():
+        # Demo mode fabricates the cluster, so it fabricates the controller
+        # too: `fetch_partitions` returns MOCK_PARTITIONS rather than nothing,
+        # and a scheduler that alone refused to answer would make the whole
+        # walkthrough unusable. Honest because `mock` is reported at the top
+        # of every document this feeds, and it changes nothing for the case
+        # this tri-state exists for, which is a REAL machine with no sbatch.
+        return "accepted", ""
+    if not is_tool_available("sbatch"):
+        return "unavailable", "sbatch is not on PATH, so the scheduler could not be asked"
+    stdout, stderr, rc = _run_command(
+        ["sbatch", "--test-only", "--parsable"], timeout=20, stdin=script
+    )
+    start, refusal = _read_test_only_output(stdout, stderr, rc)
+    if refusal:
+        return "refused", refusal
+    # A refusal is a positive answer and so is a verdict marker. Neither means
+    # the controller never answered at all, which `_read_test_only_output`
+    # reports by giving back no start time and no refusal.
+    if start is None and rc != 0:
+        detail = (stderr or "").strip().splitlines()
+        return "unavailable", (detail[-1] if detail
+                               else "the controller gave no usable answer")
+    return "accepted", ""
 
 
 def _read_test_only_output(stdout: str, stderr: str, rc: int) -> tuple[int | None, str]:
@@ -3767,8 +4325,8 @@ def _read_test_only_output(stdout: str, stderr: str, rc: int) -> tuple[int | Non
         delta = int((start - datetime.now()).total_seconds())
         # Slurm reports the placement in the *controller's* local time, compared
         # here against the *login node's* clock. A few seconds in the past is
-        # ordinary — "start immediately", plus the latency between asking and
-        # parsing — but a large negative gap is evidence the two disagree (a
+        # ordinary ("start immediately", plus the latency between asking and
+        # parsing), but a large negative gap is evidence the two disagree (a
         # different timezone, or drift), and clamping that to 0 turned it into a
         # confident "ETA: now" for a job starting hours later. Unknown is the
         # honest answer; the caller then falls through to its own estimate.
@@ -3781,7 +4339,7 @@ def _read_test_only_output(stdout: str, stderr: str, rc: int) -> tuple[int | Non
         return max(0, delta), ""
 
     if rc == 0:
-        # Accepted but no placement line to parse — no verdict either way.
+        # Accepted but no placement line to parse: no verdict either way.
         return None, ""
     return None, _test_only_refusal(combined)
 
@@ -3791,8 +4349,8 @@ def _lone_site_message(output: str) -> str:
 
     The fallback for a plugin that does not use Slurm's ``Reason:`` convention.
     Without it, Pythia's *"Batch jobs cannot use the `interactive_*` partitions."*
-    was dropped and the user was shown Slurm's half alone — "Unspecified error",
-    which names nothing and suggests nothing — on that cluster's **default**
+    was dropped and the user was shown Slurm's half alone ("Unspecified error",
+    which names nothing and suggests nothing) on that cluster's **default**
     partition, i.e. on the shipped-defaults path.
 
     The caller only consults this once Slurm's own ``allocation failure:`` verdict
@@ -3814,7 +4372,7 @@ def _lone_site_message(output: str) -> str:
 def _test_only_refusal(output: str) -> str:
     """The reason ``sbatch --test-only`` gave for refusing, or ``""``.
 
-    Requires one of Slurm's two verdict markers — ``allocation failure: <why>``
+    Requires one of Slurm's two verdict markers: ``allocation failure: <why>``
     (its own) or ``Reason: <why>`` (the site ``job_submit`` plugin's, and the more
     specific of the pair, e.g. *"Invalid account [foo]"* vs *"Access/permission
     denied"*). A non-zero exit on its own is **not** enough: sbatch also fails
@@ -3844,8 +4402,8 @@ def _test_only_refusal(output: str) -> str:
     specific = reason.group(1).strip() if reason else ""
     generic = failure.group(1).strip() if failure else ""
     # Only enrich a verdict Slurm has actually rendered. A bare `sbatch: error:`
-    # line is not positive evidence of one — sbatch prints those for an
-    # unreachable controller and for its own usage errors too — so the site's
+    # line is not positive evidence of one (sbatch prints those for an
+    # unreachable controller and for its own usage errors too), so the site's
     # sentence is read as the *specific half of a refusal*, never as the refusal.
     if generic and not specific:
         specific = _lone_site_message(output)
@@ -3853,7 +4411,7 @@ def _test_only_refusal(output: str) -> str:
         # Keep both halves. A site job_submit plugin's Reason is the more useful
         # one to read ("Account is not specified" beats "Access/permission
         # denied"), but Slurm's own generic verdict underneath is the half that
-        # can be *classified* — every marker list here is written against Slurm's
+        # can be *classified*; every marker list here is written against Slurm's
         # wordings, not against whatever a site's plugin chooses to say. Showing
         # only the specific reason therefore threw away the classification: on
         # midway3, whose plugin emits a six-line block ending in
@@ -3886,7 +4444,7 @@ def _scheduler_start_estimate(
     account: str,
     qos: str,
 ) -> int | None:
-    """Seconds until this request would start, or ``None`` — see
+    """Seconds until this request would start, or ``None``: see
     :func:`_scheduler_verdict`, which also reports *why* when Slurm refuses."""
     start, _ = _scheduler_verdict(
         partition, req_nodes, cpus, mem_mb, gpus_per_node, gpu_type, time_limit, account, qos
@@ -3969,8 +4527,8 @@ def default_memory_for(part: dict[str, Any] | None, cpus: int) -> tuple[str, str
     57 GB node and generates a permanently unschedulable script on an 8 GB one,
     and the user who never passed ``--memory`` has no reason to suspect either.
     Sizing it as ``mem_per_node × cores / cpus_per_node`` gives the request the
-    same share of the node's memory as of its cores — the same thing a site's own
-    ``DefMemPerCPU`` does — and can never exceed what a node has.
+    same share of the node's memory as of its cores (the same thing a site's own
+    ``DefMemPerCPU`` does), and can never exceed what a node has.
     """
     mem_node = _safe_int(str((part or {}).get("mem_per_node_mb") or 0))
     if mem_node <= 0:
@@ -3998,8 +4556,8 @@ def default_memory_for(part: dict[str, Any] | None, cpus: int) -> tuple[str, str
 def resolve_request_mem_mb(answers: dict[str, Any]) -> int:
     """Per-node memory the built script will request, in MB; 0 when unset.
 
-    Mirrors the builder's precedence — a custom ``--mem`` / ``--mem-per-cpu`` flag
-    suppresses the auto directive, and ``--mem-per-cpu`` wins over ``--mem`` — so
+    Mirrors the builder's precedence; a custom ``--mem`` / ``--mem-per-cpu`` flag
+    suppresses the auto directive, and ``--mem-per-cpu`` wins over ``--mem``, so
     the ETA is computed against the request the script actually makes.
     """
     try:
@@ -4051,7 +4609,7 @@ def fetch_queue_eta(
     Three tiers, best first, with ``source`` in the result naming which one
     answered so the caller can qualify what it shows:
 
-    ``scheduler``   ``sbatch --test-only`` — Slurm's own backfill placement.
+    ``scheduler``   ``sbatch --test-only``: Slurm's own backfill placement.
     ``resources``   nodes with enough free CPU/memory/GPU, counted per node.
     ``pressure``    a queue-depth heuristic; the last resort.
 
@@ -4076,7 +4634,7 @@ def fetch_queue_eta(
 
     # Capture the return code. Discarding it made a failed or timed-out squeue
     # indistinguishable from an empty queue, so the summary reported
-    # "0 running / 0 pending" as a measurement — the report's own cross-cutting
+    # "0 running / 0 pending" as a measurement; the report's own cross-cutting
     # root cause ("a subprocess's error channel is not read"), and SM-19's defect
     # arriving through the failure path instead of a missing partition.
     stdout, _, queue_rc = _run_command(
@@ -4115,8 +4673,8 @@ def fetch_queue_eta(
             # and the caller must not render them as one.
             "queue_known": queue_known,
             "eta_seconds": eta_sec,
-            # A rejected request has no wait time. Reporting one — "~60s" for a
-            # job Slurm just refused — is worse than reporting nothing, because
+            # A rejected request has no wait time. Reporting one ("~60s" for a
+            # job Slurm just refused) is worse than reporting nothing, because
             # it is specific and confident and never going to happen.
             "eta_label": label or (_format_eta(eta_sec) if feasible else "never"),
             "source": source,
@@ -4133,7 +4691,7 @@ def fetch_queue_eta(
             "refusal_is_transient": transient,
         }
 
-    # Tier 1 — ask the scheduler.
+    # Tier 1: ask the scheduler.
     scheduled, refusal = _scheduler_verdict(
         partition, req_nodes, cpus, mem_mb, gpus_per_node, gpu_type, time_limit,
         account, qos, array_spec, constraint, script,
@@ -4161,7 +4719,7 @@ def fetch_queue_eta(
             label=label, permanent=permanent, transient=transient,
         )
 
-    # Tier 2 — count nodes that genuinely fit the per-node share of the request.
+    # Tier 2: count nodes that genuinely fit the per-node share of the request.
     per_node_cpus = -(-cpus // max(req_nodes, 1)) if cpus > 0 else 0
     per_node_mem = -(-mem_mb // max(req_nodes, 1)) if mem_mb > 0 else 0
     fitting = _nodes_that_fit(partition, per_node_cpus, per_node_mem, gpus_per_node)
@@ -4169,13 +4727,13 @@ def fetch_queue_eta(
         if fitting >= req_nodes:
             return _result(0, "resources")
         # Nothing fits right now: fall through to a pressure estimate, but never
-        # back to "immediate" — the whole point is that state labels lied.
+        # back to "immediate"; the whole point is that state labels lied.
         if running == 0:
             return _result(300, "resources")
         pressure = pending / max(1, running)
         return _result(max(60, int(min(pressure * 120, 7200))), "resources")
 
-    # Tier 3 — neither the scheduler nor per-node data is available. A queue-depth
+    # Tier 3: neither the scheduler nor per-node data is available. A queue-depth
     # guess is all that is left; it is deliberately never 0, because without
     # resource data there is no evidence anything is actually free.
     #
@@ -4207,7 +4765,7 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
     # log directories before this check meant mock mode (and any host without
     # sbatch) left stray "logs/" trees behind while reporting "no job submitted".
     if not is_tool_available("sbatch"):
-        return 0, "", "sbatch not available (mock mode) — no job submitted"
+        return 0, "", "sbatch not available (mock mode): no job submitted"
 
     # Create the log directories the script's #SBATCH --output/--error point at,
     # so Slurm doesn't fail the job on a missing directory.
@@ -4238,8 +4796,8 @@ def submit_sbatch(script_content: str, job_name: str = "slurm") -> tuple[int, st
             # surrogateescape, not replace: `errors` governs the *input* encoding
             # too, and under a non-UTF-8 locale a --command carrying UTF-8 bytes
             # arrives as lone surrogates. "replace" would send sbatch a "?" for
-            # each one — silently running a different command than the user typed
-            # — where surrogateescape hands back the original bytes exactly.
+            # each one, silently running a different command than the user typed,
+            # where surrogateescape hands back the original bytes exactly.
             errors="surrogateescape",
         )
     except subprocess.TimeoutExpired:
@@ -4260,8 +4818,8 @@ _PARSABLE_ID_RE = re.compile(r"^(\d+)(?:;(\S+))?$")
 # Slurm's own non-parsable wording, which is what a site wrapper that drops
 # --parsable prints, and what a federated submit prints even with it:
 # "Submitted batch job 12345" / "... on cluster mercury". Recognising a second
-# *exact* shape is not the number-scraping the docstring below rules out — it is
-# still a fixed format, just Slurm's other one — and without it the id is lost
+# *exact* shape is not the number-scraping the docstring below rules out (it is
+# still a fixed format, just Slurm's other one), and without it the id is lost
 # whenever a wrapper reformats the output, taking the squeue/scancel hints and
 # the saved script's filename with it.
 _SUBMITTED_ID_RE = re.compile(
@@ -4280,7 +4838,7 @@ def parse_submitted_job_id(raw: str) -> str:
     shell may print a banner before the JSON"); the submit path did not.
 
     Matches only a line of the exact expected shape, and returns "" rather than
-    guessing when none is present — a banner can itself contain digits, so
+    guessing when none is present; a banner can itself contain digits, so
     scraping the first number out of arbitrary text would substitute one wrong
     answer for another. ``;cluster`` is stripped: it is not part of the id that
     ``squeue``/``scancel`` want.
@@ -4304,10 +4862,10 @@ _SBATCH_OPT_RE = re.compile(r"^(--?[A-Za-z][A-Za-z0-9-]*)(?:=|\s+)(.*)$")
 def _sbatch_log_path(line: str, kind: str | None = None) -> str:
     """Extract the path from a ``#SBATCH`` output/error directive.
 
-    Handles every spelling ``sbatch`` itself accepts — ``--output=PATH``,
+    Handles every spelling ``sbatch`` itself accepts: ``--output=PATH``,
     ``--output PATH`` (long option + space, previously missed, so the directory
     went un-created and Slurm could fail the job), ``-o PATH`` and the ``--error``
-    /``-e`` equivalents — strips surrounding quotes, and returns "" for anything
+    /``-e`` equivalents: strips surrounding quotes, and returns "" for anything
     else (or a valueless directive, which must not raise).
 
     ``kind`` restricts the match to ``"output"`` or ``"error"``; the default
@@ -4330,7 +4888,7 @@ def _sbatch_log_path(line: str, kind: str | None = None) -> str:
 
 
 # Slurm's filename patterns, split by whether slurmate can know the value before
-# the job starts. %% is a literal percent and must be consumed as a unit — a
+# the job starts. %% is a literal percent and must be consumed as a unit; a
 # naive str.replace turns "%%j" into "%<jobid>" when Slurm writes "%j".
 _LOG_PATTERN_UNKNOWABLE = frozenset("aNnts")
 
@@ -4340,7 +4898,7 @@ def expand_log_pattern(
 ) -> tuple[str, list[str]]:
     """Resolve what we can in a Slurm log pattern.
 
-    Returns ``(path, unresolved)`` — the expanded path, and the pattern letters
+    Returns ``(path, unresolved)``; the expanded path, and the pattern letters
     left in it because their value does not exist yet (``%a`` per array task,
     ``%N``/``%n``/``%t``/``%s`` per node/task/step). The caller needs that list:
     printing a ``tail -f`` for a path still containing ``%a`` offers the user a
@@ -4361,7 +4919,7 @@ def expand_log_pattern(
             continue
         nxt = pattern[i + 1]
         if nxt == "%":
-            out.append("%")          # literal percent — do not re-scan it
+            out.append("%")          # literal percent: do not re-scan it
         elif known.get(nxt):
             out.append(str(known[nxt]))
         else:
@@ -4378,8 +4936,8 @@ def effective_log_path(script: str, kind: str = "output") -> str:
     Scans the whole script and keeps the **last** matching directive, because
     that is the one Slurm honours when a script carries more than one (measured:
     with two conflicting options, only the final one takes effect). Reading the
-    *first* match is how the submit report came to print — and offer a ``tail -f``
-    for — a file the job never wrote.
+    *first* match is how the submit report came to print (and offer a ``tail -f``
+    for) a file the job never wrote.
     """
     val = ""
     for line in script.splitlines():
@@ -4459,7 +5017,7 @@ def _coerce_config_value(v: str) -> Any:
     """Parse one value for the naive key=value fallback parser.
 
     Handles quoted strings, arrays (with quoted *or* bare numeric items), ints,
-    floats, negatives and booleans. Best-effort only — real TOML (tomllib/tomli)
+    floats, negatives and booleans. Best-effort only: real TOML (tomllib/tomli)
     is used whenever available; this is the last resort.
     """
     v = v.strip()
@@ -4508,7 +5066,7 @@ CONFIG_ALIASES: dict[str, str] = {
 # Tables whose contents are merged over the top-level keys, best last.
 CONFIG_SECTIONS: tuple[str, ...] = ("defaults", "slurmate")
 
-# (file, tag) pairs already reported this process — see :func:`_config_notice`.
+# (file, tag) pairs already reported this process: see :func:`_config_notice`.
 _CONFIG_NOTICES_SHOWN: set[str] = set()
 
 # Display path of the file the last :func:`load_config` read; "" when none.
@@ -4568,7 +5126,7 @@ def _parse_config_naive(text: str, path: Any = None) -> dict[str, Any]:
         import sys
         print(
             f"slurmate: warning: unclosed array for '{pending_key}' in the "
-            f"configuration file — ignoring it",
+            f"configuration file: ignoring it",
             file=sys.stderr,
         )
 
@@ -4633,8 +5191,8 @@ def _reset_config_notices() -> None:
 def config_source() -> str:
     """Where the last :func:`load_config` got its values; "" if nowhere.
 
-    Recorded rather than returned so the existing ``load_config()`` signature —
-    used by both the batch path and the wizard — does not have to change.
+    Recorded rather than returned so the existing ``load_config()`` signature (
+    used by both the batch path and the wizard) does not have to change.
     """
     return _CONFIG_SOURCE
 
@@ -4650,8 +5208,8 @@ def _warn_unknown_config_sections(names: Iterable[str], path: Any) -> None:
         _config_notice(
             path,
             f"section:{name}",
-            f"slurmate: {where}: ignoring unknown section '[{name}]' — put keys at "
-            f"the top level or under [defaults]/[slurmate]",
+            f"slurmate: {where}: ignoring unknown section '[{name}]' (put keys "
+            f"at the top level or under [defaults]/[slurmate])",
         )
 
 
@@ -4666,7 +5224,7 @@ def _normalize_config_keys(config: dict[str, Any], path: Any) -> dict[str, Any]:
     """
     where = _config_display_path(path)
     out: dict[str, Any] = {}
-    # Which spelling filled each slot, and whether it was the real key name — so
+    # Which spelling filled each slot, and whether it was the real key name, so
     # `time` losing to `time_limit` is reported whichever order they appear in.
     filled: dict[str, tuple[str, bool]] = {}
 
@@ -4674,7 +5232,7 @@ def _normalize_config_keys(config: dict[str, Any], path: Any) -> dict[str, Any]:
         _config_notice(
             path,
             f"dupe:{loser}",
-            f"slurmate: {where}: '{loser}' ignored — '{winner}' is also set",
+            f"slurmate: {where}: '{loser}' ignored: '{winner}' is also set",
         )
 
     for raw_key, value in config.items():
@@ -4682,7 +5240,7 @@ def _normalize_config_keys(config: dict[str, Any], path: Any) -> dict[str, Any]:
         key = CONFIG_ALIASES.get(dashed, dashed)
         if key not in CONFIG_KEYS:
             hint = _near_misses(dashed, sorted(CONFIG_KEYS), limit=1)
-            suffix = f" — did you mean '{hint[0]}'?" if hint else " — ignoring it"
+            suffix = f": did you mean '{hint[0]}'?" if hint else ", ignoring it"
             _config_notice(
                 path,
                 f"key:{raw_key}",
@@ -4726,10 +5284,10 @@ def load_config() -> dict[str, Any]:
 
     First-file-wins was the previous behaviour, and it made a project file
     *destructive*: a one-line ``.slurmate.toml`` naming this cluster's partition
-    discarded the global account, memory, time limit and module list — silently,
+    discarded the global account, memory, time limit and module list: silently,
     and each with its own failure (a rejected or mischarged job, an OOM kill, a
     truncated run, an unloaded environment). That is the most natural use of the
-    feature, and every config system a user has met — git, ssh, pip, cargo, npm —
+    feature, and every config system a user has met (git, ssh, pip, cargo, npm)
     merges instead. Per-key merging is also what the search order always implied.
 
     Unrecognised keys are reported rather than dropped, CLI spellings (``time``
@@ -4762,7 +5320,7 @@ def load_config() -> dict[str, Any]:
     # built defensively, and neither is allowed to take the tool down:
     #
     # `Path.home()` raises RuntimeError when $HOME is unset AND the uid has no
-    # passwd entry — which is `sbatch --export=NONE` (standard Slurm, and a
+    # passwd entry, which is `sbatch --export=NONE` (standard Slurm, and a
     # cluster-wide default at some sites) on a node whose name service does not
     # resolve the user. Building this list eagerly made that abort *every*
     # invocation before any flag was acted on, including runs with a perfectly
@@ -4778,7 +5336,7 @@ def load_config() -> dict[str, Any]:
         base = None                  # no home is discoverable; the CWD one stands
     if base is not None:
         paths.append(base / "slurmate" / "config.toml")
-    # cwd deleted under us — nothing to read there.
+    # cwd deleted under us: nothing to read there.
     with contextlib.suppress(OSError):
         paths.append(Path.cwd() / ".slurmate.toml")
 
@@ -4809,7 +5367,7 @@ def load_config() -> dict[str, Any]:
             # perfectly readable.
             import sys
             print(
-                f"slurmate: warning: ignoring configuration file {path} — {e}",
+                f"slurmate: warning: ignoring configuration file {path}: {e}",
                 file=sys.stderr,
             )
             logger.debug(f"Failed to load config from {path}: {e}")

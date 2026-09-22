@@ -76,25 +76,25 @@ if os.environ.get("SLURMATE_DEBUG"):
 
 
 # The wizard paints no stage background of its own (_STAGE_BG = ""), so the
-# terminal's native background — including any translucency/blur the user has
-# enabled — shows through: a frosted-glass "vibrancy" look instead of a flat
+# terminal's native background (including any translucency/blur the user has
+# enabled) shows through: a frosted-glass "vibrancy" look instead of a flat
 # navy fill. Set _STAGE_BG to a "bg:#…" value to restore an opaque stage. Only
 # the floating completion menu keeps a solid backing (it overlays other text and
-# would be unreadable transparent — macOS popovers are effectively opaque too).
+# would be unreadable transparent: macOS popovers are effectively opaque too).
 _STAGE_BG = ""
 # Each structural region of the wizard owns a distinct hue, so the screen reads
 # as several colored sections instead of one flat wall of blue. Blue is now
 # reserved for the element the user's keys actually drive (the active input /
 # selection); every other region gets its own color. All hues sit at a similar
 # mid brightness so they harmonize and stay legible over the terminal's own
-# (possibly translucent) background — the cards paint no fill of their own.
-_ACCENT = "#5c9dff"  # blue   — the active/focused input card + current selection
-_TEAL = "#3bc4c4"  # teal   — the header / brand bar and status labels
-_VIOLET = "#a889f5"  # violet — the Steps sidebar + current-step marker
-_PINK = "#ee85b5"  # pink   — the header progress counter
-_GREEN = "#54c99a"  # green  — done steps, the script-preview card, shell keywords
-_AMBER = "#e0b661"  # amber  — warnings, queue ETA, $variables, the review config card
-_RED = "#ef6f7e"  # red    — errors
+# (possibly translucent) background; the cards paint no fill of their own.
+_ACCENT = "#5c9dff"  # blue:   the active/focused input card + current selection
+_TEAL = "#3bc4c4"  # teal:   the header / brand bar and status labels
+_VIOLET = "#a889f5"  # violet: the Steps sidebar + current-step marker
+_PINK = "#ee85b5"  # pink:   the header progress counter
+_GREEN = "#54c99a"  # green:  done steps, the script-preview card, shell keywords
+_AMBER = "#e0b661"  # amber:  warnings, queue ETA, $variables, the review config card
+_RED = "#ef6f7e"  # red:     errors
 _TEXT = "#dfe3ec"  # primary text
 _DIM = "#7e8699"  # subtitles, pending steps, hints
 _BORDER = "#414a63"  # fallback border for an uncolored card
@@ -121,7 +121,7 @@ _TUI_STYLE = PTStyle(
         ("warning", f"fg:{_AMBER} bold"),
         ("info", f"fg:{_DIM}"),
         # The floating completion menu keeps an opaque backing (it overlays other text
-        # and would be unreadable transparent — macOS popovers are effectively opaque).
+        # and would be unreadable transparent: macOS popovers are effectively opaque).
         ("completion-menu", "bg:#1c2233 fg:#c8cdda"),
         ("completion-menu.completion", "bg:#1c2233 fg:#c8cdda"),
         ("completion-menu.completion.current", f"bg:{_ACCENT} fg:#0b0f1a bold"),
@@ -145,7 +145,7 @@ def _card(
     so each region reads as a translucent macOS-style card. ``color`` sets the
     card's accent hue for both its border and title, giving each region its own
     color; ``focused`` overrides that with the blue focus accent and bolds the
-    title — a focus ring around the element the user's keys currently drive.
+    title; a focus ring around the element the user's keys currently drive.
     """
     hue = _ACCENT if focused else (color or _BORDER)
     b = f"fg:{hue}"
@@ -207,7 +207,7 @@ class LastTokenPathCompleter(Completer):
     """Filesystem completion for the last whitespace-separated token.
 
     Lets users tab-complete file/dir paths while typing a command (e.g.
-    ``python train.py``) or a single path field, without retyping long paths —
+    ``python train.py``) or a single path field, without retyping long paths;
     the more they type, the narrower the suggestions get.
     """
 
@@ -284,7 +284,7 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
     # ``_unknown``/``_unknown_reason`` carry the same meaning as in
     # :func:`~slurmate.main._get_partition`, and for the same reason: the zeros
     # keep the limit checks quiet, so without the flag the wizard's live panel
-    # said *nothing* about a 999-CPU request on a mistyped partition — the less
+    # said *nothing* about a 999-CPU request on a mistyped partition; the less
     # valid request producing the more reassuring screen. Only the CLI's copy of
     # this record was flagged, so the wizard (the default interface, and the only
     # one with a "Enter partition name manually..." row) was the surface that
@@ -313,7 +313,7 @@ def _fmt_partition(p: dict[str, Any]) -> str:
     all ``down*`` advertises the same "31 nodes" as a healthy one, and picking it
     gets a job that queues forever with nothing to say why. So the row shows
     ``13 of 17 nodes`` when some are unusable and marks a fully-dead partition
-    ``unavailable`` \u2014 visible, still selectable (a drained partition can be the
+    ``unavailable``: visible, still selectable (a drained partition can be the
     right answer tomorrow), but not disguised as live capacity.
 
     The GPU segment reports ``gpus_per_node`` as well as the model list, because
@@ -322,7 +322,7 @@ def _fmt_partition(p: dict[str, Any]) -> str:
     a partition whose GRES is **count-only** (``Gres=gpu:4``, no model) populates
     ``gpus_per_node`` but leaves ``gpu_types`` empty, so it got no GPU marker at
     all and rendered byte-identically to a CPU-only partition of the same shape
-    \u2014 18 of this cluster's 88 partitions, ``gpu``/``beagle3``/``kicp-gpu`` among
+   : 18 of this cluster's 88 partitions, ``gpu``/``beagle3``/``kicp-gpu`` among
     them, in the one step where the partition is chosen and before any GPU step
     runs. And on the typed side a 1-GPU and an 8-GPU ``a100`` partition both read
     ``GPU:[a100]``. ``fetch_partitions`` parses the count with ``_parse_gpu_count``
@@ -348,7 +348,7 @@ def _fmt_partition(p: dict[str, Any]) -> str:
         label += " \u00b7 default"
     if gpus or gpu_n or p.get("has_gpu"):
         # "?" for a partition known to have GPUs whose count and models are both
-        # unknown \u2014 the same admission this row already makes for an absent
+        # unknown; the same admission this row already makes for an absent
         # cpus_per_node, rather than a bare "GPU:" or silence.
         shown = [str(gpu_n)] if gpu_n else []
         if gpus:
@@ -366,7 +366,7 @@ def _rank_partitions(
 
     Raw ``sinfo`` order puts whatever the site happens to have configured first,
     which on a multi-year cluster is a scheduler partition followed by a run of
-    retired PI ones \u2014 and the two partitions anybody actually uses somewhere
+    retired PI ones, and the two partitions anybody actually uses somewhere
     below the fold. Rank instead by:
 
     1. the site default partition (sinfo's ``*`` marker),
@@ -375,7 +375,7 @@ def _rank_partitions(
     4. fully-dead partitions,
     5. scheduler/system partitions (``cron`` and friends).
 
-    Nothing is removed \u2014 a partition that is drained today may be the right
+    Nothing is removed; a partition that is drained today may be the right
     answer tomorrow, and hiding it is its own kind of confusion.
     """
     user = user_parts or set()
@@ -384,7 +384,7 @@ def _rank_partitions(
     def key(p: dict[str, Any]) -> tuple[Any, ...]:
         name = str(p.get("name", ""))
         up = p.get("nodes_up")
-        # None (state unknown) ranks with the live ones \u2014 absence of evidence.
+        # None (state unknown) ranks with the live ones: absence of evidence.
         dead = up == 0
         return (
             name in system,
@@ -403,7 +403,7 @@ def _parse_custom_flags(raw: str, reassembled: list[tuple[str, str]] | None = No
 
     Options are separated by spaces or commas, so ``--exclusive --reservation=abc``
     and ``--exclusive,--reservation=abc`` both yield two directives. Only a comma
-    that introduces another flag (one followed by ``-``) separates options — a
+    that introduces another flag (one followed by ``-``) separates options; a
     comma inside a value is kept, so ``--exclude=node1,node2`` stays a single
     directive. A leading ``#SBATCH`` (pasted by mistake) is stripped.
 
@@ -414,8 +414,8 @@ def _parse_custom_flags(raw: str, reassembled: list[tuple[str, str]] | None = No
     user wrote without dashes (``exclusive`` -> ``--exclusive``, and
     ``exclusive hold`` -> two flags).
 
-    Tokenizing is quote-aware (via ``shlex``): a value quoted to hold a space —
-    ``--comment="my job"`` — stays a single flag instead of splitting on the
+    Tokenizing is quote-aware (via ``shlex``): a value quoted to hold a space (
+    ``--comment="my job"``) stays a single flag instead of splitting on the
     inner space into two broken directives. The surrounding quotes are consumed
     here; :func:`~slurmate.builder._quote_custom_flag` re-quotes any value that
     still contains whitespace when the directive is emitted.
@@ -423,7 +423,7 @@ def _parse_custom_flags(raw: str, reassembled: list[tuple[str, str]] | None = No
     try:
         tokens = shlex.split(raw, posix=True)
     except ValueError:
-        # Unbalanced quotes (e.g. a half-typed value) — fall back to a plain
+        # Unbalanced quotes (e.g. a half-typed value): fall back to a plain
         # whitespace split so the user still gets something rather than nothing.
         tokens = raw.split()
     parts: list[str] = []
@@ -440,7 +440,7 @@ def _parse_custom_flags(raw: str, reassembled: list[tuple[str, str]] | None = No
 
 MEMORY_CHOICES = ["4G", "8G", "16G", "32G", "64G", "128G", "256G", "512G", "64000M"]
 MEM_PER_CPU_CHOICES = ["1G", "2G", "4G", "8G", "2000M"]
-# Suggestions only — the field is free-text. "cpu"/"gpu" are the mandatory
+# Suggestions only: the field is free-text. "cpu"/"gpu" are the mandatory
 # node-type features on Perlmutter-style sites, which is why --constraint exists.
 CONSTRAINT_CHOICES = ["cpu", "gpu", "bigmem", "haswell", "knl"]
 TIME_CHOICES = [
@@ -532,7 +532,7 @@ STEPS: list[Step] = [
         "memory",
         "Memory",
         "autocomplete",
-        subtitle="Total memory per node (--mem) — e.g. 16G, 32G, 64000M",
+        subtitle="Total memory per node (--mem): e.g. 16G, 32G, 64000M",
         validate=validate_memory,
         default="16G",
         choices=MEMORY_CHOICES,
@@ -541,7 +541,7 @@ STEPS: list[Step] = [
         "mem_per_cpu",
         "Memory per CPU",
         "autocomplete",
-        subtitle="--mem-per-cpu, e.g. 2G — overrides Memory when set (optional, blank = use Memory)",
+        subtitle="--mem-per-cpu (e.g. 2G): overrides Memory when set (optional, blank = use Memory)",
         validate=validate_memory,
         default="",
         choices=MEM_PER_CPU_CHOICES,
@@ -575,7 +575,7 @@ STEPS: list[Step] = [
         "gpus",
         "GPUs",
         "autocomplete",
-        subtitle="Number of GPUs — type any number (suggestions: 0, 1, 2, 4, 8)",
+        subtitle="Number of GPUs: type any number (suggestions: 0, 1, 2, 4, 8)",
         choices=["0", "1", "2", "4", "8"],
         default="0",
         validate=lambda v: v.strip().isdigit(),
@@ -596,7 +596,7 @@ STEPS: list[Step] = [
         subtitle="e.g. 1-10, 1,3,5-7%4 (optional)",
         # Every other resource field validates as you type; this one was
         # free-text, so a reversed range or a zero step was only caught later at
-        # the summary. Empty is valid — the field is optional.
+        # the summary. Empty is valid: the field is optional.
         validate=validate_array_spec,
     ),
     Step(
@@ -739,7 +739,7 @@ class Wizard:
         self.transient: dict[str, Any] = {}
         self.submitted = False
         self.config = load_config()
-        # Per-instance default overrides from config — never mutate the shared
+        # Per-instance default overrides from config, never mutate the shared
         # module-level STEPS objects (that would leak across wizards and tests).
         self._config_defaults: dict[str, str] = {}
         for step in STEPS:
@@ -880,7 +880,7 @@ class Wizard:
 
         @kb.add("enter", eager=True)
         def _enter(event: Any) -> None:
-            # Enter always proceeds — consistent across every step, including the
+            # Enter always proceeds: consistent across every step, including the
             # multiline command step. (Use Ctrl+J for a literal newline there.)
             s = self.current_step
             buf = self._focused_buffer()
@@ -974,7 +974,7 @@ class Wizard:
 
         We read ``_selected_index`` (the cursor position) rather than
         ``current_value`` because the wizard binds Enter with ``eager=True``,
-        which preempts RadioList's own Enter handler — the only place that would
+        which preempts RadioList's own Enter handler; the only place that would
         otherwise sync ``current_value`` to the highlighted row. Without this,
         every select step returns its initial value regardless of navigation
         (e.g. the partition list always returned "Enter manually...").
@@ -1017,7 +1017,7 @@ class Wizard:
 
         if s.kind in ("text", "autocomplete", "ntasks_per_node"):
             val = self._text_val()
-            # Empty is always allowed — the user can skip a step and come back.
+            # Empty is always allowed; the user can skip a step and come back.
             # Required fields are flagged at the final review instead of blocking
             # navigation here. Only malformed *non-empty* input is rejected.
             if val and s.validate and not s.validate(val):
@@ -1054,20 +1054,20 @@ class Wizard:
         # NB: gpu_type has no select<-text transition to unwind (unlike partition):
         # the text sub is entered only when the partition lists no typed GPUs, and
         # no radio is built for it. So gpu_type Back must fall through to the
-        # general logic below (decrement idx, return to the gpus step) — handling
+        # general logic below (decrement idx, return to the gpus step): handling
         # it like partition here trapped the user and confirmed a stale radio value.
         # Whether the step we're leaving was auto-skipped. Its value isn't the
-        # user's, and the shared text widget may still hold another step's text —
+        # user's, and the shared text widget may still hold another step's text:
         # capture this before the pruning below drops the index.
         was_skipped = self.idx in self._skipped_indices
-        # Read the gpu_type sub-mode before it's cleared below — the save block
+        # Read the gpu_type sub-mode before it's cleared below; the save block
         # needs it to know whether a typed value is on screen.
         gpu_sub = self.step_cache.get("gpu_sub")
         self._skipped_indices = {i for i in self._skipped_indices if i < self.idx - 1}
         self.step_cache.pop("partition_sub", None)
         self.step_cache.pop("gpu_sub", None)
         self.step_cache.pop("error", None)
-        # Save current text so it's preserved when returning to this step — but
+        # Save current text so it's preserved when returning to this step, but
         # never for a skipped step, whose shared widget holds a different step's
         # leftover text (e.g. the modules string would otherwise be saved into a
         # skipped env_name when navigating back through it).
@@ -1077,7 +1077,7 @@ class Wizard:
                 # Mirror the forward-path guard (_confirm_and_next): only persist a
                 # value that passes the step's validator, so a malformed entry
                 # (e.g. cpus="3.5") isn't fed to _coerce's int() and crash on Back.
-                # An invalid value is simply not saved — the prior answer stands.
+                # An invalid value is simply not saved: the prior answer stands.
                 # A *cleared* field is not an invalid value, though: where blank is
                 # an offered answer the emptied field is committed, exactly as Enter
                 # commits it, so which key the user presses next cannot decide
@@ -1092,7 +1092,7 @@ class Wizard:
             elif s.kind == "gpu_type" and gpu_sub == "text":
                 # The free-text GPU-type sub-mode (used when the partition lists no
                 # typed GPUs) was the one input the Back path didn't persist, so a
-                # typed model was silently lost — unlike every other kind of step.
+                # typed model was silently lost: unlike every other kind of step.
                 val = self._text_val()
                 if val or self._blank_is_an_answer(s):
                     self.answers["gpu_type"] = val or None
@@ -1104,7 +1104,7 @@ class Wizard:
         self._invalidate()
 
     def _default_int(self, key: str, literal: int) -> int:
-        """Config-aware integer default — falls back to the configured value (if
+        """Config-aware integer default: falls back to the configured value (if
         any) when a field is cleared, not the bare hard-coded literal."""
         raw = self._config_defaults.get(key)
         if raw is None:
@@ -1119,30 +1119,30 @@ class Wizard:
 
         Read straight off ``_coerce``, so the two navigation gestures cannot
         disagree about a field the user emptied: blank is an answer exactly where
-        ``_coerce`` turns ``""`` into ``None`` ("unset") — ``account``,
+        ``_coerce`` turns ``""`` into ``None`` ("unset"): ``account``,
         ``mem_per_cpu``, ``ntasks_per_node``, ``gpu_type``, ``constraint``,
         ``array_spec``, the two output paths, ``custom_sbatch``, ``modules``,
         ``env_name``. Every one of those steps says so twice more: it is absent
         from ``main._REQUIRED_FIELDS`` (nothing flags it when left empty), and its
         validator, where it has one, accepts an empty string.
 
-        False for the steps that substitute a *default* for a cleared field —
+        False for the steps that substitute a *default* for a cleared field:
         ``cpus``/``nodes``/``memory``/``time_limit``/``gpus``; see ``_coerce``'s
-        ``time_limit`` note, "Blank is not an offered answer here either" — and for
+        ``time_limit`` note, "Blank is not an offered answer here either", and for
         the required free-text ones (``job_name``, ``command``, and ``partition``
         via its own handler), whose blank coerces to ``""``. There, "the prior
         answer stands" is the answer, and Back keeps it.
 
         ``env_name`` was the one field where this derived rule disagreed with the
         builder, and the disagreement was ``_coerce``'s: see its note there. The
-        rule itself did not need an exception — the fix was to stop the field
+        rule itself did not need an exception; the fix was to stop the field
         falling through to the bare ``return val``.
 
         Enter (``_confirm_and_next``) has always committed a cleared field. Back did
         not, which made the *same* visible field state mean two different things
         depending on which key came next: on ``ntasks_per_node`` the live panel even
-        confirmed the clear — its "exceeds partition limit" warning is computed from
-        the field's live value, so it went quiet as the field emptied — and Back then
+        confirmed the clear; its "exceeds partition limit" warning is computed from
+        the field's live value, so it went quiet as the field emptied, and Back then
         put the deleted ``--ntasks-per-node`` back into the script. Slurm's verdict on
         the resurrected directive: ``sbatch --test-only -p amd -N2
         --ntasks-per-node=64 -c 4`` (what Back produced) → "Requested node
@@ -1168,7 +1168,7 @@ class Wizard:
             # A cleared field reverts to the config/literal default, the same
             # P3-10 invariant cpus/nodes/memory follow. It used to fall through to
             # the bare `return val`, i.e. "", and the builder omits `--time` for an
-            # empty value — so clearing the pre-filled `02:00:00` and pressing
+            # empty value, so clearing the pre-filled `02:00:00` and pressing
             # Enter produced a script with NO `#SBATCH --time` at all, a summary
             # with no "Time limit" row at all, and an "Estimated CPU-hours" figure
             # still computed from `estimate_su`'s implicit 120-minute assumption.
@@ -1181,7 +1181,7 @@ class Wizard:
             if val:
                 return normalize_memory(val)
             # A cleared field reverts to the config/literal default (P3-10 invariant,
-            # shared with cpus/nodes) — the base case. To OMIT --mem on a whole-node
+            # shared with cpus/nodes): the base case. To OMIT --mem on a whole-node
             # site (e.g. TACC), use batch mode's `--memory none` / `--mem-per-cpu`,
             # or delete the line via the editor step.
             return (
@@ -1204,11 +1204,11 @@ class Wizard:
         # The fields whose blank simply means "unset". ``env_name`` belongs here
         # and was only missing because it fell off the end of the chain into the
         # bare ``return val`` below: the builder reads it as unset (``if
-        # env_name:`` — no activation line), its parameter is ``str | None =
+        # env_name:``; no activation line), its parameter is ``str | None =
         # None``, and the wizard's OWN skip path already writes ``None``
         # (``_setup_env_name``, when env_type is "None (skip)"). Every reader goes
-        # through truthiness or ``or ""`` — ``env_activation_emitted``,
-        # ``check_conda_env``, ``job_summary_rows``' ``add`` — so nothing wanted
+        # through truthiness or ``or ""`` (``env_activation_emitted``,
+        # ``check_conda_env``, ``job_summary_rows``' ``add``), so nothing wanted
         # the ``""`` spelling; it just gave one user-visible state two encodings,
         # and the ``""`` one made ``_blank_is_an_answer`` (which reads this
         # function) say blank was not an answer for the one optional text step
@@ -1231,7 +1231,7 @@ class Wizard:
     # Steps whose in-progress value affects the partition-compatibility check.
     # For the active one of these, the field's live (not-yet-committed) value is
     # overlaid before validating, so the current field gives feedback as it's
-    # edited — while every *other* field's already-committed value is still
+    # edited, while every *other* field's already-committed value is still
     # checked, so a problem introduced earlier (e.g. GPUs on a CPU-only
     # partition) keeps showing after you move past that step.
     _VALIDATED_KEYS = frozenset(
@@ -1251,7 +1251,7 @@ class Wizard:
         """The site's MaxArraySize, fetched once per session; None until needed.
 
         Without it the live panel stayed silent about an over-large ``--array``
-        while the final summary flagged it — the same request judged differently
+        while the final summary flagged it; the same request judged differently
         by two surfaces. It is a cluster constant, not per-partition, so one
         lookup covers the session (~20 ms), and it is only fetched when an array
         has actually been entered, so a user who never uses arrays never pays for
@@ -1302,13 +1302,13 @@ class Wizard:
 
         Delegates to the shared, side-effect-free ``validate_job_config`` (the
         same check the final CLI summary runs), so the live preview flags a
-        script that's already in a failure mode even while it's unfinished —
+        script that's already in a failure mode even while it's unfinished,
         rather than only warning about the step you happen to be on. Safe to
         call on every redraw: no subprocess calls, and the partition's GPU-type
         list is reused from the cache populated when the GPU-type step loaded.
 
         Called with no partition too (before the partition step, and after
-        confirming an *empty* manual entry — a legitimate "use the site
+        confirming an *empty* manual entry; a legitimate "use the site
         default"). It used to return [] there, which turned one blank field into
         a silent banner for the rest of the wizard: ``validate_job_config`` only
         consults ``_partition_obj`` in *some* of its rules, and the ones that
@@ -1338,8 +1338,8 @@ class Wizard:
         The step declares a literal ``16G``, which is the number SM-7 was filed
         about: it is not a measurement of anything, and on a cluster whose nodes
         have 8 GB it is an unschedulable default. The batch path derives it from
-        the partition; the wizard — the *default* interface, and the one that
-        shows the value pre-filled for the user to accept — did not.
+        the partition; the wizard (the *default* interface, and the one that
+        shows the value pre-filled for the user to accept) did not.
         """
         part = self.answers.get("_partition_obj")
         if not part or part.get("_unknown"):
@@ -1355,7 +1355,7 @@ class Wizard:
         """Default value for a step, preferring a per-instance config override.
 
         Memory additionally prefers a value *derived from the cluster* over the
-        declared literal — an explicit config setting still wins, since the user
+        declared literal; an explicit config setting still wins, since the user
         asked for it.
         """
         override = self._config_defaults.get(s.key)
@@ -1375,12 +1375,12 @@ class Wizard:
         if part:
             # Key the cache on the node count as well as the partition: the ETA is
             # computed from whether enough idle nodes exist for `req_nodes`, and the
-            # first fetch happens on the step right after partition — before `nodes`
+            # first fetch happens on the step right after partition, before `nodes`
             # has been entered, so it always used req_nodes=1. A later nodes=8 then
             # never refreshed it (same partition) and the ETA stayed optimistic.
-            # The ETA depends on the whole request, not just the node count — a GPU
+            # The ETA depends on the whole request, not just the node count (a GPU
             # job on a partition whose GPUs are all allocated must not read
-            # "immediate" — so the cache key covers every field fetch_queue_eta uses.
+            # "immediate"), so the cache key covers every field fetch_queue_eta uses.
             nodes = self.answers.get("nodes", 1)
             from .system_utils import fetch_queue_eta, resolve_request_mem_mb
 
@@ -1435,7 +1435,7 @@ class Wizard:
                     # holding whitespace comes back unquoted and the next confirm
                     # re-splits it: --comment="my big run" was restored as
                     # `--comment=my big run` and re-parsed into
-                    # ['--comment=my big', '--run'] — a fabricated `#SBATCH --run`
+                    # ['--comment=my big', '--run']; a fabricated `#SBATCH --run`
                     # that sbatch refuses outright (rc 255, "unrecognized option"),
                     # so pressing Back turned an accepted script into a rejected
                     # one. The builder already applies this rule when it emits the
@@ -1517,7 +1517,7 @@ class Wizard:
                     known = fetch_known_qos()  # all QoS names, or [] if unknown
                     if any(str(q).upper() == "ALL" for q in raw):
                         # AllowQos=ALL is a sentinel ("any QoS allowed"), not a QoS
-                        # name — offer every known QoS rather than intersecting
+                        # name: offer every known QoS rather than intersecting
                         # against a value that can never match one.
                         raw = list(known)
                     elif known:
@@ -1563,7 +1563,7 @@ class Wizard:
             try:
                 all_parts = fetch_partitions()
                 public = fetch_public_partitions(all_parts)
-                # The partition ACL is not the gate on most clusters — private PI
+                # The partition ACL is not the gate on most clusters: private PI
                 # partitions advertise AllowAccounts=ALL and still reject every
                 # submission. The association list is. None means "can't tell"
                 # (or an account-scoped site), in which case nothing is filtered.
@@ -1626,7 +1626,7 @@ class Wizard:
                 )
                 fmt_all = [_fmt_partition(p) for p in all_parts]
                 self.radio_list = RadioList([(c, c) for c in fmt_all])
-                # Restore the already-chosen partition as the highlighted row —
+                # Restore the already-chosen partition as the highlighted row;
                 # the same thing _setup_partition does for the public list, and
                 # for the same reason. This list is one keypress away from that
                 # one, and without the restore its cursor sits on row 0: a user
@@ -1634,7 +1634,7 @@ class Wizard:
                 # Enter had the job silently moved to whatever partition sorts
                 # first, taking the memory default, GPU-type list and QoS list
                 # with it. Unlike the public list this cannot be a partial
-                # restore — every partition is in this list by construction.
+                # restore; every partition is in this list by construction.
                 prev_name = self.answers.get("partition")
                 if prev_name:
                     for p in all_parts:
@@ -1805,7 +1805,7 @@ class Wizard:
                 # Pop the dropdown so the discovered envs are visible up front,
                 # not only once the user starts typing.
                 self._open_completion_menu()
-        else:  # Virtualenv (venv) — complete filesystem paths
+        else:  # Virtualenv (venv): complete filesystem paths
             self.text_area.text = self.answers.get("env_name") or ""
             self._set_completer(self._path_completer)
 
@@ -1845,7 +1845,7 @@ class Wizard:
         """
         info = self._review_script_window.render_info
         # The panel title now lives in the card border (not inside the window), so
-        # the whole window height is body — no header row to subtract.
+        # the whole window height is body: no header row to subtract.
         visible = max(1, info.window_height if info else 0)
         width = info.window_width if info else 0
         widths = self._review_line_widths
@@ -1881,7 +1881,7 @@ class Wizard:
             FloatContainer(
                 HSplit(
                     [
-                        Window(height=1),  # top margin — keep the header off the top edge
+                        Window(height=1),  # top margin: keep the header off the top edge
                         self._header(),
                         Window(height=1),  # breathing room between the header and the cards
                         VSplit([self._sidebar(), self._content()], padding=1),
@@ -1918,11 +1918,11 @@ class Wizard:
         # Two-tone brand: the name in the header's teal, the tagline dimmed.
         return [
             ("class:status-bar", "  \u26a1  Slurmate"),
-            ("class:subtitle", "  \u2014 sbatch wizard"),
+            ("class:subtitle", "  sbatch wizard"),
         ]
 
     def _render_header_right(self) -> StyleAndTextTuples:
-        # Just the progress counter — the current step's name is already the card
+        # Just the progress counter; the current step's name is already the card
         # title and the highlighted sidebar row, so repeating it here was redundant.
         visible_total = len(STEPS) - len(self._skipped_indices)
         visible_done = sum(1 for i in range(self.idx) if i not in self._skipped_indices)
@@ -1973,7 +1973,7 @@ class Wizard:
             )
         # Persistent whole-config validation: every issue in the work-in-progress
         # script stays visible on every step, not just the one that introduced it.
-        # Errors (a config Slurm will reject \u2014 e.g. GPUs on a CPU-only partition)
+        # Errors (a config Slurm will reject: e.g. GPUs on a CPU-only partition)
         # render red; capacity warnings render orange. Wrapped (not fixed height=1)
         # so a long message flows onto extra lines instead of truncating at the edge.
         for level, msg in self._config_warnings():
@@ -1999,7 +1999,7 @@ class Wizard:
             body_h = max(config_lines, script_lines) + 2  # +2 for the card borders
             # The script column usually drives the height, so the shorter config
             # summary is centered vertically inside its card (flex spacers above and
-            # below) — balanced breathing room instead of a block crammed at the top.
+            # below): balanced breathing room instead of a block crammed at the top.
             config_body = HSplit([Window(), self._review_config_window, Window()])
             return HSplit(
                 [
@@ -2024,12 +2024,12 @@ class Wizard:
                         padding=1,
                         height=D(preferred=body_h, max=body_h),
                     ),
-                    Window(),  # spacer — keeps the footer pinned to the bottom
+                    Window(),  # spacer: keeps the footer pinned to the bottom
                 ]
             )
 
         # The current step: subtitle + input widget in one focused card, titled
-        # with the step name. The blue focus ring marks it as the live field —
+        # with the step name. The blue focus ring marks it as the live field;
         # the one region that stays blue, since blue now means "your keys act here".
         subtitle_win = Window(
             FormattedTextControl([("class:subtitle", f" {s.subtitle}\n")]),
@@ -2066,8 +2066,8 @@ class Wizard:
     def _past_hardware_config(self) -> bool:
         """True once every resource/hardware step is done (modules onward).
 
-        The queue ETA is surfaced here as a heads-up — how long the job will
-        wait before modules load and the script runs — rather than during the
+        The queue ETA is surfaced here as a heads-up (how long the job will
+        wait before modules load and the script runs) rather than during the
         hardware steps, where it would keep shifting as choices change.
         """
         modules_idx = next((i for i, s in enumerate(STEPS) if s.key == "modules"), len(STEPS))
@@ -2089,19 +2089,19 @@ class Wizard:
         and a request Slurm has already refused has no wait time. The CLI summary
         settled both (see :func:`~slurmate.main._show_script_and_summary`); this
         strip did not, and the wizard is the surface that can reach the synthetic
-        blank partition object — it owns the "Enter partition name manually..."
+        blank partition object; it owns the "Enter partition name manually..."
         row. Measured: with the partition unresolved, ``squeue -p <name>`` returns
         no rows (or fails outright), which arrived here as a confident
         ``0 running / 0 pending``, and a refused request's ``eta_seconds=0``
-        selected the under-an-hour GREEN for the word "never" — a check that never
+        selected the under-an-hour GREEN for the word "never"; a check that never
         ran, and a verdict of refusal, both rendered as a pass.
 
-        Said in one word rather than the summary's fuller ``unknown — <reason>``:
+        Said in one word rather than the summary's fuller ``unknown: <reason>``:
         this strip is a fixed two rows, and a wrapped reason would push the ETA
-        line off the bottom. The reason is already on screen — the
+        line off the bottom. The reason is already on screen; the
         ``Capacity limits NOT checked: ...`` warning from
         :func:`~slurmate.system_utils.validate_job_config` sits directly above it
-        — and the controller's own words are printed by ``_note_scheduler_refusal``
+       , and the controller's own words are printed by ``_note_scheduler_refusal``
         on the way to submit.
         """
         qinfo = self.transient.get("queue_info")
@@ -2151,12 +2151,12 @@ class Wizard:
 
     def _review_summary_items(self) -> list[tuple[str, str]]:
         # Shared with the CLI summary panel (job_summary_rows) so both surfaces
-        # show the same fields \u2014 including Modules, Custom flags, GPU format, and
+        # show the same fields, including Modules, Custom flags, GPU format, and
         # Tasks/node, which the Review step previously omitted.
         return job_summary_rows(self.answers)
 
     def _render_review_config(self) -> StyleAndTextTuples:
-        """Left column of the review step \u2014 the job configuration summary."""
+        """Left column of the review step; the job configuration summary."""
         out: StyleAndTextTuples = [("", "\n")]
         items = [(label, val) for label, val in self._review_summary_items() if val]
         # Width comes from the actual labels (as the CLI summary already does): a
@@ -2206,7 +2206,7 @@ class Wizard:
         return lines
 
     def _render_review_script(self) -> StyleAndTextTuples:
-        """Right column \u2014 the final script, manually scrolled by ``_review_scroll``."""
+        """Right column; the final script, manually scrolled by ``_review_scroll``."""
         lines = self._build_script_lines()
         self._review_total_lines = len(lines)
         # Kept for `_review_max_scroll`, which has to know how many ROWS each line
@@ -2303,7 +2303,7 @@ class Wizard:
 
         The batch path discloses this (a ``.slurmate.toml`` travels with a project
         onto whatever cluster it is next checked out on, so where a value came
-        from is part of the answer) and the wizard did not — even though the
+        from is part of the answer) and the wizard did not, even though the
         wizard is what *prefills* from that file. Recorded on the way out rather
         than at prefill time, so a value the user then changed is no longer
         credited to the file.

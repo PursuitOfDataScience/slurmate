@@ -4,8 +4,8 @@
 does not list with a synthetic record: every capacity field 0/None, flagged
 ``_unknown`` with an ``_unknown_reason`` of ``absent`` / ``undescribed`` /
 ``unreadable``.  Every partition-dependent rule in `validate_job_config` then
-has nothing to compare against and stays **silent** — which is the right answer
-for a check that could not run — and one warning says so:
+has nothing to compare against and stays **silent** (which is the right answer
+for a check that could not run), and one warning says so:
 
     Capacity limits NOT checked: ... the request above has been validated for
     shape only
@@ -21,10 +21,10 @@ read `queue_info` unconditionally, so for an unresolved partition it printed
 
     Queue status (typo): 0 running / 0 pending   ETA: now
 
-in the under-an-hour GREEN — ``squeue -p <name>``'s empty answer (or a failed
+in the under-an-hour GREEN: ``squeue -p <name>``'s empty answer (or a failed
 query) rendered as a measurement, and the queue-depth heuristic's flat constant
 rendered as a wait time.  The CLI summary settled exactly this and says
-``unknown — <reason>`` for both rows; the wizard is the surface that *owns* the
+``unknown: <reason>`` for both rows; the wizard is the surface that *owns* the
 "Enter partition name manually..." row, so it is the one that can reach the
 blank record, and it was the one still making the claim.  Separately, a request
 Slurm had already refused got its "never" in the same green, because the colour
@@ -123,7 +123,7 @@ def _eta(frags):
 
 
 class TestWhatTheBlankCosts:
-    """The withdrawal, pinned. Holds in both states — the fix is elsewhere."""
+    """The withdrawal, pinned. Holds in both states: the fix is elsewhere."""
 
     #: cpus 999 / nodes 20 / 500G / 30 days / 99 GPUs / a model the partition
     #: does not have, against a partition that is itself DOWN with every node
@@ -176,7 +176,7 @@ class TestWhatTheBlankCosts:
     def test_a_zero_ceiling_is_read_as_unknown_not_as_a_refusal(self, field, value):
         """A 0/None limit must silence its check, never refuse everything.
 
-        The alternative reading — 0 cores is a ceiling of zero — would refuse a
+        The alternative reading (0 cores is a ceiling of zero) would refuse a
         1-core job on a partition slurmate simply could not describe, which is
         the SM-4 false rejection this module is most careful about.
         """
@@ -190,7 +190,7 @@ class TestWhatTheBlankCosts:
     def test_the_blank_is_not_reported_as_a_refusal(self):
         """`capacity_refusal` stays empty: no figures means no verdict.
 
-        "" is read by the caller as "nothing to add", not as "this fits" — the
+        "" is read by the caller as "nothing to add", not as "this fits"; the
         summary's ETA row is decided by ``_unknown`` before it is consulted.
         """
         assert su.capacity_refusal(_blank("p", "undescribed"), self.HOSTILE) == ""
@@ -257,7 +257,7 @@ class TestControls:
 
         The strip's window is a fixed ``height=2``; a row that wrapped would
         push the ETA off the bottom, which is why the fix says "unknown" rather
-        than the summary's fuller "unknown — <reason>".
+        than the summary's fuller "unknown: <reason>".
         """
         for part, q in ((_described(), _LIVE), (_blank(), _qinfo()),
                         (_described(), _REFUSED)):
@@ -312,7 +312,7 @@ class TestTheCliSummaryIsUntouched:
         text = self._summary(
             {"partition": "typo", "job_name": "probe", "command": "true",
              "_partition_obj": _blank(reason=reason)}, _qinfo())
-        assert f"unknown — {phrase}" in text
+        assert f"unknown: {phrase}" in text
         assert "0 running / 0 pending" not in text
 
     def test_a_nonexistent_name_still_gets_its_own_error(self, mocker):

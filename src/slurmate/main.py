@@ -212,15 +212,15 @@ def _get_partition(partitions: list[dict[str, Any]], name: str) -> dict[str, Any
     # silent rather than warning against a limit of zero. nodes_up is None
     # (unknown), never 0, so it is not read as "all nodes are down".
     # Marked as unknown rather than merely empty: zeros keep the limit checks
-    # quiet, but *silence about a 999-CPU request is itself a wrong answer* — the
+    # quiet, but *silence about a 999-CPU request is itself a wrong answer*; the
     # less valid request produced the more reassuring screen. The flag lets the
     # validator say "I could not check" instead.
     #
     # ``_unknown_reason`` distinguishes the three ways we get here, because the
     # honest message differs: with a readable partition list this name is genuinely
     # absent, with an *empty* list (no Slurm, sinfo down) nothing is known
-    # about any partition — and saying "not on this cluster" there is the false
-    # rejection the SM-4 restraint exists to prevent — and a name the wide
+    # about any partition (and saying "not on this cluster" there is the false
+    # rejection the SM-4 restraint exists to prevent), and a name the wide
     # ``sinfo -a`` list has but this narrow one does not exists and is merely
     # undescribed. See :func:`~slurmate.system_utils.unknown_partition_reason`.
     return {"name": name, "nodes": 0, "nodes_up": None, "cpus_per_node": 0,
@@ -233,7 +233,7 @@ def _enrich_partition_maxima(part: dict[str, Any]) -> dict[str, Any]:
     """Attach the per-node maxima for a heterogeneous partition (SM-27).
 
     Only for the partition actually in use, and only when ``sinfo``'s aggregate
-    row carried a ``+`` — so a homogeneous site makes no extra call at all, and a
+    row carried a ``+``, so a homogeneous site makes no extra call at all, and a
     mixed one makes exactly one. Left absent when the query fails, which keeps the
     floor-based warning and its honest "nodes differ" wording rather than
     silencing the check.
@@ -276,7 +276,7 @@ def _coerce_int(value: Any, default: int, *, field: str | None = None,
         return default
 
     # A bool is an int subclass, so `cpus = true` in a TOML file silently became
-    # a one-core request — a meaningless value accepted as a plausible one.
+    # a one-core request; a meaningless value accepted as a plausible one.
     if isinstance(value, bool):
         return _reject("is a boolean, not a core/node count")
     # int(2.7) truncates. A config written as `cpus = 2.7` therefore ran a 2-core
@@ -299,8 +299,8 @@ def _coerce_str(value: Any, default: str | None, *, field: str,
                 err_console: Console) -> str | None:
     """Coerce a CLI/config value for a free-form string field.
 
-    A scalar (str/int/float/bool) is accepted and stringified — mirroring how
-    ``_coerce_int`` leniently accepts stringy numbers — but a list/dict (or any
+    A scalar (str/int/float/bool) is accepted and stringified (mirroring how
+    ``_coerce_int`` leniently accepts stringy numbers), but a list/dict (or any
     other structured value) can't become a single directive value, so it is
     rejected with a clean error and ``sys.exit(1)`` instead of crashing the
     builder with an AttributeError/TypeError deep in script generation. This
@@ -311,7 +311,7 @@ def _coerce_str(value: Any, default: str | None, *, field: str,
         return default
     if isinstance(value, str):
         return value
-    if isinstance(value, (int, float)):  # bool is an int subclass — str() is fine
+    if isinstance(value, (int, float)):  # bool is an int subclass: str() is fine
         return str(value)
     _print_issue(
         err_console,
@@ -358,7 +358,7 @@ def _check_cluster_targets(
     Fatal by default: a script naming a partition that isn't here is not a script,
     it is a queued failure the user finds out about minutes later from sbatch.
     ``--force`` downgrades it to a warning, because writing a script *to carry to
-    another cluster* is a legitimate thing to do — it just must not be the silent
+    another cluster* is a legitimate thing to do; it just must not be the silent
     default.
 
     Stays quiet when the cluster's lists can't be read (no Slurm, sinfo down):
@@ -366,7 +366,7 @@ def _check_cluster_targets(
     """
     known_parts = fetch_all_partition_names()
     # The picker's own list is a subset of the validation list, but it is what we
-    # already have and it names the site default — used for the suggestion line.
+    # already have and it names the site default: used for the suggestion line.
     default_part = next((str(p["name"]) for p in all_parts if p.get("is_default")), "")
     # Only look up accounts when one was actually given: sacctmgr is slow enough
     # on a busy controller to be worth skipping.
@@ -437,10 +437,10 @@ def _run_batch(args: argparse.Namespace, console: Console,
     args_memory = getattr(args, "memory", None)
     # None here means "nobody asked for a memory size", which is different from
     # asking for none: the value is filled in from the partition further down,
-    # once sinfo has been read (see SM-7 — a literal default is a number, not a
+    # once sinfo has been read (see SM-7; a literal default is a number, not a
     # measurement, and 16G is unschedulable on an 8 GB node).
     memory_val = args_memory if args_memory is not None else config.get("memory")
-    # An explicit empty / "none" memory omits --mem entirely — required by
+    # An explicit empty / "none" memory omits --mem entirely: required by
     # whole-node/exclusive sites (e.g. TACC) that reject a memory request.
     mem_omit = memory_val is not None and str(memory_val).strip().lower() in ("", "none")
 
@@ -465,7 +465,7 @@ def _run_batch(args: argparse.Namespace, console: Console,
             ntasks_per_node = int(raw_ntasks)
         except (TypeError, ValueError):
             # A non-integer (e.g. a config `ntasks_per_node = "x"`) is a hard
-            # error naming the original value — not _coerce_int's "using 0",
+            # error naming the original value, not _coerce_int's "using 0",
             # which would then trip the positive-int guard below with a
             # confusing "got 0" that never echoes what the user wrote.
             _print_issue(
@@ -541,7 +541,7 @@ def _run_batch(args: argparse.Namespace, console: Console,
         sys.exit(1)
 
     # Hard-validate memory (unless deliberately omitted for a whole-node site,
-    # or not supplied at all \u2014 that case is sized from the partition below).
+    # or not supplied at all; that case is sized from the partition below).
     #
     # These rejections carried their indent as two literal spaces and their
     # colour as a raw `c.RED` escape handed to `rich`. Measured wrong three ways
@@ -597,7 +597,7 @@ def _run_batch(args: argparse.Namespace, console: Console,
         sys.exit(1)
 
     all_parts = fetch_partitions()
-    # With no --partition, Slurm uses the site default — and slurmate already
+    # With no --partition, Slurm uses the site default, and slurmate already
     # knows which that is, from sinfo's "*" marker. Treating the partition as
     # *unknown* instead produced two confidently wrong figures: a queue depth of
     # "0 running / 0 pending" (from `squeue -p ""`) for a job that will land in a
@@ -659,7 +659,7 @@ def _run_batch(args: argparse.Namespace, console: Console,
 
     # A module this cluster does not have is the one cross-cluster error that
     # survives submission: sbatch accepts it, the job runs, `module load` prints
-    # to stderr, the body executes anyway and Slurm records COMPLETED 0:0 — so
+    # to stderr, the body executes anyway and Slurm records COMPLETED 0:0, so
     # the run silently proceeds against whatever toolchain was on PATH. Checked
     # here, before any script exists, and fatal like the partition/account check.
     if mods:
@@ -667,7 +667,7 @@ def _run_batch(args: argparse.Namespace, console: Console,
 
     # A gpu_format that this cluster's select plugin does not implement. Checked
     # only when GPUs are actually requested, and fatal like the other
-    # cluster-mismatch errors — with --force, since writing a script for a
+    # cluster-mismatch errors, with --force, since writing a script for a
     # cons_tres cluster from a cons_res one is legitimate. `gpu_format` is a
     # config-file key, so this arrives without the user typing a flag.
     resolved_format = _check_gpu_format(
@@ -742,7 +742,7 @@ def _run_batch(args: argparse.Namespace, console: Console,
     # A custom flag repeating a directive slurmate manages emits a second
     # #SBATCH line. Slurm honours the LAST, so the job would run with the custom
     # value while the summary, the cluster validation and the queue/ETA figures
-    # all describe the managed one — and a custom --partition/--account also
+    # all describe the managed one, and a custom --partition/--account also
     # routes straight past the checks that exist to catch exactly those two.
     # Refused rather than reconciled: for every directive in this set slurmate
     # already has a flag that is validated and reflected everywhere.
@@ -782,8 +782,8 @@ def _run_batch(args: argparse.Namespace, console: Console,
     conflicts = managed_custom_flags(custom_sbatch_raw)
     if conflicts:
         for name, owner in conflicts:
-            # When the owner *is* the flag they typed — now the common case, since
-            # SM-25 made Slurm's own spellings first-class — "use --gres instead"
+            # When the owner *is* the flag they typed (now the common case, since
+            # SM-25 made Slurm's own spellings first-class), "use --gres instead"
             # reads like a tautology. Say the actual distinction: pass it as an
             # option rather than inside --custom-sbatch.
             advice = (
@@ -827,7 +827,7 @@ def _run_batch(args: argparse.Namespace, console: Console,
         "account": account,
         "partition": partition,
         # The partition the derived figures (limits, queue depth, ETA, default
-        # memory) were computed for — the site default when none was given.
+        # memory) were computed for; the site default when none was given.
         "_effective_partition": effective_partition,
         "_partition_obj": part_obj,
         "qos": qos,
@@ -860,7 +860,7 @@ def _partition_issues(
 ) -> list[tuple[str, str]]:
     """Resolved ``(level, msg)`` validation issues for the answers.
 
-    A GPU model the partition doesn't statically list may still be valid \u2014 a live
+    A GPU model the partition doesn't statically list may still be valid; a live
     ``sinfo`` lookup can surface types the cached partition object missed, so widen
     the known set with a one-shot query (only when there's an unrecognized type, to
     avoid a needless call). The same query also reports *how* each model can be
@@ -872,13 +872,13 @@ def _partition_issues(
     """
     # ``or {}``, not an early return: the wizard leaves ``_partition_obj`` None
     # when the partition is blank (its legitimate "site default"), and returning
-    # [] here dropped the rules that never consult a partition — so the live
+    # [] here dropped the rules that never consult a partition, so the live
     # panel and this summary must agree that a duplicated custom directive or an
     # over-MaxArraySize --array is still an issue. validate_job_config gates the
     # partition-dependent rules itself; the lookup below is skipped because it
     # keys on the partition name, which is exactly what is missing.
     part = answers.get("_partition_obj") or {}
-    # A site limit, so it needs a live query — done by the caller rather than
+    # A site limit, so it needs a live query: done by the caller rather than
     # inside validate_job_config, which the TUI calls on every redraw and which
     # must stay subprocess-free. Fetched here only when the caller did not
     # already have it (the pre-submit guard calls this directly).
@@ -891,7 +891,7 @@ def _partition_issues(
     if gpu_type and str(gpu_type).lower() != "any":
         static = {str(g).lower() for g in part.get("gpu_types", [])}
         # A statically-listed model is a typed GRES by construction, so the
-        # lookup buys nothing for the *default* format — but it is the only way
+        # lookup buys nothing for the *default* format, but it is the only way
         # to answer the mirror question, "is this model also a node feature?",
         # which is what gpu_format 'constraint' turns on. So it runs for an
         # unrecognized type (as before) or for a constraint request, and stays
@@ -930,7 +930,7 @@ def _check_gpu_format(
 ) -> str | None:
     """Reject a ``gpu_format`` whose syntax this cluster's Slurm cannot parse.
 
-    Returns a replacement format, or ``None`` for "leave it alone" — which is
+    Returns a replacement format, or ``None`` for "leave it alone", which is
     every case but one. The exception: a format that was *inferred* (from a typed
     ``--gpus a100:2``) and that this cluster cannot parse becomes
     ``"gres_type"``. An inferred format is slurmate's reading of a spelling, not
@@ -974,7 +974,7 @@ def _check_modules_exist(
 ) -> None:
     """Reject ``module load`` names this cluster does not have.
 
-    Fatal by default, ``--force`` downgrades to a warning — the same treatment as
+    Fatal by default, ``--force`` downgrades to a warning; the same treatment as
     an unknown partition, for the same reason: writing a script to carry to
     another cluster is legitimate, but it must not be the silent default. Stays
     quiet when there is no module system to ask.
@@ -1033,7 +1033,7 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
     """Cluster-membership checks as ``(level, message)``, making no exit.
 
     These all lived on the batch path, where they are fatal before a script
-    exists — which left the **wizard** unchecked, and the wizard is the default
+    exists, which left the **wizard** unchecked, and the wizard is the default
     interface *and* offers "Enter partition name manually…". So a name that the
     non-interactive path rejects outright was accepted silently by the
     interactive one. Returning issues rather than exiting lets the wizard offer
@@ -1058,7 +1058,7 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
         # above establish that the partition IS on this cluster and the account
         # IS one the user holds, and every partition-limit check establishes that
         # the shape fits. None of them asks whether this partition will run this
-        # account — the gate that actually says no on a multi-PI cluster. Only
+        # account; the gate that actually says no on a multi-PI cluster. Only
         # reached for a partition, since the ACL is the partition's.
         if partition:
             acl_refusal = partition_account_refusal(
@@ -1073,7 +1073,7 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
         if mods:
             # Raised to "error" to match the batch path, which SM-13 asked to be
             # fatal-with---force. Keeping it a warning here meant the wizard would
-            # submit a job the non-interactive path refuses — and the failure it
+            # submit a job the non-interactive path refuses, and the failure it
             # predicts is real: the job queues, starts, and dies on `module load`.
             # An error still lets the wizard offer "go back to edit"; only the
             # batch path exits.
@@ -1097,7 +1097,7 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
                 out.append(("error", reason))
             # `--gpus-per-task` is per *task*, so Slurm needs a task count to
             # resolve it: on its own it is refused with "Invalid generic resource
-            # (gres) specification" — measured — while the same request with
+            # (gres) specification" (measured), while the same request with
             # --ntasks-per-node is accepted. Cluster-agnostic: the requirement is
             # in the flag, not the site.
             if (
@@ -1106,7 +1106,7 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
             ):
                 out.append((
                     "error",
-                    "gpu_format 'gpus_per_task' needs a task count — Slurm refuses "
+                    "gpu_format 'gpus_per_task' needs a task count; Slurm refuses "
                     "--gpus-per-task without one ('Invalid generic resource (gres) "
                     "specification'). Set --ntasks-per-node, or use 'gres_type' "
                     "(the default) or 'gpus_per_node'",
@@ -1124,14 +1124,14 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
                 "warning",
                 f"environment '{answers.get('env_name')}' will NOT be activated: "
                 f"env_type is '{answers.get('env_type') or 'none'}', which emits no "
-                f"activation line — set --env-type conda/mamba/venv, or activate it "
+                f"activation line: set --env-type conda/mamba/venv, or activate it "
                 f"yourself in the command",
             ))
         smuggled = command_injects_directives(answers.get("command"))
         if smuggled:
             out.append((
                 "error",
-                f"the command begins with a #SBATCH line ({smuggled}) — Slurm is "
+                f"the command begins with a #SBATCH line ({smuggled}); Slurm is "
                 f"still reading directives there, so it would take effect "
                 f"unvalidated and unshown. Use the matching flag, or "
                 f"--custom-sbatch for anything slurmate does not manage",
@@ -1158,7 +1158,7 @@ def site_check_issues(answers: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _hard_errors(answers: dict[str, Any]) -> list[str]:
-    """Error-level issues only \u2014 a configuration Slurm will reject outright."""
+    """Error-level issues only; a configuration Slurm will reject outright."""
     return [
         msg
         for level, msg in (_partition_issues(answers) + site_check_issues(answers))
@@ -1211,7 +1211,7 @@ def _build_and_show(answers: dict[str, Any],
         # array reported the same figure as a single job.
         array_task_count(str(answers.get("array_spec") or "")),
         # slurmate has no --ntasks, so --custom-sbatch is the only way to express
-        # an MPI job — and the estimate ignored it entirely.
+        # an MPI job, and the estimate ignored it entirely.
         custom_ntasks(answers.get("custom_sbatch")),
     )
 
@@ -1231,14 +1231,14 @@ def _build_and_show(answers: dict[str, Any],
         array_spec=answers.get("array_spec", "") or "",
         constraint=answers.get("constraint", "") or "",
         # Hand Slurm the script it will actually receive, rather than an argv
-        # rebuilt from the same fields — see _scheduler_verdict.
+        # rebuilt from the same fields: see _scheduler_verdict.
         script=script,
     )
 
     # The ETA's first choice is Slurm's own verdict. When sbatch cannot be
     # reached it falls through to a queue-depth heuristic, which used to print a
     # confident "~7min" on the same screen as a warning saying the request
-    # exceeds the partition. Ask the partition's own figures in that case — but
+    # exceeds the partition. Ask the partition's own figures in that case, but
     # only when the scheduler stayed silent: if Slurm *placed* the job it knows
     # better than our advertised capacity does (a heterogeneous partition's
     # figures are floors, and a larger node may well have taken it).
@@ -1326,7 +1326,7 @@ def _forced_advisory(queue_info: dict[str, Any]) -> bool:
 def _note_scheduler_refusal(queue_info: dict[str, Any], console: Console) -> None:
     """Say, as an error, that this job has already been refused.
 
-    The verdict was reaching the screen only as the summary's ``ETA: never —
+    The verdict was reaching the screen only as the summary's ``ETA: never:
     <reason>`` row, which renders "this cannot run at all" as a *time estimate*,
     in the same weight as a queue depth, while strictly lesser problems (a time
     limit over the partition's, an array index over MaxArraySize) each got a
@@ -1383,7 +1383,7 @@ def _note_mock_mode(console: Console) -> None:
 
     Marking each figure individually would mean touching every message; one
     statement in the same stream as the other warnings covers the partition list,
-    its limits, the queue depth and the ETA together — and it cannot be mistaken
+    its limits, the queue depth and the ETA together, and it cannot be mistaken
     for a reading, which a bare "12 running / 5 pending" can.
     """
     if not is_mock():
@@ -1411,8 +1411,8 @@ def _note_config_source(answers: dict[str, Any], console: Console) -> None:
     """Say which config file supplied directives the user did not type.
 
     A ``.slurmate.toml`` travels with a project into git and onto the next
-    cluster, so the summary — the one surface that says "here is what you are
-    about to submit" — has to name where the values came from. The loader also
+    cluster, so the summary (the one surface that says "here is what you are
+    about to submit") has to name where the values came from. The loader also
     says this on stderr; the summary is stdout, which is what a reader of
     ``--dry-run`` output is actually looking at.
     """
@@ -1429,7 +1429,7 @@ def _note_config_source(answers: dict[str, Any], console: Console) -> None:
 def _note_defaulted_memory(answers: dict[str, Any], console: Console) -> None:
     """Say so when the ``--mem`` in the script is slurmate's guess, not the user's.
 
-    A number nobody typed should never look like a number somebody typed —
+    A number nobody typed should never look like a number somebody typed:
     especially the fallback, which is the one case where it has no relationship
     to this cluster at all.
     """
@@ -1441,7 +1441,7 @@ def _note_defaulted_memory(answers: dict[str, Any], console: Console) -> None:
         # Name the partition the figure was actually derived from. With no
         # --partition the number comes from the site default (which slurmate
         # resolves, and says so two lines further down), but this line read the
-        # *user's* answer and printed "from '?' node memory" — a provenance note
+        # *user's* answer and printed "from '?' node memory"; a provenance note
         # whose entire job is to say where a number came from, admitting it does
         # not know, on the default path of every cluster tested.
         part = answers.get("_partition_obj") or {}
@@ -1489,7 +1489,7 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
     num_w = len(str(len(script_lines)))
     # Never let this box wrap. rich wraps mid-token, which renders
     # "#SBATCH --output=<long path>" as a bare "#SBATCH" (a no-op directive) on
-    # one line and "--output=…" — split mid-path — on the next, where it reads as
+    # one line and "--output=…" (split mid-path) on the next, where it reads as
     # a *shell command*. `bash -n` accepts that, so a user who copies the box out
     # gets "command not found" at run time and none of the --output they asked
     # for. Clipping makes the box visibly an excerpt instead of a broken script;
@@ -1572,11 +1572,11 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
             "undescribed": "partition not described by this cluster's sinfo",
         }.get(str(part_obj.get("_unknown_reason")), "partition not on this cluster")
         if part_unknown:
-            rows.append(("Queue:", f"unknown — {why_unknown}", "#ffaa00"))
+            rows.append(("Queue:", f"unknown: {why_unknown}", "#ffaa00"))
         elif not queue_info.get("queue_known", True):
             # squeue failed or timed out; 0/0 would present a failed query as an
             # idle queue.
-            rows.append(("Queue:", "unknown — could not read the queue", "#ffaa00"))
+            rows.append(("Queue:", "unknown: could not read the queue", "#ffaa00"))
         else:
             depth = f"{queue_info['running']} running / {queue_info['pending']} pending"
             if is_mock():
@@ -1596,17 +1596,17 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
             forced = _forced_advisory(queue_info)
             rows.append((
                 "ETA:",
-                f"{label} — {reason}" + (" (--force: not enforced)" if forced else ""),
+                f"{label}: {reason}" + (" (--force: not enforced)" if forced else ""),
                 "#ffaa00" if forced or not permanent else "red",
             ))
         elif part_unknown:
-            rows.append(("ETA:", f"unknown — {why_unknown}", "#ffaa00"))
+            rows.append(("ETA:", f"unknown: {why_unknown}", "#ffaa00"))
         else:
             eta_color = "green" if queue_info["eta_seconds"] < 3600 else "#ffaa00"
             # fetch_queue_eta returns `source` naming which of its three tiers
             # answered, precisely so this row can qualify itself. Dropping it made
-            # Slurm's own backfill placement and a queue-depth heuristic — which
-            # returns a flat constant — typographically identical.
+            # Slurm's own backfill placement and a queue-depth heuristic (which
+            # returns a flat constant) typographically identical.
             rows.append(("ETA:", _qualified_eta(queue_info), eta_color))
 
     label_w = max(len(label) for label, _, _ in rows)
@@ -1619,7 +1619,7 @@ def _show_script_and_summary(console: Console, script: str, answers: dict[str, A
         for label, val, style in rows
     )
 
-    s_title = "Summary — SIMULATED (SLURMATE_MOCK)" if is_mock() else "Summary"
+    s_title = "Summary: SIMULATED (SLURMATE_MOCK)" if is_mock() else "Summary"
     summary_panel = Panel(summary, title=f"[bold cyan]{s_title}[/]", border_style="cyan",
                           width=summary_w + 4, padding=(0, 1))
 
@@ -1672,7 +1672,7 @@ def _edit_script_in_editor(script: str) -> str:
         with open(tmp_path, encoding="utf-8", errors="replace") as f:
             return f.read()
     except OSError as e:
-        # exec failure (editor not found / not executable) — check=False only
+        # exec failure (editor not found / not executable): check=False only
         # suppresses non-zero exit codes, not the exec error. Keep the current
         # script instead of crashing the whole wizard with a traceback.
         print(f"  {c.YELLOW}{g.WARN} Could not open editor {' '.join(argv)!r}: {e}{c.RESET}")
@@ -1703,12 +1703,12 @@ def _save_script(script: str, default_name: str) -> None:
         # saved script is what the shell would have seen.
         write_private_text(path, script)
         print(f"  {c.GREEN}{g.OK} Saved to {path}{c.RESET} "
-              f"{c.GRAY}(mode 600 — it contains your command verbatim){c.RESET}")
+              f"{c.GRAY}(mode 600; it contains your command verbatim){c.RESET}")
         # The same handover as --print, and so the same SM-24 exposure: this
         # script is the user's to submit, so nothing will create the directories
         # its --output/--error point at, and Slurm accepts the path, discards
         # what the job writes and reports COMPLETED anyway. Wiring that check
-        # into --print alone left this second artifact-handover path uncovered —
+        # into --print alone left this second artifact-handover path uncovered,
         # which is the shape of half the findings in the portability report.
         for _level, msg in check_log_dirs(script, will_create=False):
             print(f"  {c.YELLOW}{g.WARN} Warning: {msg}{c.RESET}")
@@ -1721,7 +1721,7 @@ def _save_submitted_script(script: str, job_name: str, job_id: str,
     """Write the exact submitted script for reproducibility; return the path.
 
     Writes into ``directory`` (e.g. ``SLURMATE_LOG_DIR``) or the working dir, and
-    returns ``None`` if the write actually failed — so the caller only reports
+    returns ``None`` if the write actually failed, so the caller only reports
     "Script saved" when a file was really written.
     """
     safe = sanitize_job_name(job_name) or "slurm"
@@ -1761,17 +1761,17 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
 
     # An empty stdout with rc 0 has two very different causes and this inferred
     # the wrong one. Mock mode (or no sbatch at all) short-circuits before
-    # running anything — but a real sbatch that exits 0 and prints nothing has
+    # running anything, but a real sbatch that exits 0 and prints nothing has
     # very likely *submitted the job*, and telling that user "not actually
     # submitted" invites them to submit a duplicate. Ask which case it is rather
     # than reading it off the emptiness.
     raw_out = stdout.strip()
     if not raw_out:
         if is_mock() or not is_tool_available("sbatch"):
-            print(f"  {c.YELLOW}(mock mode — not actually submitted){c.RESET}")
+            print(f"  {c.YELLOW}(mock mode, not actually submitted){c.RESET}")
         else:
             print(f"  {c.GREEN}{g.OK} Submitted!{c.RESET} "
-                  f"{c.YELLOW}(sbatch exited 0 but printed no job ID — "
+                  f"{c.YELLOW}(sbatch exited 0 but printed no job ID: "
                   f"check `squeue -u $USER` before resubmitting){c.RESET}")
         if stderr:
             print(f"  {c.GRAY}{stderr}{c.RESET}")
@@ -1780,7 +1780,7 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
     # `sbatch --parsable` returns "jobid", or "jobid;cluster" on a federated
     # setup. A site's sbatch *wrapper* can also print a policy notice on stdout,
     # in which case the banner used to become the "job id" and travel into the
-    # hints and the saved filename — so match the expected shape instead of
+    # hints and the saved filename, so match the expected shape instead of
     # trusting the whole of stdout.
     job_id = parse_submitted_job_id(raw_out)
     if not job_id:
@@ -1794,8 +1794,8 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
 
     print(f"  {c.GREEN}{g.OK} Submitted!{c.RESET} Job ID: {c.CYAN}{job_id}{c.RESET}")
 
-    # Save a copy of the exact submitted script for reproducibility — into
-    # SLURMATE_LOG_DIR when set, else the CWD — and only report success when the
+    # Save a copy of the exact submitted script for reproducibility (into
+    # SLURMATE_LOG_DIR when set, else the CWD), and only report success when the
     # write actually happened. Skippable via --no-save-script / SLURMATE_NO_SAVE=1.
     if not _no_save_requested(save_script):
         log_dir = os.environ.get("SLURMATE_LOG_DIR")
@@ -1804,7 +1804,7 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
             # Say that a copy of the command now exists on disk: the file is the
             # exact submitted script, so a token pasted into --command is in it.
             print(f"  {c.GRAY}Script saved: {saved} "
-                  f"(mode 600 — contains your command){c.RESET}")
+                  f"(mode 600: contains your command){c.RESET}")
 
     # Read the actual --output path from the generated script (source of truth).
     # effective_log_path takes the LAST output directive (what Slurm honours) and
@@ -1812,8 +1812,8 @@ def _submit_and_report(script: str, answers: dict[str, Any], console: Console,
     # `-o`/`--output PATH` no longer makes this point at a file the job never wrote.
     log_path = (effective_log_path(script, "output")
                 or f"{answers.get('job_name', '') or 'slurm'}-%j.out")
-    # Resolve every pattern whose value we know — %j/%A (this job id), %x (the
-    # job name) and %u (the user) — in a single pass, so "%%" stays a literal
+    # Resolve every pattern whose value we know, namely %j/%A (this job id),
+    # %x (the job name) and %u (the user), in a single pass, so "%%" stays a literal
     # percent rather than leaving a bare "%" for the next substitution to
     # misread. What is left is genuinely unknowable before the job starts.
     resolved_log, unresolved = expand_log_pattern(
@@ -1860,13 +1860,13 @@ def _check_custom_sbatch_form(
 
     argparse treats a value starting with ``-`` as the next option, so the one
     flag whose entire job is passing *other* flags through fails on its most
-    natural invocation — with argparse's generic "expected one argument", which
+    natural invocation, with argparse's generic "expected one argument", which
     names neither the cause nor the fix. The ``=`` form works.
 
     Diagnosed rather than silently repaired: rewriting the pair into the ``=``
     form would make ``slurmate --custom-sbatch --print`` swallow a real slurmate
     flag as an sbatch one, which is a silent wrong answer in place of a loud
-    error — the failure mode this whole package is being audited for.
+    error; the failure mode this whole package is being audited for.
     """
     for i, token in enumerate(argv[:-1]):
         if token != "--custom-sbatch":
@@ -1906,12 +1906,24 @@ def _check_custom_sbatch_form(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     from . import __version__
+
     # Without an explicit prog, argparse takes it from sys.argv[0], so
     # `python -m slurmate --help` announced itself as `usage: __main__.py`.
     # The other tools in this family all pin it; slurmate is the command name
     # users type, and the one the help should name.
+    from .agent import VERB_HELP
+
+    verbs = "\n".join(f"  slurmate {v:<7} {why}" for v, why in VERB_HELP.items())
     parser = argparse.ArgumentParser(
-        prog="slurmate", description="Slurmate \u2014 sbatch wizard"
+        prog="slurmate", description="Slurmate: sbatch wizard",
+        # In the epilog, not as subparsers. Making them real subcommands would
+        # put a `{brief,check,...}` line above every flag in this help and
+        # change what a bare `slurmate` means to argparse, and a bare
+        # `slurmate` is the wizard, which is the product. They still have to be
+        # *findable*: a reader of --help who cannot see them cannot use them,
+        # and that reader is now often an agent.
+        epilog=f"read-only subcommands (each takes --json):\n{verbs}\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--job-name", "-J", default=None, help="Job name")
     parser.add_argument("--account", "-A", default=None, help="Slurm account")
@@ -1984,7 +1996,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "implied when the terminal's encoding cannot carry them")
     parser.add_argument("--force", action="store_true",
                         help="Downgrade cluster checks (unknown partition/account) to "
-                             "warnings — for writing a script to carry to another cluster")
+                             "warnings, for writing a script to carry to another cluster")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation and submit")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show the full summary (script, limit warnings, CPU-hours/ETA, "
@@ -2006,7 +2018,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 # Job-defining flags whose presence means the user wants non-interactive
-# (batch) mode — not just --partition. Output modes (--print/--dry-run) and
+# (batch) mode, not just --partition. Output modes (--print/--dry-run) and
 # --no-save-script are deliberately excluded; --yes is handled separately.
 _BATCH_FLAGS = (
     "job_name", "account", "partition", "qos", "cpus", "memory", "mem_per_cpu",
@@ -2053,7 +2065,7 @@ def _require_terminal_for_wizard() -> None:
 
     prompt_toolkit detects the problem, prints ``Warning: Input is not a terminal
     (fd=0)``, renders the wizard anyway and then blocks forever on input that
-    cannot arrive — so ``slurmate | tee setup.log``, a CI runner, or any wrapper
+    cannot arrive, so ``slurmate | tee setup.log``, a CI runner, or any wrapper
     script that inherits a pipe hangs until something kills it. Piping is the most
     ordinary thing a user can do to a command, and the non-interactive surface
     already exists and works; this points at it instead of hanging.
@@ -2066,7 +2078,7 @@ def _require_terminal_for_wizard() -> None:
         return
     verb = "is" if len(missing) == 1 else "are"
     print(
-        f"  {c.RED}{g.ERR} slurmate: {' and '.join(missing)} {verb} not a terminal — the "
+        f"  {c.RED}{g.ERR} slurmate: {' and '.join(missing)} {verb} not a terminal; the "
         f"interactive wizard needs one.{c.RESET}\n"
         f"  {c.GRAY}Pass the job as flags for non-interactive use, e.g.{c.RESET}\n"
         f"  {c.GRAY}  slurmate --print --partition <name> --cpus 2 "
@@ -2083,7 +2095,7 @@ def _redirect_error_flag(args: argparse.Namespace) -> None:
 
     SM-25's rule is that anything slurmate prints should be typeable back at it.
     ``--error`` is the single exception, because it is *derived* from the output
-    path — so the useful response names the escape hatch, which is verified to
+    path, so the useful response names the escape hatch, which is verified to
     work: a custom directive suppresses the auto one rather than duplicating it.
     """
     raw = getattr(args, "error", None)
@@ -2102,7 +2114,7 @@ def _normalize_gpus_flag(args: argparse.Namespace) -> None:
     """Turn ``--gpus`` into an int, splitting off a ``<type>:`` prefix.
 
     Called from :func:`parse_args` so that ``args.gpus`` is an int (or None) for
-    every caller — the flag has to accept Slurm's ``<type>:count`` spelling,
+    every caller; the flag has to accept Slurm's ``<type>:count`` spelling,
     which argparse's ``type=int`` rejected, but "after parsing, gpus is a number"
     is an invariant the rest of the module and its tests rely on. Idempotent, so
     :func:`_resolve_gpu_spellings` can re-run it without caring who came first.
@@ -2198,9 +2210,24 @@ def _main(stack: contextlib.ExitStack) -> None:
     # Before any output: a non-encodable character must not be able to abort the
     # run. A *valid* non-UTF-8 locale (en_US is latin-1; el7 has no C.UTF-8) made
     # a "⚠" in a warning raise UnicodeEncodeError mid-print, killing the run and
-    # truncating the summary — and the warnings are error paths, so the tool was
+    # truncating the summary, and the warnings are error paths, so the tool was
     # least robust exactly when something had already gone wrong.
     make_output_safe()
+    # Before argparse, because these are subcommands and `parse_args` declares
+    # no positionals: it would reject the verb rather than route it. Only the
+    # first token is inspected and only as an exact match, so no existing
+    # invocation can be captured by it (a value that reads "brief" arrives
+    # after its flag, never in argv[0]).
+    from .agent import dispatch, is_verb, verb_suggestion
+    if is_verb(sys.argv[1:]):
+        raise SystemExit(dispatch(sys.argv[1:]))
+    # A near-miss is a typo, not a flag. Left to argparse it printed the whole
+    # usage block under "unrecognized arguments: brieff", which buries the one
+    # thing the reader needs (the spelling) under sixty lines of flags.
+    hint = verb_suggestion(sys.argv[1:])
+    if hint:
+        print(hint, file=sys.stderr)
+        raise SystemExit(2)
     args = parse_args()
     # Before --demo and before run_batch: these are aliases, so everything
     # downstream must see the resolved --gpus/--gpu-type/--gpu-format.
@@ -2297,15 +2324,15 @@ def _main(stack: contextlib.ExitStack) -> None:
             fatal = fatal or _level == "error"
         # will_create=False: --print is the only mode that hands over a script
         # slurmate will never submit, so it is the only one where a missing log
-        # directory stays missing. --dry-run is not that case — a later real run
-        # creates it — and warning there would fire on every dry run of the
+        # directory stays missing. --dry-run is not that case (a later real run
+        # creates it), and warning there would fire on every dry run of the
         # default `logs/`.
         _warn_runtime_targets(script, answers, err, will_create=False)
         # And Slurm's own verdict on the script. Every other mode gets this free
         # from the ETA (build_and_show), which --print does not call, so the mode
         # meant for pipes and CI was the one that could not learn a job was
-        # unsubmittable: on Booth's Mercury an account-less script — which that
-        # controller refuses outright — printed with zero bytes on stderr and
+        # unsubmittable: on Booth's Mercury an account-less script (which that
+        # controller refuses outright) printed with zero bytes on stderr and
         # rc=0. Script-based, so it needs no answers, and it submits nothing.
         refusal = check_script_with_scheduler(script)
         forced = bool(getattr(args, "force", False))
@@ -2358,7 +2385,7 @@ def _main(stack: contextlib.ExitStack) -> None:
     )
 
     if args.dry_run:
-        print(f"  {c.GRAY}Dry run — not submitted.{c.RESET}")
+        print(f"  {c.GRAY}Dry run, not submitted.{c.RESET}")
         return
 
     if args.yes:
@@ -2366,26 +2393,26 @@ def _main(stack: contextlib.ExitStack) -> None:
         # would submit a no-op job (the builder rstrips the body to nothing), so
         # make it a hard error here rather than only an advisory warning. Strip
         # each line and treat a command with no real (non-comment) line as
-        # missing. (Partition and job name stay advisory — sbatch defaults them.)
+        # missing. (Partition and job name stay advisory; sbatch defaults them.)
         cmd_lines = [ln.strip() for ln in str(answers.get("command") or "").splitlines()]
         if all(not ln or ln.startswith("#") for ln in cmd_lines):
-            print(f"  {c.RED}{g.ERR} Nothing to run — refusing to submit with --yes "
+            print(f"  {c.RED}{g.ERR} Nothing to run: refusing to submit with --yes "
                   f"(pass --command){c.RESET}", file=sys.stderr)
             sys.exit(1)
         # Don't fire off a job Slurm will certainly reject (e.g. GPUs on a CPU-only
         # partition). Errors are hard rejections; warnings stay advisory (a
         # heterogeneous partition can under-report, so they aren't guaranteed fails).
         errs = _hard_errors(answers)
-        # Slurm's own refusal blocks the submit too — it is more authoritative
+        # Slurm's own refusal blocks the submit too; it is more authoritative
         # than any answers-derived check, and this gate exists precisely to save
         # the round-trip. Two narrowings, both load-bearing: only the
         # *scheduler's* verdict blocks (a refusal derived from advertised
         # partition figures stays advisory, because a heterogeneous partition
-        # under-reports — see capacity_refusal), and only a *permanent* one (a
+        # under-reports: see capacity_refusal), and only a *permanent* one (a
         # submit-count cap means wait, not fix, and blocking on it refused a
         # valid job on Mercury purely because another job was already queued).
         # The message was already printed by build_and_show, so this only
-        # decides — repeating it here would say the same thing twice.
+        # decides: repeating it here would say the same thing twice.
         # A third narrowing: --force. It is documented as downgrading cluster
         # checks to warnings, and an unknown partition -- a certain rejection --
         # already submits under it. Blocking here while that goes through would
@@ -2400,7 +2427,7 @@ def _main(stack: contextlib.ExitStack) -> None:
         if errs or refused:
             for m in errs:
                 print(f"  {c.RED}{g.ERR} {m}{c.RESET}", file=sys.stderr)
-            print(f"  {c.RED}{g.ERR} Refusing to submit — Slurm would reject this job "
+            print(f"  {c.RED}{g.ERR} Refusing to submit; Slurm would reject this job "
                   f"(fix the above and pass corrected flags){c.RESET}", file=sys.stderr)
             sys.exit(1)
         _submit_and_report(script, answers, console, save_script=save_script)
@@ -2431,7 +2458,7 @@ def _main(stack: contextlib.ExitStack) -> None:
 
     from .theme import questionary_style
     QS = questionary_style()
-    # Label the menu with the command that will actually be launched — the raw
+    # Label the menu with the command that will actually be launched; the raw
     # env lookup disagreed with _editor_command() whenever EDITOR was set but
     # empty (menu said "Open script in ", vim was launched).
     editor = " ".join(_editor_command())
@@ -2473,7 +2500,7 @@ def _main(stack: contextlib.ExitStack) -> None:
         if action == _GO_BACK or (action is not None and action.startswith("Go back")):
             assert wizard is not None
             # Editing answers regenerates the script from scratch, discarding any
-            # manual $EDITOR changes — confirm before throwing them away.
+            # manual $EDITOR changes: confirm before throwing them away.
             if manually_edited and not questionary.confirm(
                 "Editing answers regenerates the script and discards your manual "
                 "edits. Continue?", default=False, qmark="", style=QS,
@@ -2491,12 +2518,12 @@ def _main(stack: contextlib.ExitStack) -> None:
             return
         if action.startswith("Submit"):
             # Navigation stays free (the error shows on every step), but block the
-            # actual submit — otherwise slurmate fires off a script sbatch rejects,
+            # actual submit: otherwise slurmate fires off a script sbatch rejects,
             # wasting a round-trip. The fix is usually an earlier step (partition).
             if manually_edited:
                 # The answers no longer describe the script, so validating them
                 # would check something other than what is about to be submitted
-                # — and would block a hand edit that *fixed* the problem while
+                #, and would block a hand edit that *fixed* the problem while
                 # passing one that introduced it. Ask the controller about the
                 # actual bytes instead.
                 refusal = check_script_with_scheduler(script)
@@ -2516,7 +2543,7 @@ def _main(stack: contextlib.ExitStack) -> None:
                     # blocking would strand a correct script behind a condition
                     # that clears, and "rejects the edited script" would send the
                     # user hunting for a mistake in it. Submit and let the
-                    # controller decide at the moment it matters — the same call
+                    # controller decide at the moment it matters: the same call
                     # the other paths make. The wording still distinguishes a
                     # known-transient limit from one we cannot classify.
                     detail = (
@@ -2554,7 +2581,7 @@ def _main(stack: contextlib.ExitStack) -> None:
             manually_edited = True
             _resummarize()
             # Say once that the summary above is now describing the answers, not
-            # the edited script — the two can disagree, and the checks that
+            # the edited script; the two can disagree, and the checks that
             # produced that summary no longer apply to what would be submitted.
             console.print(
                 f"  [yellow]{g.WARN} Script edited by hand: the summary and checks "

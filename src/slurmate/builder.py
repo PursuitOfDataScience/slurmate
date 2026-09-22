@@ -48,7 +48,7 @@ def job_name_change_note(raw: str) -> str:
 
     Collapsing whitespace to underscores stays quiet: it is visible in the
     result and nothing is lost. Dropping characters is not, and the fallback is
-    the case that really needs saying — *any* all-non-Latin name (``训练任务``)
+    the case that really needs saying: *any* all-non-Latin name (``训练任务``)
     becomes ``slurm``, so a user's logs appear as ``logs/slurm-<jobid>.out`` and
     nothing anywhere explained why. The name is not only a directive; it is the
     log filename and the auto-saved script's filename, so a silent rewrite sends
@@ -65,7 +65,7 @@ def job_name_change_note(raw: str) -> str:
     if not safe or safe == re.sub(r"\s+", "_", original):
         return ""
     return (
-        f"job name '{original}' was changed to '{safe}' — sbatch takes a single "
+        f"job name '{original}' was changed to '{safe}'; sbatch takes a single "
         f"token, and the name is also the log filename, so the output will be "
         f"'{safe}-<jobid>.out'"
     )
@@ -75,7 +75,7 @@ def _abort_guard(label: str) -> str:
     """`|| { … exit 1; }` tail that stops the job when a setup line fails.
 
     A batch script is not run with ``set -e``, so a failed ``module load`` or
-    ``conda activate`` prints to stderr and the body runs anyway — Slurm then
+    ``conda activate`` prints to stderr and the body runs anyway; Slurm then
     records the job **COMPLETED, exit 0** with the environment absent. The worst
     case is not a confusing failure later, it is a run that quietly proceeds
     against whatever toolchain was already on ``PATH`` and produces results the
@@ -87,7 +87,7 @@ def _abort_guard(label: str) -> str:
     """
     # shlex.quote the whole message, not just the command's argument. The label
     # carries a user-supplied module or environment name, and a double-quoted
-    # shell string still performs command substitution — so `--modules '$(cmd)'`
+    # shell string still performs command substitution, so `--modules '$(cmd)'`
     # would have run `cmd` at the moment the guard fired. Single-quoting the
     # message makes it inert text.
     return f" || {{ echo {shlex.quote(f'slurmate: {label} failed; aborting')} >&2; exit 1; }}"
@@ -99,7 +99,7 @@ def _fold_directive(value: str) -> str:
     Slurm stops parsing ``#SBATCH`` directives at the first non-comment line, so
     a newline smuggled into a value (via a CLI flag or an auto-loaded config)
     would (a) inject a bare command line into the script body and (b) silently
-    drop every directive after it — the job then runs mis-sized. Fold any CR/LF
+    drop every directive after it: the job then runs mis-sized. Fold any CR/LF
     to a space so the value always stays a single well-formed directive. The
     ``command`` body and ``custom_sbatch`` flags are handled separately (command
     is intentionally multi-line; custom flags fold their own newlines).
@@ -177,17 +177,17 @@ def _quote_custom_flag(flag: str) -> str:
     A custom flag whose value contains a space (e.g. ``--comment=my job``, once
     the parser has consumed the user's quotes) would otherwise be split by
     Slurm's directive parser into ``--comment=my`` plus a stray ``job`` token,
-    producing a script Slurm rejects. Wrap the value in double quotes — which
-    Slurm strips — so it stays a single argument. A bare flag (``--exclusive``),
+    producing a script Slurm rejects. Wrap the value in double quotes (which
+    Slurm strips), so it stays a single argument. A bare flag (``--exclusive``),
     a value with no whitespace, or a value the caller already quoted is emitted
     unchanged.
 
     The **space** form (``--comment my job``) is handled too, but only when the
-    option name is a known value-taking one (``_VALUE_TAKING_FLAGS``) — that is
+    option name is a known value-taking one (``_VALUE_TAKING_FLAGS``); that is
     what tells us where the value starts. Otherwise the flag is left alone, since
     guessing wrong would corrupt it. Without this, ``--comment "my job"`` typed in
     the custom-flags box became ``#SBATCH --comment my job``, which Slurm splits
-    into ``--comment=my`` plus a stray ``job`` — the same defect the ``=`` form
+    into ``--comment=my`` plus a stray ``job``; the same defect the ``=`` form
     was already protected against.
     """
     if "=" in flag:
@@ -201,7 +201,7 @@ def _quote_custom_flag(flag: str) -> str:
         sep = " "
     if not value or not any(ch.isspace() for ch in value):
         return flag
-    # Already wrapped in matching quotes — don't double-quote it.
+    # Already wrapped in matching quotes: don't double-quote it.
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return flag
     return f"{name}{sep}{_quote_sbatch_value(value)}"
@@ -210,7 +210,7 @@ def _quote_custom_flag(flag: str) -> str:
 # sbatch options that take a value, so a bare token following one of them is
 # that value (``-C bigmem``, ``--reservation abc``) rather than a new option.
 # Without this, every space-separated Slurm option was shredded into a valueless
-# flag plus a nonsense ``--<value>`` one — ``-o /logs/x.out`` became
+# flag plus a nonsense ``--<value>`` one: ``-o /logs/x.out`` became
 # ``['-o', '--/logs/x.out']``, a script sbatch rejects outright.
 _VALUE_TAKING_FLAGS = frozenset({
     # short forms
@@ -318,14 +318,14 @@ def _normalize_custom_flags(
 ) -> list[str]:
     """Coerce ``custom_sbatch`` (list | str | None) into a clean list of flags.
 
-    Single place that (a) tolerates a bare string from a direct API caller — which
-    would otherwise be iterated character-by-character — (b) folds CR/LF in an
+    Single place that (a) tolerates a bare string from a direct API caller (which
+    would otherwise be iterated character-by-character) (b) folds CR/LF in an
     entry to a space so one entry can never become two script lines, and (c)
     rejoins an option that was split from its value across two list elements
     (a TOML ``custom_sbatch = ["-o", "/logs/%j.out"]`` used to emit a valueless
-    ``#SBATCH -o`` plus a bare path line). Every consumer — the memory override,
+    ``#SBATCH -o`` plus a bare path line). Every consumer (the memory override,
     the constraint merge, the output/error dedup, the emit loop and
-    ``job_summary_rows`` — works from this same list, so the summary and the
+    ``job_summary_rows``) works from this same list, so the summary and the
     script can't disagree about what the custom flags say.
     """
     if not custom_sbatch:
@@ -359,10 +359,10 @@ _MEM_FLAG_NAMES = ("--mem",)
 _MEM_PER_CPU_FLAG_NAMES = ("--mem-per-cpu",)
 # The third member of Slurm's mutually exclusive memory family. slurmate has no
 # option of its own for it, so --custom-sbatch=--mem-per-gpu=1G is the only way
-# to ask for per-GPU memory — and it has to suppress the auto --mem the same way
+# to ask for per-GPU memory, and it has to suppress the auto --mem the same way
 # a custom --mem/--mem-per-cpu does. Measured on Slurm 20.11.8: a script with
-# both is not merely overridden, it is refused outright — `sbatch: fatal: --mem,
-# --mem-per-cpu, and --mem-per-gpu are mutually exclusive.` — so slurmate emitted
+# both is not merely overridden, it is refused outright (`sbatch: fatal: --mem,
+# --mem-per-cpu, and --mem-per-gpu are mutually exclusive.`), so slurmate emitted
 # an unsubmittable script for a GPU job whose user never mentioned memory at all
 # (the --mem comes from the partition default).
 _MEM_PER_GPU_FLAG_NAMES = ("--mem-per-gpu",)
@@ -374,7 +374,7 @@ _ERROR_FLAG_NAMES = ("--error", "-e")
 # Directives slurmate owns and *reconciles* when a custom flag also sets them:
 # --mem/--mem-per-cpu (the custom value wins, the auto one is suppressed),
 # --constraint/-C (merged into one directive), --output/--error (de-duplicated).
-# A custom flag naming one of these is fine — the machinery already accounts for
+# A custom flag naming one of these is fine; the machinery already accounts for
 # it, and the merged constraint case is behaviour the portability report asked to
 # keep.
 _RECONCILED_CUSTOM_FLAGS = {
@@ -393,7 +393,7 @@ _MANAGED_CUSTOM_FLAGS = {
     "--time": "--time", "-t": "--time",
     # Each maps to a spelling the CLI actually accepts. SM-25 made Slurm's own
     # spellings first-class (--cpus-per-task, --gres, --gpus-per-node/task), so
-    # these used to send the user to a *different* flag than the one they typed —
+    # these used to send the user to a *different* flag than the one they typed,
     # and for --gres that lost information, since --gres gpu:a100:2 carries a type
     # that a bare --gpus does not.
     "--cpus-per-task": "--cpus-per-task", "-c": "--cpus-per-task",
@@ -409,7 +409,7 @@ _MANAGED_CUSTOM_FLAGS = {
 def output_dir_is_used(output_dir: Any, output_file: Any) -> bool:
     """Whether ``output_dir`` will actually place the log files.
 
-    The builder puts only a **bare** filename inside it — an absolute or
+    The builder puts only a **bare** filename inside it; an absolute or
     directory-bearing ``output_file`` is left alone. So with
     ``--output-file /tmp/x.out --output-dir logs`` the script writes to ``/tmp``
     while the summary still said ``Output directory: logs``, sending the user to
@@ -444,7 +444,7 @@ def command_injects_directives(command: Any) -> str:
 
     Slurm stops reading directives at the first line that is neither blank nor a
     comment. The command body is emitted after the directive block, so a
-    ``#SBATCH`` line at the *start* of the body — before any real command — is
+    ``#SBATCH`` line at the *start* of the body (before any real command) is
     still inside the directive region and takes effect. Measured: a command of
     ``#SBATCH --qos=INJECTED`` produced ``Access/permission denied`` from the
     controller, which is its answer for an invalid QoS, so the directive was
@@ -510,7 +510,7 @@ def custom_ntasks(custom_sbatch: Any) -> int | None:
     """A total task count supplied via ``--custom-sbatch --ntasks``, or ``None``.
 
     slurmate has no ``--ntasks`` option, so ``--custom-sbatch=--ntasks=N`` is the
-    *only* way to express an MPI job with it — which makes this a likely path
+    *only* way to express an MPI job with it, which makes this a likely path
     rather than an exotic one. The cost estimate multiplies by tasks, so a custom
     ``--ntasks=100`` left it reporting a hundredth of the real footprint: 2.0
     core-hours for a job asking for 200 cores.
@@ -539,7 +539,7 @@ def _custom_mem_override(
     All three of Slurm's memory directives are reported, because all three are
     mutually exclusive of one another: whichever one a custom flag carries, the
     auto directive must give way or the controller refuses the script. Matched on
-    the exact flag name, so ``--mem-bind`` — which merely starts the same — is
+    the exact flag name, so ``--mem-bind`` (which merely starts the same) is
     left alone and does not silently drop the memory request.
 
     Last occurrence wins, mirroring Slurm's own "later option overrides earlier"
@@ -568,7 +568,7 @@ def _clean_constraint(value: str) -> str:
 
     Slurm's feature grammar has no room for spaces: ``-C "a100 & 384g"`` is
     rejected outright ("Invalid feature specification") while ``-C "a100&384g"``
-    schedules — measured against a live sbatch. A user typing the spaced form (or
+    schedules: measured against a live sbatch. A user typing the spaced form (or
     a stray leading space, which produced ``--constraint= a100``) would otherwise
     get a job Slurm refuses, so normalize instead of passing it through. Feature
     names cannot contain whitespace, so nothing legitimate is lost.
@@ -638,8 +638,8 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
             rows.append((label, text))
 
     # Show what Slurm will see, not what was typed. These fields are transformed
-    # on the way into the script — the name is sanitized, memory is normalized,
-    # free-text values are CR/LF-folded — and the CLI happens to pre-transform
+    # on the way into the script (the name is sanitized, memory is normalized,
+    # free-text values are CR/LF-folded), and the CLI happens to pre-transform
     # them before they reach here, so the two agreed by accident rather than by
     # construction. A library caller got a summary describing its input and a
     # script carrying something else.
@@ -660,7 +660,7 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     )
     if custom_mem_per_cpu or custom_mem or custom_mem_per_gpu:
         # A custom flag wins. Several can be present (Slurm would reject that, but
-        # it's the user's script) — show whatever the script really says.
+        # it's the user's script): show whatever the script really says.
         add("Mem per GPU", custom_mem_per_gpu)
         add("Mem per CPU", custom_mem_per_cpu)
         add("Memory", custom_mem)
@@ -668,7 +668,7 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
         # Mirror the builder: --mem-per-cpu takes precedence over --mem when set.
         add("Mem per CPU", answers.get("mem_per_cpu"))
         # And say so when a --memory was also supplied. Slurm rejects the two
-        # together, so the builder emits only one — but the discarded value was
+        # together, so the builder emits only one, but the discarded value was
         # then absent from the summary entirely, which reads as "I never set
         # that". It matters most for the case that cannot be seen: a `memory`
         # key inherited from a config file, silently dropped by a --mem-per-cpu
@@ -677,7 +677,7 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
         if answers.get("memory"):
             add(
                 "Memory",
-                f"{answers.get('memory')} (not used — --mem-per-cpu takes "
+                f"{answers.get('memory')} (not used: --mem-per-cpu takes "
                 f"precedence, and Slurm rejects both together)",
             )
     else:
@@ -689,7 +689,7 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     # Mirror the builder's own default: build_sbatch_script receives
     # opt("nodes", 1), so an absent value still emits `#SBATCH --nodes=1`. Reading
     # the raw answer here omitted the row, leaving a directive in the script that
-    # nothing in the summary accounted for — SM-15's shape in miniature. (The
+    # nothing in the summary accounted for: SM-15's shape in miniature. (The
     # value is not an imposition: 1 node is Slurm's own default too. It just has
     # to be visible, because the summary is what the user checks the script by.)
     nodes = answers.get("nodes")
@@ -744,13 +744,13 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     add("Array specification", answers.get("array_spec"))
     # The --output/--error directives are emitted unconditionally, so a row has to
     # account for them. The CLI and the wizard both default this to "logs", but a
-    # direct API caller may omit it — and then the logs land in the working
+    # direct API caller may omit it, and then the logs land in the working
     # directory, which is worth saying rather than leaving the row out.
     out_dir = answers.get("output_dir")
     if out_dir and not output_dir_is_used(out_dir, answers.get("output_file")):
         # The flag was given and has no effect: say that, rather than naming a
         # directory the job will not write to.
-        add("Output directory", f"{out_dir} (not used — output file has its own path)")
+        add("Output directory", f"{out_dir} (not used: output file has its own path)")
     else:
         add("Output directory", out_dir or "(current directory)")
     add("Output file", answers.get("output_file"))
@@ -758,7 +758,7 @@ def job_summary_rows(answers: dict[str, Any]) -> list[tuple[str, str]]:
     # Say when the name will not be acted on, rather than implying activation.
     env_name = answers.get("env_name")
     if env_name and not env_activation_emitted(env_name, answers.get("env_type")):
-        add("Environment", f"{env_name} (not activated — env_type "
+        add("Environment", f"{env_name} (not activated: env_type "
                            f"{answers.get('env_type') or 'none'!s})")
     else:
         add("Environment", env_name)
@@ -825,7 +825,7 @@ def build_from_answers(answers: dict[str, Any], partial: bool = False) -> str:
             else:
                 output_path = _in_dir(f"{of}-{tag}.out")
                 error_path = _in_dir(f"{of}-{tag}.err")
-        # `os.path.splitext("run.%j")` returns ("run", ".%j") — but a suffix that
+        # `os.path.splitext("run.%j")` returns ("run", ".%j"), but a suffix that
         # carries a Slurm pattern character (%) is part of the log *pattern*, not
         # a real extension. Treating it as one dropped %j from the derived error
         # path (every task then overwrote the same file). So: only swap a literal
@@ -917,7 +917,7 @@ def build_sbatch_script(
     job_name = sanitize_job_name(job_name)
 
     # Defensive coercion for direct callers passing stringy numbers (e.g. from a
-    # config value) — otherwise the `gpus > 0` / `nodes > 1` comparisons below
+    # config value): otherwise the `gpus > 0` / `nodes > 1` comparisons below
     # raise TypeError comparing str and int.
     try:
         gpus = int(gpus)
@@ -963,12 +963,12 @@ def build_sbatch_script(
     # If the user supplied their own memory directive via custom flags, don't also
     # emit the auto one: Slurm rejects a script that sets --mem, --mem-per-cpu or
     # --mem-per-gpu together, so a user override wins (mirrors the GPU-flag dedup
-    # below). All three count — --mem-per-gpu has no slurmate option, so the
+    # below). All three count: --mem-per-gpu has no slurmate option, so the
     # passthrough is the only way to ask for it.
     _cm, _cmpc, _cmpg = _custom_mem_override(custom_flags)
     _custom_mem = bool(_cm or _cmpc or _cmpg)
     # Memory: --mem-per-cpu takes precedence over --mem when set (Slurm treats the
-    # two as mutually exclusive). A blank memory omits the directive entirely — what
+    # two as mutually exclusive). A blank memory omits the directive entirely; what
     # whole-node/exclusive sites need: e.g. TACC rejects any script that sets --mem.
     if _custom_mem:
         pass  # a custom --mem / --mem-per-cpu flag is emitted below instead
@@ -980,7 +980,7 @@ def build_sbatch_script(
         # normalize_memory here, not only in the CLI: `sbatch --mem` requires an
         # integer magnitude, so a fractional value that validate_memory accepts
         # ("1.5G") is refused by the controller with "Invalid --mem
-        # specification" — measured. The CLI and the wizard both normalized before
+        # specification": measured. The CLI and the wizard both normalized before
         # calling, so the emitted directive was correct *by accident of the
         # caller*; a library caller got an unsubmittable script, and the summary
         # row disagreed with it. Idempotent, so the pre-normalising callers are
@@ -1028,7 +1028,7 @@ def build_sbatch_script(
     # silently discards the earlier one (measured: an invalid feature placed first
     # schedules fine, placed last it fails with "Invalid feature specification"),
     # and because the custom-flag loop runs last, the directive being discarded was
-    # always slurmate's own — dropping the GPU type or the node feature the user
+    # always slurmate's own: dropping the GPU type or the node feature the user
     # asked for, with no error. Merging with "&" (AND) keeps both requirements.
     # Collected here, appended after the GPU block (so the merged value reads
     # param → GPU type → custom), and skipped in the emit loop below.
@@ -1061,7 +1061,7 @@ def build_sbatch_script(
         else:  # "constraint" (also gres_type with no/any type)
             auto_value = f"gpu:{gpus}"
         # A custom flag on the SAME option, with a DIFFERENT value, suppresses the
-        # auto directive — exactly as a custom --mem/--output does. Slurm honours
+        # auto directive: exactly as a custom --mem/--output does. Slurm honours
         # the last option, so the override already won; leaving the auto directive
         # in the script merely contradicted it, and made the summary describe a GPU
         # request the job doesn't make. An *exact* duplicate is handled the other way
@@ -1097,7 +1097,7 @@ def build_sbatch_script(
     constraint_parts.extend(custom_constraints)
 
     # Emit the merged node/GPU/custom constraint as a single directive. De-dup
-    # case-SENSITIVELY: Slurm node features are case-sensitive (measured — a node
+    # case-SENSITIVELY: Slurm node features are case-sensitive (measured; a node
     # advertising "a100" is not matched by "-C A100"), so "A100" and "a100" are
     # different requirements and must not be folded together.
     if constraint_parts:
@@ -1194,15 +1194,15 @@ def build_sbatch_script(
             # `#!/bin/bash`): source conda.sh first so the `conda`/`mamba` shell
             # functions are defined, then activate. Bare `source activate <env>`
             # (the old form) silently fails on modern conda (4.4+) whenever the
-            # job's shell hasn't been conda-initialized — i.e. the common batch
-            # case — leaving the job in the base/system Python.
+            # job's shell hasn't been conda-initialized: i.e. the common batch
+            # case: leaving the job in the base/system Python.
             lines.append("")
             lines.append('source "$(conda info --base)/etc/profile.d/conda.sh"')
             quoted = shlex.quote(env_name)
             if strategy == "mamba":
                 # conda.sh defines the `conda` hook only. mamba >= 2 (miniforge's
                 # current default) needs its OWN hook, so a bare `mamba activate`
-                # here dies with "critical libmamba Shell not initialized" — and,
+                # here dies with "critical libmamba Shell not initialized", and,
                 # crucially, the script keeps going, so the job silently runs in
                 # whatever interpreter it inherited. Fall back to `conda activate`,
                 # which activates a mamba-created env identically (verified on
@@ -1225,7 +1225,7 @@ def build_sbatch_script(
                 f"source {activate}{_abort_guard(f'activating {env_name}')}"
             )
         else:
-            logger.warning(f"env_type '{env_type}' with env_name '{env_name}' — no activation line emitted")
+            logger.warning(f"env_type '{env_type}' with env_name '{env_name}': no activation line emitted")
 
     if command:
         lines.append("")
@@ -1242,9 +1242,9 @@ def build_sbatch_script(
 # Requested time limits that mean "no limit": `--time=0` is documented Slurm for
 # exactly that, and UNLIMITED/INFINITE appear in config-sourced values. Treating
 # them as a *zero-length* job and substituting a two-hour default produced a
-# confident core-hour figure for something unbounded — the same shape as quoting
+# confident core-hour figure for something unbounded; the same shape as quoting
 # an ETA for a job the scheduler has refused.
-UNBOUNDED_ESTIMATE = "unbounded — no time limit"
+UNBOUNDED_ESTIMATE = "unbounded: no time limit"
 
 
 def _time_is_unbounded(time_limit: str) -> bool:
@@ -1262,7 +1262,7 @@ def _with_array_total(per_task: float, array_tasks: int | None) -> str:
     """Render a cost as the array total, with the per-task figure kept visible.
 
     The cost of an array job is per-task cost × task count, and showing only the
-    per-task figure understates a 1000-task array a thousandfold — in the
+    per-task figure understates a 1000-task array a thousandfold, in the
     direction that matters, because it tells the user an enormous job is cheap.
     The ``%N`` throttle is not a divisor: it caps concurrency, so it changes the
     wall-clock and not the bill.
@@ -1311,7 +1311,7 @@ def estimate_su(cpus: int, time_limit: str, nodes: int = 1,
     tasks = ntasks_per_node if (ntasks_per_node and ntasks_per_node > 0) else 1
     # An explicit total (Slurm's --ntasks) is job-wide, so it replaces
     # tasks-per-node × nodes rather than multiplying it. `max` because the two can
-    # disagree — --ntasks-per-node is a per-node cap, not a total — and the larger
+    # disagree (--ntasks-per-node is a per-node cap, not a total), and the larger
     # is the number of tasks Slurm will actually run.
     task_units = max(ntasks_total or 0, tasks * max(nodes, 0))
     su = cpus * task_units * hours
@@ -1335,7 +1335,7 @@ def estimate_gpu_hours(gpus: int, time_limit: str, nodes: int = 1,
 
     GPU allocation is per-node for ``--gres``/``--gpus-per-node`` (and the
     constraint form), per-task for ``--gpus-per-task``, and job-wide for
-    ``--gpus`` — so the multiplier has to follow the chosen ``gpu_format``, not
+    ``--gpus``, so the multiplier has to follow the chosen ``gpu_format``, not
     just the raw count. Reported next to the CPU-hours figure because on nearly
     every GPU site it is the GPU, not the core, that drives the bill.
     """

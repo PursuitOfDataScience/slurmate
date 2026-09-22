@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slurmate"
-version = "0.7.2"
+version = "0.8.0"
 description = "Interactive TUI wizard for generating and submitting Slurm sbatch scripts"
 requires-python = ">=3.10"
 readme = "README.md"
@@ -71,7 +71,9 @@ slurmate = "slurmate.main:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-slurmate = ["py.typed"]
+# SKILL.md ships in the wheel so `slurmate skill --install` works from a plain
+# `pip install slurmate`, with no checkout and no network.
+slurmate = ["py.typed", "data/SKILL.md"]
 
 [tool.ruff]
 target-version = "py310"

@@ -21,7 +21,7 @@ def _env_flag(name: str) -> bool:
 # aborts the run and truncates the output. rich picks a safe box set for its own
 # glyphs, but it does not transcode application text, so slurmate's own "⚠"/"✗"
 # went straight to the encoder. The markers below therefore have ASCII fallbacks
-# — and :func:`make_output_safe` covers everything a table cannot, including
+#, and :func:`make_output_safe` covers everything a table cannot, including
 # user-supplied data (a CJK job name, a partition name) that no fallback table
 # could anticipate.
 
@@ -29,7 +29,7 @@ _FORCE_ASCII = False
 
 
 def set_ascii(enabled: bool) -> None:
-    """Force (or unforce) ASCII markers — backs ``--ascii``."""
+    """Force (or unforce) ASCII markers: backs ``--ascii``."""
     global _FORCE_ASCII
     _FORCE_ASCII = enabled
 
@@ -84,7 +84,7 @@ g = _Glyphs()
 
 # Typography slurmate writes into its own prose, and the ASCII that carries the
 # same meaning. Applied by the codec error handler below, so it covers every
-# output path at once — including the 238 em dashes, which are far too many to
+# output path at once, including the 238 em dashes, which are far too many to
 # route through the marker table individually.
 _TRANSLITERATE = {
     "\u2014": "-", "\u2013": "-", "\u2026": "...", "\u00a0": " ",
@@ -105,7 +105,7 @@ def _encode_fallback(exc: UnicodeError) -> tuple[str, int]:
     for ch in exc.object[exc.start:exc.end]:
         replacement = _TRANSLITERATE.get(ch)
         if replacement is None:
-            # Unknown character — escape rather than drop it. This is the case
+            # Unknown character: escape rather than drop it. This is the case
             # the table cannot cover: a job name, module or partition carrying
             # characters the terminal cannot encode is *data*, not decoration,
             # and "?" would silently destroy it.
@@ -138,7 +138,7 @@ def _should_use_color() -> bool:
     """Check if we should use color output based on environment.
 
     ``FORCE_COLOR`` is honoured because ``rich`` honours it: without it, piping
-    slurmate's output with ``FORCE_COLOR=1`` produced half-coloured output — rich's
+    slurmate's output with ``FORCE_COLOR=1`` produced half-coloured output: rich's
     panels kept their colour while every ``c.*``-prefixed status line lost it.
 
     The test matches rich's, down to the edges: any **non-empty** value forces
@@ -162,7 +162,7 @@ def _should_use_color() -> bool:
     one input where treating it as unset produced the split this function exists
     to prevent -- inverted. Measured on ``--dry-run`` over a tty with
     ``FORCE_COLOR=``: rich's styling collapsed from 253 SGR sequences to 1 while
-    the ``c.*``-coloured "Dry run — not submitted." line kept its grey, leaving
+    the ``c.*``-coloured "Dry run, not submitted." line kept its grey, leaving
     one coloured line in an otherwise plain screen. Every other value agrees
     with rich both on a tty and piped, so only the empty case changed.
     """
@@ -209,7 +209,7 @@ class C:
     def __getattribute__(self, name: str) -> Any:
         if name.startswith("_"):
             return object.__getattribute__(self, name)
-        # Decide once per instance and cache it — `__getattribute__` runs on
+        # Decide once per instance and cache it: `__getattribute__` runs on
         # every color access (the banner animation hits it many times per
         # frame), and `_should_use_color()` does an isatty()/env probe each call.
         cache = object.__getattribute__(self, "__dict__")
@@ -235,19 +235,19 @@ BANNER_LINES = [
 
 # The banner is the one output path that ignored `use_ascii()`, and it is the
 # first thing printed. Its glyphs are a full block plus six box-drawing pieces,
-# none of which are in `_TRANSLITERATE` — so under a *valid* non-UTF-8 locale
+# none of which are in `_TRANSLITERATE`, so under a *valid* non-UTF-8 locale
 # (`en_US` is latin-1, the case this module exists for) the codec handler fell
 # through to `backslashreplace` and the six lines came out as ~440 `\uXXXX`
 # escapes: a screen of soup before the tool had said anything. Escaping is the
 # right answer for *data* (a job name is not recoverable from a "?"), which is
-# exactly why it is the wrong answer here — the banner is decoration, and
+# exactly why it is the wrong answer here; the banner is decoration, and
 # decoration is what has a fallback table. `--ascii`/`SLURMATE_ASCII=1` were
 # ignored too, on a UTF-8 terminal as well, so asking for ASCII output still
 # produced block art.
 #
 # Derived from BANNER_LINES by translation rather than written out a second
 # time: the two lists then cannot drift, and the line *count* and per-line
-# *width* are identical by construction — which the gradient (indexed 0..5) and
+# *width* are identical by construction, which the gradient (indexed 0..5) and
 # the animation's save/restore region both depend on.
 _ASCII_BANNER_MAP = str.maketrans({
     "█": "#",                                            # █ full block
@@ -293,7 +293,7 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
         animate: If True, show animation. Default is False (instant display).
                  Can be overridden with SLURMATE_BANNER_ANIMATE=1.
         interactive: When False (batch/non-interactive mode), the "ESC to go
-                 back" hint is suppressed \u2014 there's no wizard to go back in.
+                 back" hint is suppressed: there's no wizard to go back in.
     """
     if _env_flag("SLURMATE_NO_BANNER"):
         return
@@ -308,7 +308,7 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
     use_animation = bool(animate) or _env_flag("SLURMATE_BANNER_ANIMATE")
 
     # The animation drives the cursor with absolute save/restore over the banner
-    # region, which only means anything on a real terminal — into a pipe or a log
+    # region, which only means anything on a real terminal: into a pipe or a log
     # file it would just emit escape soup. Colour alone is no longer a proxy for
     # that (FORCE_COLOR can enable colour on a non-TTY), so check isatty directly.
     if use_animation and not sys.stdout.isatty():
@@ -335,9 +335,9 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
 
     if not use_animation or not use_color:
         if use_color:
-            subtitle = f"{c.CYAN}Slurmate{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
+            subtitle = f"{c.CYAN}Slurmate{c.RESET}{c.GRAY}: interactive sbatch wizard{c.RESET}"
         else:
-            subtitle = "Slurmate  \u2014  interactive sbatch wizard"
+            subtitle = "Slurmate: interactive sbatch wizard"
         print(f"  {subtitle}")
         if interactive:
             print(f"  {c.GRAY if use_color else ''}ESC to go back{c.RESET if use_color else ''}")
@@ -363,7 +363,7 @@ def print_banner(animate: bool | str | None = False, interactive: bool = True) -
     for i, line in enumerate(lines):
         print(f"\033[2K{BANNER_GRADIENT[i]}{c.BOLD}\033[3m{line}\033[23m{c.RESET}")
     print()
-    subtitle = f"{c.CYAN}Slurmate{c.RESET}  {c.GRAY}\u2014  interactive sbatch wizard{c.RESET}"
+    subtitle = f"{c.CYAN}Slurmate{c.RESET}{c.GRAY}: interactive sbatch wizard{c.RESET}"
     print(f"  {subtitle}")
     if interactive:
         print(f"  {c.GRAY}ESC to go back{c.RESET}")

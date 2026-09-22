@@ -38,7 +38,9 @@ EXPECTED = {
     "fetch_public_partitions": (False, "offers only publicly-usable partitions"),
     "fetch_account_acl": (True, "describes a user-supplied partition name"),
     "fetch_qos_acl": (True, "describes a user-supplied partition name"),
+    "fetch_reachable_partitions": (True, "asks entitlement; Hidden is not an ACL"),
     "fetch_system_partitions": (False, "advisory list, de-prioritised not hidden"),
+    "fetch_node_types": (False, "offers a hardware inventory, rejects no name"),
 }
 
 
