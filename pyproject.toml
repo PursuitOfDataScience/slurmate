@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "slurmate"
 version = "0.8.0"
-description = "Interactive TUI wizard for generating and submitting Slurm sbatch scripts"
+description = "Slurm sbatch wizard, plus read-only cluster queries and an MCP server for AI agents"
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
 authors = [
     {name = "Youzhi Yu", email = "yuyouzhi666@icloud.com"},
 ]
-keywords = ["slurm", "sbatch", "hpc", "tui", "wizard"]
+keywords = ["slurm", "sbatch", "hpc", "tui", "wizard", "mcp", "ai-agent"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
