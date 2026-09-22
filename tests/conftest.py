@@ -34,12 +34,12 @@ def _clear_cluster_cache():
 # Environment variables slurmate reads that would silently change a result if the
 # shell running the suite happens to set them. This is not hypothetical: the
 # config tests set HOME and wrote $HOME/.config/slurmate/config.toml, but
-# load_config() honours XDG_CONFIG_HOME first — and GitHub's runners export it
+# load_config() honours XDG_CONFIG_HOME first, and GitHub's runners export it
 # while a midway3 login shell does not. Seven tests passed locally and failed in
 # CI for a reason that had nothing to do with the code under test.
 #
 # SLURMATE_MOCK is deliberately absent: the module sets it above, on purpose.
-# TERM/USER/LOGNAME are left alone too — tests that depend on them patch them,
+# TERM/USER/LOGNAME are left alone too: tests that depend on them patch them,
 # and blanking them changes what prompt_toolkit and getpass do rather than
 # isolating anything.
 _AMBIENT_VARS = (
@@ -53,8 +53,14 @@ _AMBIENT_VARS = (
     "EDITOR",
     "VISUAL",
     "LMOD_CMD",              # set on any Lmod login shell, and consulted by
-    "MODULESHOME",           # _module_command() — so module checks differed by
-)                            # whether the suite ran from a login shell
+    "MODULESHOME",           # _module_command(), so module checks differed
+    "MODULEPATH",            # by whether the suite ran from a login shell.
+)                            # The third joined them when _module_command()
+                             # started refusing to answer without a search
+                             # path: two layout tests passed locally, where
+                             # midway3 exports it, and failed on all four CI
+                             # Pythons. That split is this file's whole
+                             # reason for existing.
 
 
 @pytest.fixture(autouse=True)

@@ -5244,14 +5244,23 @@ class TestRefusalAttribution:
 class TestModuleCommandLayouts:
     """`module` is a shell function; the runnable entry point moved between Tcl
     environment-modules major versions. Checking only the 3.x path makes every
-    module check silently inert on a 5.x site whose wrapper is off PATH."""
+    module check silently inert on a 5.x site whose wrapper is off PATH.
+
+    Each case sets ``MODULEPATH`` because `_module_command` now requires one:
+    `modulecmd` with no search path answers every query with "ERROR: No module
+    path defined", and those lines were being read as module names. These
+    tests are about WHICH entry point is found, not about whether there is a
+    module system at all, so the search path belongs in their fixture.
+    """
 
     def test_tcl_modules_5x_libexec_layout_is_found(self, mocker, tmp_path):
         home = tmp_path / "Modules"
         (home / "libexec").mkdir(parents=True)
         real = home / "libexec" / "modulecmd.tcl"
         real.write_text("#!/bin/sh\n")
-        mocker.patch.dict(os.environ, {"MODULESHOME": str(home)}, clear=False)
+        mocker.patch.dict(os.environ, {"MODULESHOME": str(home),
+                                       "MODULEPATH": str(home / "modulefiles")},
+                          clear=False)
         mocker.patch.dict(os.environ, {"LMOD_CMD": ""}, clear=False)
         mocker.patch.object(su.shutil, "which", return_value=None)
         assert su._module_command() == [str(real), "bash"]
@@ -5263,7 +5272,9 @@ class TestModuleCommandLayouts:
         old = home / "bin" / "modulecmd"
         old.write_text("#!/bin/sh\n")
         (home / "libexec" / "modulecmd.tcl").write_text("#!/bin/sh\n")
-        mocker.patch.dict(os.environ, {"MODULESHOME": str(home)}, clear=False)
+        mocker.patch.dict(os.environ, {"MODULESHOME": str(home),
+                                       "MODULEPATH": str(home / "modulefiles")},
+                          clear=False)
         mocker.patch.dict(os.environ, {"LMOD_CMD": ""}, clear=False)
         mocker.patch.object(su.shutil, "which", return_value=None)
         assert su._module_command() == [str(old), "bash"]
