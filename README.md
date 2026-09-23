@@ -7,10 +7,6 @@
 [![CI](https://github.com/PursuitOfDataScience/slurmate/actions/workflows/ci.yml/badge.svg)](https://github.com/PursuitOfDataScience/slurmate/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/slurmate.svg?cache=0)](https://pypi.org/project/slurmate/)
 [![PyPI downloads](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PursuitOfDataScience/slurmate/badges/downloads.json)](https://pypi.org/project/slurmate/)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](#-license)
-[![Status: beta](https://img.shields.io/badge/status-beta-orange.svg)](#-status)
-[![Linter: ruff](https://img.shields.io/badge/lint-ruff-261230.svg)](https://github.com/astral-sh/ruff)
 
 <img src="assets/demo.gif" width="840" alt="slurmate building a GPU job in the wizard, with the #SBATCH script updating live beside each answer">
 
@@ -23,7 +19,8 @@ pipx install slurmate     # or: uv tool install slurmate / pip install slurmate
 slurmate                  # start the wizard
 ```
 
-It only offers what your cluster actually has: real partitions, QOS, GPU types and modules.
+Needs Python 3.10+. The wizard only offers what your cluster actually has: real partitions,
+QOS, GPU types and modules.
 
 ## 🧰 Use
 
